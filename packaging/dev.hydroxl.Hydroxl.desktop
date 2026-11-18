@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Hydroxl
+Comment=QEMU and KVM virtual machines
+Exec=hydroxl %f
+Icon=dev.hydroxl.Hydroxl
+Terminal=false
+Categories=System;Emulator;
+MimeType=application/ovf;application/x-virtualbox-ova;application/x-ovf;
+StartupWMClass=dev.hydroxl.Hydroxl
+Keywords=virtual;machine;qemu;kvm;libvirt;ova;ovf;

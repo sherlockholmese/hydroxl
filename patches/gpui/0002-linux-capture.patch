@@ -1,0 +1,830 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -245,6 +245,7 @@
+     "xkb",
+     "randr",
+     "xinput",
++    "xfixes",
+     "cursor",
+     "resource_manager",
+     "sync",
+--- /dev/null
++++ b/src/linux/wayland/capture.rs
+@@ -0,0 +1,242 @@
++// Guest-input extensions, kept separate to make upstream rebases reviewable.
++use wayland_protocols::wp::{
++    keyboard_shortcuts_inhibit::zv1::client::{
++        zwp_keyboard_shortcuts_inhibit_manager_v1, zwp_keyboard_shortcuts_inhibitor_v1,
++    },
++    pointer_constraints::zv1::client::{zwp_locked_pointer_v1, zwp_pointer_constraints_v1},
++    relative_pointer::zv1::client::{zwp_relative_pointer_manager_v1, zwp_relative_pointer_v1},
++};
++
++#[derive(Default)]
++struct WaylandCapture {
++    hidden: bool,
++    locked: bool,
++    lock: Option<zwp_locked_pointer_v1::ZwpLockedPointerV1>,
++    relative: Option<zwp_relative_pointer_v1::ZwpRelativePointerV1>,
++    inhibitor: Option<zwp_keyboard_shortcuts_inhibitor_v1::ZwpKeyboardShortcutsInhibitorV1>,
++    delta: Point<f64>,
++}
++impl WaylandCapture {
++    fn unlock(&mut self) {
++        if let Some(relative) = self.relative.take() {
++            relative.destroy();
++        }
++        if let Some(lock) = self.lock.take() {
++            lock.destroy();
++        }
++        self.locked = false;
++        self.delta = Point::default();
++    }
++    fn uninhibit(&mut self) {
++        if let Some(inhibitor) = self.inhibitor.take() {
++            inhibitor.destroy();
++        }
++    }
++}
++impl WaylandClientState {
++    fn restore_captured_cursor(&mut self, surface: &ObjectId) {
++        if self.mouse_focused_window.as_ref().is_some_and(|window| window.surface_id() == *surface)
++        {
++            self.cursor_hidden_window = self.mouse_focused_window.clone();
++            self.restore_cursor_after_hide();
++        }
++    }
++
++    fn capture_hides_cursor(&self) -> bool {
++        self.mouse_focused_window.as_ref().is_some_and(|window| {
++            self.captures.get(&window.surface_id()).is_some_and(|capture| capture.hidden)
++        })
++    }
++    fn release_all_captures(&mut self) {
++        let ids: Vec<_> = self.captures.keys().cloned().collect();
++        for id in ids {
++            self.release_capture(&id);
++        }
++    }
++    fn release_capture(&mut self, id: &ObjectId) {
++        if let Some(mut capture) = self.captures.remove(id) {
++            capture.unlock();
++            capture.uninhibit();
++            if capture.hidden {
++                self.restore_captured_cursor(id);
++            }
++        }
++    }
++}
++impl WaylandClientStatePtr {
++    pub(super) fn release_guest_capture(&self, id: &ObjectId) {
++        if let Some(client) = self.try_get_client() {
++            client.borrow_mut().release_capture(id);
++        }
++    }
++    pub(super) fn capture_cursor(
++        &self,
++        surface: &wl_surface::WlSurface,
++        hidden: bool,
++    ) -> anyhow::Result<()> {
++        let client = self.get_client();
++        let mut state = client.borrow_mut();
++        if hidden {
++            anyhow::ensure!(
++                state.mouse_focused_window.as_ref().is_some_and(|w| w.surface_id() == surface.id()),
++                "pointer is outside this window"
++            );
++            let pointer = state.wl_pointer.as_ref().context("seat has no pointer")?;
++            pointer.set_cursor(
++                state.serial_tracker.get(SerialKind::MouseEnter).as_raw(),
++                None,
++                0,
++                0,
++            );
++            state.cursor_style.get_or_insert(CursorStyle::Arrow);
++            let focused = state.mouse_focused_window.clone();
++            state.cursor_hidden_window = focused;
++            state.captures.entry(surface.id()).or_default().hidden = true;
++        } else if let Some(capture) = state.captures.get_mut(&surface.id())
++            && std::mem::take(&mut capture.hidden)
++        {
++            state.restore_captured_cursor(&surface.id());
++        }
++        Ok(())
++    }
++    pub(super) fn capture_pointer(
++        &self,
++        surface: &wl_surface::WlSurface,
++        lock: bool,
++    ) -> anyhow::Result<()> {
++        let client = self.get_client();
++        let mut state = client.borrow_mut();
++        if !lock {
++            if let Some(capture) = state.captures.get_mut(&surface.id()) {
++                capture.unlock();
++            }
++            return Ok(());
++        }
++        if state.captures.get(&surface.id()).is_some_and(|c| c.lock.is_some()) {
++            return Ok(());
++        }
++        anyhow::ensure!(
++            state.mouse_focused_window.as_ref().is_some_and(|w| w.surface_id() == surface.id()),
++            "pointer is outside this window"
++        );
++        let pointer = state.wl_pointer.as_ref().context("seat has no pointer")?;
++        let constraints = state
++            .globals
++            .pointer_constraints
++            .as_ref()
++            .context("compositor does not support pointer lock")?;
++        let manager = state
++            .globals
++            .relative_pointer_manager
++            .as_ref()
++            .context("compositor does not support relative motion")?;
++        let relative = manager.get_relative_pointer(pointer, &state.globals.qh, surface.id());
++        let locked = constraints.lock_pointer(
++            surface,
++            pointer,
++            None,
++            zwp_pointer_constraints_v1::Lifetime::Persistent,
++            &state.globals.qh,
++            surface.id(),
++        );
++        let capture = state.captures.entry(surface.id()).or_default();
++        capture.lock = Some(locked);
++        capture.relative = Some(relative);
++        capture.delta = Point::default();
++        Ok(())
++    }
++    pub(super) fn capture_locked(&self, surface: &wl_surface::WlSurface) -> bool {
++        self.get_client().borrow().captures.get(&surface.id()).is_some_and(|c| c.locked)
++    }
++    pub(super) fn capture_motion(&self, surface: &wl_surface::WlSurface) -> Point<f64> {
++        self.get_client()
++            .borrow_mut()
++            .captures
++            .get_mut(&surface.id())
++            .map(|c| std::mem::take(&mut c.delta))
++            .unwrap_or_default()
++    }
++    pub(super) fn capture_shortcuts(
++        &self,
++        surface: &wl_surface::WlSurface,
++        inhibit: bool,
++    ) -> anyhow::Result<()> {
++        let client = self.get_client();
++        let mut state = client.borrow_mut();
++        if !inhibit {
++            if let Some(capture) = state.captures.get_mut(&surface.id()) {
++                capture.uninhibit();
++            }
++            return Ok(());
++        }
++        if state.captures.get(&surface.id()).is_some_and(|c| c.inhibitor.is_some()) {
++            return Ok(());
++        }
++        anyhow::ensure!(
++            state.keyboard_focused_window.as_ref().is_some_and(|w| w.surface_id() == surface.id()),
++            "window has no keyboard focus"
++        );
++        let manager = state
++            .globals
++            .shortcuts_manager
++            .as_ref()
++            .context("compositor does not support shortcut inhibition")?;
++        let inhibitor = manager.inhibit_shortcuts(surface, &state.wl_seat, &state.globals.qh, ());
++        state.captures.entry(surface.id()).or_default().inhibitor = Some(inhibitor);
++        Ok(())
++    }
++}
++
++wayland_client::delegate_noop!(WaylandClientStatePtr: ignore zwp_pointer_constraints_v1::ZwpPointerConstraintsV1);
++wayland_client::delegate_noop!(WaylandClientStatePtr: ignore zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1);
++wayland_client::delegate_noop!(WaylandClientStatePtr: ignore zwp_keyboard_shortcuts_inhibit_manager_v1::ZwpKeyboardShortcutsInhibitManagerV1);
++wayland_client::delegate_noop!(WaylandClientStatePtr: ignore zwp_keyboard_shortcuts_inhibitor_v1::ZwpKeyboardShortcutsInhibitorV1);
++
++impl Dispatch<zwp_locked_pointer_v1::ZwpLockedPointerV1, ObjectId> for WaylandClientStatePtr {
++    fn event(
++        this: &mut Self,
++        proxy: &zwp_locked_pointer_v1::ZwpLockedPointerV1,
++        event: zwp_locked_pointer_v1::Event,
++        id: &ObjectId,
++        _: &Connection,
++        _: &QueueHandle<Self>,
++    ) {
++        let client = this.get_client();
++        let mut state = client.borrow_mut();
++        if let Some(capture) = state.captures.get_mut(id) {
++            // Ignore events queued before an unlock/relock.
++            if capture.lock.as_ref() != Some(proxy) {
++                return;
++            }
++            capture.locked = matches!(event, zwp_locked_pointer_v1::Event::Locked);
++            capture.delta = Point::default();
++        }
++    }
++}
++impl Dispatch<zwp_relative_pointer_v1::ZwpRelativePointerV1, ObjectId> for WaylandClientStatePtr {
++    fn event(
++        this: &mut Self,
++        proxy: &zwp_relative_pointer_v1::ZwpRelativePointerV1,
++        event: zwp_relative_pointer_v1::Event,
++        id: &ObjectId,
++        _: &Connection,
++        _: &QueueHandle<Self>,
++    ) {
++        let zwp_relative_pointer_v1::Event::RelativeMotion {
++            dx_unaccel,
++            dy_unaccel,
++            ..
++        } = event
++        else {
++            return;
++        };
++        let client = this.get_client();
++        let mut state = client.borrow_mut();
++        if let Some(capture) = state.captures.get_mut(id) {
++            if capture.locked && capture.relative.as_ref() == Some(proxy) {
++                capture.delta.x += dx_unaccel;
++                capture.delta.y += dy_unaccel;
++            }
++        }
++    }
++}
+--- a/src/linux/wayland/client.rs
++++ b/src/linux/wayland/client.rs
+@@ -241,6 +241,10 @@
+ 
+ #[derive(Clone)]
+ pub struct Globals {
++    pointer_constraints: Option<zwp_pointer_constraints_v1::ZwpPointerConstraintsV1>,
++    relative_pointer_manager: Option<zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1>,
++    shortcuts_manager:
++        Option<zwp_keyboard_shortcuts_inhibit_manager_v1::ZwpKeyboardShortcutsInhibitManagerV1>,
+     pub qh: QueueHandle<WaylandClientStatePtr>,
+     pub activation: Option<xdg_activation_v1::XdgActivationV1>,
+     pub compositor: wl_compositor::WlCompositor,
+@@ -277,6 +281,9 @@
+     ) -> anyhow::Result<Self> {
+         let dialog_v = XdgWmDialogV1::interface().version;
+         Ok(Globals {
++            pointer_constraints: globals.bind(&qh, 1..=1, ()).ok(),
++            relative_pointer_manager: globals.bind(&qh, 1..=1, ()).ok(),
++            shortcuts_manager: globals.bind(&qh, 1..=1, ()).ok(),
+             activation: globals.bind(&qh, 1..=1, ()).ok(),
+             compositor: globals
+                 .bind(
+@@ -357,7 +364,10 @@
+     pub refresh_interval: Option<Duration>,
+ }
+ 
++include!("capture.rs");
++
+ pub(crate) struct WaylandClientState {
++    captures: HashMap<ObjectId, WaylandCapture>,
+     serial_tracker: SerialTracker,
+     globals: Globals,
+     pub gpu_context: GpuContext,
+@@ -805,6 +815,7 @@
+     pub fn drop_window(&self, surface_id: &ObjectId) {
+         let client = self.get_client();
+         let mut state = client.borrow_mut();
++        state.release_capture(surface_id);
+         let closed_window = state.windows.remove(surface_id).unwrap();
+         if let Some(window) = state.mouse_focused_window.take()
+             && !window.ptr_eq(&closed_window)
+@@ -843,6 +854,9 @@
+     }
+ 
+     fn restore_cursor_after_hide(&mut self) {
++        if self.capture_hides_cursor() {
++            return;
++        }
+         if self.cursor_hidden_window.take().is_none() {
+             return;
+         }
+@@ -1070,6 +1084,7 @@
+             compositor_gpu,
+             wl_seat: seat,
+             wl_pointer: None,
++            captures: HashMap::default(),
+             wl_keyboard: None,
+             pinch_gesture: None,
+             pinch_scale: 1.0,
+@@ -1369,7 +1384,7 @@
+         state.cursor_style = Some(style);
+ 
+         // Don't clobber the invisible cursor; restore reads back from `cursor_style`.
+-        if state.cursor_hidden_window.is_some() {
++        if state.cursor_hidden_window.is_some() || state.capture_hides_cursor() {
+             return;
+         }
+ 
+@@ -1613,6 +1628,7 @@
+                         log::error!("ignoring wl_seat below the required version");
+                         return;
+                     };
++                    state.release_all_captures();
+                     if let Some(wl_pointer) = state.wl_pointer.take() {
+                         wl_pointer.release();
+                     }
+@@ -1993,6 +2009,8 @@
+         {
+             let client = state.get_client();
+             let mut state = client.borrow_mut();
++            // Seat changes invalidate the objects on which capture was requested.
++            state.release_all_captures();
+             if capabilities.contains(wl_seat::Capability::Keyboard) {
+                 let keyboard = seat.get_keyboard(qh, ());
+ 
+@@ -2105,6 +2123,7 @@
+             }
+             wl_keyboard::Event::Leave { surface, .. } => {
+                 let keyboard_focused_window = get_window(&mut state, &surface.id());
++                state.release_capture(&surface.id());
+                 state.keyboard_focused_window = None;
+                 state.enter_token.take();
+                 // Prevent keyboard events from repeating after opening e.g. a file chooser and closing it quickly
+@@ -2423,7 +2442,10 @@
+                         state.enter_token = None;
+                     }
+                     state.restore_cursor_after_hide();
+-                    if let Some(style) = state.cursor_style {
++                    if state.capture_hides_cursor() {
++                        wl_pointer.set_cursor(serial, None, 0, 0);
++                        state.cursor_hidden_window = Some(window.clone());
++                    } else if let Some(style) = state.cursor_style {
+                         if let Some(cursor_shape_device) = &state.cursor_shape_device {
+                             cursor_shape_device.set_shape(serial, to_shape(style));
+                         } else {
+--- a/src/linux/wayland/window.rs
++++ b/src/linux/wayland/window.rs
+@@ -776,6 +776,10 @@
+     fn drop(&mut self) {
+         self.0.frame_loop.set(FrameLoop::Parked);
+ 
++        {
++            let state = self.0.state.borrow();
++            state.client.release_guest_capture(&state.surface.id());
++        }
+         let mut state = self.0.state.borrow_mut();
+         let surface_id = state.surface.id();
+ 
+@@ -898,6 +902,10 @@
+ }
+ 
+ impl WaylandWindowStatePtr {
++    pub(super) fn surface_id(&self) -> ObjectId {
++        self.state.borrow().surface.id()
++    }
++
+     pub fn handle(&self) -> AnyWindowHandle {
+         self.state.borrow().handle
+     }
+@@ -1719,6 +1727,27 @@
+ }
+ 
+ impl PlatformWindow for WaylandWindow {
++    fn set_cursor_hidden(&mut self, hidden: bool) -> anyhow::Result<()> {
++        let state = self.0.state.borrow();
++        state.client.capture_cursor(&state.surface, hidden)
++    }
++    fn lock_pointer(&mut self, lock: bool) -> anyhow::Result<()> {
++        let state = self.0.state.borrow();
++        state.client.capture_pointer(&state.surface, lock)
++    }
++    fn is_pointer_locked(&self) -> bool {
++        let state = self.0.state.borrow();
++        state.client.capture_locked(&state.surface)
++    }
++    fn take_raw_mouse_motion(&mut self) -> gpui::Point<f64> {
++        let state = self.0.state.borrow();
++        state.client.capture_motion(&state.surface)
++    }
++    fn inhibit_system_shortcuts(&mut self, inhibit: bool) -> anyhow::Result<()> {
++        let state = self.0.state.borrow();
++        state.client.capture_shortcuts(&state.surface, inhibit)
++    }
++
+     fn bounds(&self) -> Bounds<Pixels> {
+         self.borrow().bounds
+     }
+--- /dev/null
++++ b/src/linux/x11/capture.rs
+@@ -0,0 +1,262 @@
++// Additive guest-input APIs. The normal XI2 dispatch path remains unchanged.
++use x11rb::protocol::xfixes::ConnectionExt as _;
++
++#[derive(Default)]
++struct X11Capture {
++    hidden: bool,
++    locked: bool,
++    shortcuts: bool,
++    delta: Point<f64>,
++    position: Point<Pixels>,
++}
++impl X11ClientState {
++    fn release_capture(&mut self, window: xproto::Window) {
++        if let Some(capture) = self.captures.remove(&window) {
++            if capture.locked {
++                let _ = self.xcb_connection.ungrab_pointer(x11rb::CURRENT_TIME);
++                let root = self.xcb_connection.setup().roots[self.x_root_index].root;
++                let _ = self.xcb_connection.xinput_xi_select_events(
++                    root,
++                    &[xinput::EventMask {
++                        deviceid: XINPUT_ALL_DEVICE_GROUPS,
++                        mask: vec![],
++                    }],
++                );
++            }
++            if capture.shortcuts {
++                let _ = self.xcb_connection.ungrab_keyboard(x11rb::CURRENT_TIME);
++            }
++            if capture.hidden {
++                let _ = self.xcb_connection.xfixes_show_cursor(window);
++            }
++            self.xcb_connection.flush().log_err();
++        }
++    }
++    fn capture_raw_motion(&mut self, event: &xinput::RawMotionEvent) {
++        let Some(window) = self.keyboard_focused_window else {
++            return;
++        };
++        let Some(capture) = self.captures.get_mut(&window).filter(|c| c.locked) else {
++            return;
++        };
++        let mut values = event.axisvalues_raw.iter();
++        // XI2 values are packed for set mask bits; X/Y need not both be present.
++        for (word_index, word) in event.valuator_mask.iter().enumerate() {
++            for bit in 0..32 {
++                if word & (1 << bit) == 0 {
++                    continue;
++                }
++                let Some(value) = values.next() else {
++                    return;
++                };
++                let value = value.integral as f64 + value.frac as f64 / 4294967296.;
++                match word_index * 32 + bit {
++                    0 => capture.delta.x += value,
++                    1 => capture.delta.y += value,
++                    _ => {}
++                }
++            }
++        }
++    }
++}
++impl X11Client {
++    // A core grab routes buttons as core events, even though normal GPUI input is
++    // XI2. Keep their logical position fixed at the lock origin, like Wayland lock.
++    fn capture_core_button(&self, event: xproto::ButtonPressEvent, down: bool) {
++        let Some(window) = self.get_window(event.event) else {
++            return;
++        };
++        let state = self.0.borrow();
++        let Some(capture) = state.captures.get(&event.event).filter(|c| c.locked) else {
++            return;
++        };
++        let position = capture.position;
++        let modifiers = modifiers_from_state(event.state);
++        drop(state);
++        match button_or_scroll_from_event_detail(event.detail.into()) {
++            Some(ButtonOrScroll::Button(button)) => {
++                if down {
++                    window.handle_input(PlatformInput::MouseDown(gpui::MouseDownEvent {
++                        button,
++                        position,
++                        modifiers,
++                        click_count: 1,
++                        first_mouse: false,
++                    }));
++                } else {
++                    window.handle_input(PlatformInput::MouseUp(gpui::MouseUpEvent {
++                        button,
++                        position,
++                        modifiers,
++                        click_count: 1,
++                    }));
++                }
++            }
++            Some(ButtonOrScroll::Scroll(direction)) if down => {
++                let delta = match direction {
++                    ScrollDirection::Up => Point::new(0., SCROLL_LINES),
++                    ScrollDirection::Down => Point::new(0., -SCROLL_LINES),
++                    ScrollDirection::Left => Point::new(SCROLL_LINES, 0.),
++                    ScrollDirection::Right => Point::new(-SCROLL_LINES, 0.),
++                };
++                window.handle_input(PlatformInput::Scroll(make_scroll_wheel_event(
++                    position, delta, modifiers,
++                )));
++            }
++            _ => {}
++        }
++    }
++
++    pub(super) fn release_guest_capture(&self, window: xproto::Window) {
++        self.0.borrow_mut().release_capture(window);
++    }
++    pub(super) fn capture_cursor(
++        &self,
++        window: xproto::Window,
++        hidden: bool,
++    ) -> anyhow::Result<()> {
++        let mut state = self.0.borrow_mut();
++        if state.captures.get(&window).is_some_and(|c| c.hidden) == hidden {
++            return Ok(());
++        }
++        if hidden {
++            // XFixes requires version negotiation before HideCursor (v4).
++            let version = state.xcb_connection.xfixes_query_version(4, 0)?.reply()?;
++            anyhow::ensure!(version.major_version >= 4, "XFixes cursor hiding is unsupported");
++            state.xcb_connection.xfixes_hide_cursor(window)?.check()?;
++        } else {
++            state.xcb_connection.xfixes_show_cursor(window)?.check()?;
++        }
++        state.captures.entry(window).or_default().hidden = hidden;
++        if !hidden && state.cursor_hidden_window == Some(window) {
++            state.restore_cursor_after_hide();
++        }
++        state.xcb_connection.flush()?;
++        Ok(())
++    }
++    pub(super) fn capture_pointer(&self, window: xproto::Window, lock: bool) -> anyhow::Result<()> {
++        let mut state = self.0.borrow_mut();
++        if state.captures.get(&window).is_some_and(|c| c.locked) == lock {
++            return Ok(());
++        }
++        let root = state.xcb_connection.setup().roots[state.x_root_index].root;
++        if lock {
++            anyhow::ensure!(
++                state.keyboard_focused_window == Some(window),
++                "window has no keyboard focus"
++            );
++            anyhow::ensure!(
++                !state.captures.iter().any(|(&other, c)| other != window && c.locked),
++                "another window owns pointer lock"
++            );
++            state
++                .xcb_connection
++                .xinput_xi_select_events(
++                    root,
++                    &[xinput::EventMask {
++                        deviceid: XINPUT_ALL_DEVICE_GROUPS,
++                        mask: vec![xinput::XIEventMask::RAW_MOTION],
++                    }],
++                )?
++                .check()?;
++            let reply = state
++                .xcb_connection
++                .grab_pointer(
++                    false,
++                    window,
++                    xproto::EventMask::BUTTON_PRESS
++                        | xproto::EventMask::BUTTON_RELEASE
++                        | xproto::EventMask::POINTER_MOTION,
++                    xproto::GrabMode::ASYNC,
++                    xproto::GrabMode::ASYNC,
++                    window,
++                    x11rb::NONE,
++                    x11rb::CURRENT_TIME,
++                )?
++                .reply()?;
++            if reply.status != xproto::GrabStatus::SUCCESS {
++                state
++                    .xcb_connection
++                    .xinput_xi_select_events(
++                        root,
++                        &[xinput::EventMask {
++                            deviceid: XINPUT_ALL_DEVICE_GROUPS,
++                            mask: vec![],
++                        }],
++                    )?
++                    .check()?;
++                anyhow::bail!("X11 refused pointer grab: {:?}", reply.status);
++            }
++        } else {
++            state.xcb_connection.ungrab_pointer(x11rb::CURRENT_TIME)?.check()?;
++            state
++                .xcb_connection
++                .xinput_xi_select_events(
++                    root,
++                    &[xinput::EventMask {
++                        deviceid: XINPUT_ALL_DEVICE_GROUPS,
++                        mask: vec![],
++                    }],
++                )?
++                .check()?;
++        }
++        let position = state.last_location;
++        let capture = state.captures.entry(window).or_default();
++        capture.position = position;
++        capture.locked = lock;
++        capture.delta = Point::default();
++        state.xcb_connection.flush()?;
++        Ok(())
++    }
++    pub(super) fn capture_locked(&self, window: xproto::Window) -> bool {
++        self.0.borrow().captures.get(&window).is_some_and(|c| c.locked)
++    }
++    pub(super) fn capture_motion(&self, window: xproto::Window) -> Point<f64> {
++        self.0
++            .borrow_mut()
++            .captures
++            .get_mut(&window)
++            .map(|c| std::mem::take(&mut c.delta))
++            .unwrap_or_default()
++    }
++    pub(super) fn capture_shortcuts(
++        &self,
++        window: xproto::Window,
++        inhibit: bool,
++    ) -> anyhow::Result<()> {
++        let mut state = self.0.borrow_mut();
++        if state.captures.get(&window).is_some_and(|c| c.shortcuts) == inhibit {
++            return Ok(());
++        }
++        if inhibit {
++            anyhow::ensure!(
++                state.keyboard_focused_window == Some(window),
++                "window has no keyboard focus"
++            );
++            anyhow::ensure!(
++                !state.captures.iter().any(|(&other, c)| other != window && c.shortcuts),
++                "another window owns the keyboard grab"
++            );
++            let reply = state
++                .xcb_connection
++                .grab_keyboard(
++                    true,
++                    window,
++                    x11rb::CURRENT_TIME,
++                    xproto::GrabMode::ASYNC,
++                    xproto::GrabMode::ASYNC,
++                )?
++                .reply()?;
++            anyhow::ensure!(
++                reply.status == xproto::GrabStatus::SUCCESS,
++                "X11 refused keyboard grab: {:?}",
++                reply.status
++            );
++        } else {
++            state.xcb_connection.ungrab_keyboard(x11rb::CURRENT_TIME)?.check()?;
++        }
++        state.captures.entry(window).or_default().shortcuts = inhibit;
++        state.xcb_connection.flush()?;
++        Ok(())
++    }
++}
+--- a/src/linux/x11/client.rs
++++ b/src/linux/x11/client.rs
+@@ -179,7 +179,10 @@
+     scroll_value: Option<f32>,
+ }
+ 
++include!("capture.rs");
++
+ pub struct X11ClientState {
++    captures: HashMap<xproto::Window, X11Capture>,
+     /// A weak pointer to this state, for event-loop callbacks registered by its methods.
+     this: X11ClientStatePtr,
+     pub(crate) loop_handle: LoopHandle<'static, ()>,
+@@ -255,6 +258,7 @@
+         };
+         let mut state = client.0.borrow_mut();
+ 
++        state.release_capture(x_window);
+         if let Some(window_ref) = state.windows.remove(&x_window)
+             && let Some(RefreshState::PeriodicRefresh {
+                 event_loop_token, ..
+@@ -545,6 +549,7 @@
+                 cursor_styles: HashMap::default(),
+                 cursor_cache: HashMap::default(),
+                 cursor_hidden_window: None,
++                captures: HashMap::default(),
+                 invisible_cursor_cache: None,
+ 
+                 pointer_device_states,
+@@ -883,6 +888,7 @@
+         match event {
+             Event::UnmapNotify(event) => {
+                 let mut state = self.0.borrow_mut();
++                state.release_capture(event.window);
+                 if let Some(window_ref) = state.windows.get_mut(&event.window) {
+                     window_ref.is_mapped = false;
+                 }
+@@ -1057,6 +1063,12 @@
+                     .context("X11: Failed to handle property notify")
+                     .log_err();
+             }
++            Event::FocusIn(event)
++                if event.mode == xproto::NotifyMode::GRAB
++                    || event.mode == xproto::NotifyMode::UNGRAB => {}
++            Event::FocusOut(event)
++                if event.mode == xproto::NotifyMode::GRAB
++                    || event.mode == xproto::NotifyMode::UNGRAB => {}
+             Event::FocusIn(event) => {
+                 let window = self.get_window(event.event)?;
+                 window.set_active(true);
+@@ -1069,6 +1081,7 @@
+                 self.enable_ime();
+             }
+             Event::FocusOut(event) => {
++                self.0.borrow_mut().release_capture(event.event);
+                 let window = self.get_window(event.event)?;
+                 window.set_active(false);
+                 let mut state = self.0.borrow_mut();
+@@ -1332,6 +1345,15 @@
+                     None => {}
+                 }
+             }
++            Event::ButtonPress(event) => {
++                self.capture_core_button(event, true);
++            }
++            Event::ButtonRelease(event) => {
++                self.capture_core_button(event, false);
++            }
++            Event::XinputRawMotion(event) => {
++                self.0.borrow_mut().capture_raw_motion(&event);
++            }
+             Event::XinputMotion(event) => {
+                 let window = self.get_window(event.event)?;
+                 let mut state = self.0.borrow_mut();
+@@ -1804,7 +1826,12 @@
+     }
+ 
+     pub(crate) fn is_cursor_visible(&self) -> bool {
+-        self.0.borrow().cursor_hidden_window.is_none()
++        let state = self.0.borrow();
++        state.cursor_hidden_window.is_none()
++            && !state
++                .mouse_focused_window
++                .and_then(|window| state.captures.get(&window))
++                .is_some_and(|capture| capture.hidden)
+     }
+ 
+     pub(crate) fn open_uri(&self, uri: &str) {
+--- a/src/linux/x11/window.rs
++++ b/src/linux/x11/window.rs
+@@ -881,6 +881,9 @@
+ 
+ impl Drop for X11Window {
+     fn drop(&mut self) {
++        if let Some(client) = self.0.state.borrow().client.get_client() {
++            client.release_guest_capture(self.0.x_window);
++        }
+         let mut state = self.0.state.borrow_mut();
+ 
+         if let Some(parent) = state.parent.as_ref() {
+@@ -1385,6 +1388,51 @@
+ }
+ 
+ impl PlatformWindow for X11Window {
++    fn set_cursor_hidden(&mut self, hidden: bool) -> anyhow::Result<()> {
++        self.0
++            .state
++            .borrow()
++            .client
++            .get_client()
++            .ok_or_else(|| anyhow!("X11 connection closed"))?
++            .capture_cursor(self.0.x_window, hidden)
++    }
++    fn lock_pointer(&mut self, lock: bool) -> anyhow::Result<()> {
++        self.0
++            .state
++            .borrow()
++            .client
++            .get_client()
++            .ok_or_else(|| anyhow!("X11 connection closed"))?
++            .capture_pointer(self.0.x_window, lock)
++    }
++    fn is_pointer_locked(&self) -> bool {
++        self.0
++            .state
++            .borrow()
++            .client
++            .get_client()
++            .is_some_and(|client| client.capture_locked(self.0.x_window))
++    }
++    fn take_raw_mouse_motion(&mut self) -> gpui::Point<f64> {
++        self.0
++            .state
++            .borrow()
++            .client
++            .get_client()
++            .map(|client| client.capture_motion(self.0.x_window))
++            .unwrap_or_default()
++    }
++    fn inhibit_system_shortcuts(&mut self, inhibit: bool) -> anyhow::Result<()> {
++        self.0
++            .state
++            .borrow()
++            .client
++            .get_client()
++            .ok_or_else(|| anyhow!("X11 connection closed"))?
++            .capture_shortcuts(self.0.x_window, inhibit)
++    }
++
+     fn bounds(&self) -> Bounds<Pixels> {
+         self.0.state.borrow().bounds
+     }

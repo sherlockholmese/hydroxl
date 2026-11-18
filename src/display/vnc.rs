@@ -1,0 +1,917 @@
+//! Minimal RFB 3.8 client for QEMU's local VNC server.
+//!
+//! The reader thread applies framebuffer updates (Raw, CopyRect, DesktopSize) to a shared
+//! BGRA buffer and records the damaged area; the UI uploads at most one frame per tick.
+//! Input is written from the UI thread through a cloned socket.
+use super::damage::Damage;
+use anyhow::{Context, Result, bail, ensure};
+use std::io::{Read, Write};
+use std::net::{TcpStream, ToSocketAddrs};
+use std::os::unix::net::UnixStream;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+const EXTENDED_DESKTOP_SIZE: i32 = -308;
+pub(super) const MAX_DESKTOP_SIZE: usize = 8192;
+
+/// Where QEMU serves the display, as reported by `virsh domdisplay --type vnc`.
+#[derive(Clone, Debug)]
+pub enum Endpoint {
+    Unix(std::path::PathBuf),
+    Tcp(String),
+}
+impl Endpoint {
+    pub fn parse(uri: &str) -> Option<Self> {
+        let uri = uri.trim();
+        if let Some(path) = uri.strip_prefix("vnc+unix://") {
+            return Some(Self::Unix(path.into()));
+        }
+        let rest = uri.strip_prefix("vnc://")?;
+        let (host, display) = rest.rsplit_once(':')?;
+        let display: u16 = display.trim_end_matches('/').parse().ok()?;
+        // `domdisplay` reports a display number; the TCP port is 5900 + display.
+        let port = if display < 5900 {
+            5900 + display
+        } else {
+            display
+        };
+        Some(Self::Tcp(format!("{host}:{port}")))
+    }
+}
+
+trait Stream: Read + Write + Send {
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()>;
+    fn duplicate(&self) -> std::io::Result<Box<dyn Stream>>;
+    fn shutdown(&self);
+}
+impl Stream for UnixStream {
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        UnixStream::set_read_timeout(self, timeout)
+    }
+    fn duplicate(&self) -> std::io::Result<Box<dyn Stream>> {
+        Ok(Box::new(self.try_clone()?))
+    }
+    fn shutdown(&self) {
+        let _ = UnixStream::shutdown(self, std::net::Shutdown::Both);
+    }
+}
+impl Stream for TcpStream {
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        TcpStream::set_read_timeout(self, timeout)
+    }
+    fn duplicate(&self) -> std::io::Result<Box<dyn Stream>> {
+        let clone = self.try_clone()?;
+        clone.set_nodelay(true)?;
+        Ok(Box::new(clone))
+    }
+    fn shutdown(&self) {
+        let _ = TcpStream::shutdown(self, std::net::Shutdown::Both);
+    }
+}
+
+/// The guest framebuffer, BGRA, plus what changed since the UI last looked.
+#[derive(Default)]
+pub struct Framebuffer {
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Vec<u8>,
+    pub(super) damage: Vec<Damage>,
+    /// Incremented on every applied update; the UI uploads when it differs.
+    pub generation: u64,
+    pub closed: Option<String>,
+    /// Guest cursor shape, drawn by the client at the host pointer. `None` hides it.
+    pub cursor: Option<Cursor>,
+    /// Incremented when the cursor shape changes.
+    pub cursor_generation: u64,
+    /// Whether QEMU routes pointer events absolutely (a tablet is active in the guest).
+    pub absolute: Option<bool>,
+    /// A single screen that can be addressed by a SetDesktopSize request.
+    pub resize_screen: Option<ResizeScreen>,
+    pub spice_resize: bool,
+    pub dbus_resize: bool,
+    pub spice_usb: bool,
+    pub spice_clipboard: bool,
+    /// QEMU's VNC clipboard extension is active (guest agent through qemu-vdagent).
+    pub vnc_clipboard: bool,
+    /// Latest guest clipboard text received over VNC.
+    pub clipboard_text: Option<String>,
+    /// Incremented each time the guest announces new clipboard text.
+    pub guest_clipboard: u64,
+    pub(crate) gpu_draw: Option<super::scanout::GpuDraw>,
+    pub(crate) preview_requested: bool,
+    pub(crate) thumbnail: Option<image::RgbaImage>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResizeScreen {
+    id: u32,
+    flags: u32,
+}
+
+/// A cursor bitmap in BGRA with alpha from the RFB mask, and its hotspot.
+#[derive(Clone)]
+pub struct Cursor {
+    pub width: u32,
+    pub height: u32,
+    pub hot_x: u32,
+    pub hot_y: u32,
+    pub pixels: Vec<u8>,
+}
+
+pub struct Session {
+    pub frame: Arc<Mutex<Framebuffer>>,
+    writer: Mutex<Box<dyn Stream>>,
+    /// Last absolute position sent, for relative-mode deltas.
+    last: Mutex<Option<(u16, u16)>>,
+    pressed_keys: Mutex<std::collections::BTreeSet<u32>>,
+    /// Host text offered to the guest, sent when the server asks for it.
+    clipboard_offer: Mutex<Option<String>>,
+}
+
+impl Session {
+    pub fn connect(endpoint: &Endpoint) -> Result<Arc<Self>> {
+        let mut stream: Box<dyn Stream> = match endpoint {
+            Endpoint::Unix(path) => {
+                Box::new(UnixStream::connect(path).context("Could not reach the guest display.")?)
+            }
+            Endpoint::Tcp(addr) => {
+                let addresses = addr.to_socket_addrs().context("Invalid guest display address.")?;
+                let s = addresses
+                    .filter_map(|address| {
+                        TcpStream::connect_timeout(&address, Duration::from_secs(3)).ok()
+                    })
+                    .next()
+                    .context("Could not reach the guest display.")?;
+                s.set_nodelay(true)?;
+                Box::new(s)
+            }
+        };
+        stream.set_read_timeout(Some(Duration::from_secs(3)))?;
+        let (width, height) = handshake(&mut stream)?;
+        stream.set_read_timeout(None)?;
+        let writer = stream.duplicate()?;
+        let session = Arc::new(Self {
+            frame: Arc::new(Mutex::new(Framebuffer {
+                width,
+                height,
+                pixels: vec![0; (width * height * 4) as usize],
+                damage: vec![Damage {
+                    x: 0,
+                    y: 0,
+                    width,
+                    height,
+                }],
+                generation: 0,
+                ..Default::default()
+            })),
+            writer: Mutex::new(writer),
+            last: Mutex::new(None),
+            pressed_keys: Mutex::default(),
+            clipboard_offer: Mutex::default(),
+        });
+        session.request(false)?;
+        let reader = session.clone();
+        std::thread::spawn(move || {
+            let result = reader.read_loop(stream);
+            let mut frame = reader.frame.lock().unwrap_or_else(|e| e.into_inner());
+            frame.closed = Some(match result {
+                Ok(()) => "The guest display closed.".into(),
+                Err(error) => error.to_string(),
+            });
+            frame.generation += 1;
+        });
+        Ok(session)
+    }
+
+    fn send(&self, bytes: &[u8]) -> Result<()> {
+        let mut writer = self.writer.lock().unwrap_or_else(|e| e.into_inner());
+        writer.write_all(bytes)?;
+        Ok(())
+    }
+
+    fn request(&self, incremental: bool) -> Result<()> {
+        let (w, h) = {
+            let f = self.frame.lock().unwrap_or_else(|e| e.into_inner());
+            (f.width as u16, f.height as u16)
+        };
+        let mut msg = vec![3, incremental as u8, 0, 0, 0, 0];
+        msg.extend_from_slice(&w.to_be_bytes());
+        msg.extend_from_slice(&h.to_be_bytes());
+        self.send(&msg)
+    }
+
+    pub fn resize_desktop(&self, (width, height): (u16, u16), screen: ResizeScreen) -> Result<()> {
+        validate_size(width.into(), height.into())?;
+        // SetDesktopSize with one screen at the desktop origin.
+        let mut msg = [0u8; 24];
+        msg[0] = 251;
+        msg[2..4].copy_from_slice(&width.to_be_bytes());
+        msg[4..6].copy_from_slice(&height.to_be_bytes());
+        msg[6] = 1;
+        msg[8..12].copy_from_slice(&screen.id.to_be_bytes());
+        msg[16..18].copy_from_slice(&width.to_be_bytes());
+        msg[18..20].copy_from_slice(&height.to_be_bytes());
+        msg[20..24].copy_from_slice(&screen.flags.to_be_bytes());
+        self.send(&msg)
+    }
+
+    /// Offers host clipboard text to the guest. QEMU asks for the data when the guest
+    /// pastes, so large text is only transferred when it is used.
+    pub fn offer_clipboard(&self, text: String) {
+        if !self.frame.lock().unwrap_or_else(|e| e.into_inner()).vnc_clipboard {
+            return;
+        }
+        *self.clipboard_offer.lock().unwrap_or_else(|e| e.into_inner()) = Some(text);
+        let _ = self.send_clipboard_message(CLIP_NOTIFY | CLIP_TEXT, &[]);
+    }
+
+    /// Asks the guest for its clipboard text; it arrives as `clipboard_text`.
+    pub fn request_clipboard(&self) -> Result<()> {
+        if !self.frame.lock().unwrap_or_else(|e| e.into_inner()).vnc_clipboard {
+            bail!("Clipboard sharing needs the guest agent.");
+        }
+        self.send_clipboard_message(CLIP_REQUEST | CLIP_TEXT, &[])
+    }
+
+    /// ClientCutText in the extended form: a negative length, then flags and data.
+    fn send_clipboard_message(&self, flags: u32, data: &[u8]) -> Result<()> {
+        let mut msg = vec![6, 0, 0, 0];
+        msg.extend_from_slice(&(-((4 + data.len()) as i32)).to_be_bytes());
+        msg.extend_from_slice(&flags.to_be_bytes());
+        msg.extend_from_slice(data);
+        self.send(&msg)
+    }
+
+    fn received_clipboard(&self, text: String) {
+        let text = text.trim_end_matches('\0').to_owned();
+        let mut frame = self.frame.lock().unwrap_or_else(|e| e.into_inner());
+        frame.clipboard_text = Some(text);
+        frame.guest_clipboard = frame.guest_clipboard.wrapping_add(1);
+    }
+
+    /// QEMU's extended clipboard (`vnc-clipboard.c`): capabilities, notify, request, provide.
+    fn extended_clipboard(&self, payload: &[u8]) -> Result<()> {
+        if payload.len() < 4 {
+            return Ok(());
+        }
+        let flags = u32::from_be_bytes(payload[..4].try_into().unwrap_or_default());
+        let data = &payload[4..];
+        if flags & CLIP_CAPS != 0 {
+            self.frame.lock().unwrap_or_else(|e| e.into_inner()).vnc_clipboard = true;
+            // Our capabilities: text, every action, and the largest text we accept.
+            let actions = CLIP_REQUEST | CLIP_PEEK | CLIP_NOTIFY | CLIP_PROVIDE;
+            self.send_clipboard_message(
+                CLIP_CAPS | CLIP_TEXT | actions,
+                &(MAX_CLIPBOARD_TEXT as u32).to_be_bytes(),
+            )?;
+            return Ok(());
+        }
+        if flags & CLIP_TEXT == 0 {
+            return Ok(());
+        }
+        if flags & CLIP_PROVIDE != 0 {
+            if let Some(text) = inflate_text(data) {
+                self.received_clipboard(text);
+            }
+        }
+        if flags & CLIP_REQUEST != 0 {
+            let offer = self.clipboard_offer.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            if let Some(text) = offer {
+                self.send_clipboard_message(CLIP_PROVIDE | CLIP_TEXT, &deflate_text(&text)?)?;
+            }
+        }
+        if flags & CLIP_PEEK != 0
+            && self.clipboard_offer.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+        {
+            self.send_clipboard_message(CLIP_NOTIFY | CLIP_TEXT, &[])?;
+        }
+        if flags & CLIP_NOTIFY != 0 {
+            // The guest copied text: fetch it so the host clipboard follows.
+            self.send_clipboard_message(CLIP_REQUEST | CLIP_TEXT, &[])?;
+        }
+        Ok(())
+    }
+
+    /// Ends the session; the reader thread stops when the socket closes.
+    pub fn close(&self) {
+        self.writer.lock().unwrap_or_else(|e| e.into_inner()).shutdown();
+    }
+
+    pub fn key(&self, keysym: u32, down: bool) {
+        let mut msg = vec![4, down as u8, 0, 0];
+        msg.extend_from_slice(&keysym.to_be_bytes());
+        if self.send(&msg).is_ok() {
+            let mut pressed = self.pressed_keys.lock().unwrap_or_else(|e| e.into_inner());
+            if down {
+                pressed.insert(keysym);
+            } else {
+                pressed.remove(&keysym);
+            }
+        }
+    }
+
+    /// Absolute pointer position in framebuffer pixels and the RFB button mask.
+    pub fn pointer(&self, x: u16, y: u16, buttons: u8) {
+        let absolute = self.frame.lock().unwrap_or_else(|e| e.into_inner()).absolute;
+        let previous = self.last.lock().unwrap_or_else(|e| e.into_inner()).replace((x, y));
+        // With pointer-type-change negotiated, QEMU reads relative-mode coordinates as
+        // offsets from 0x7FFF.
+        let (x, y) = match (absolute, previous) {
+            (Some(false), Some((px, py))) => (
+                (0x7fff + x as i32 - px as i32).clamp(0, 0xffff) as u16,
+                (0x7fff + y as i32 - py as i32).clamp(0, 0xffff) as u16,
+            ),
+            (Some(false), None) => (0x7fff, 0x7fff),
+            _ => (x, y),
+        };
+        self.pointer_packet(x, y, buttons);
+    }
+
+    /// Sends relative motion without deriving it from a clamped host position.
+    pub fn relative_pointer(&self, mut dx: i32, mut dy: i32, buttons: u8) {
+        loop {
+            let x = dx.clamp(-32767, 32768);
+            let y = dy.clamp(-32767, 32768);
+            self.pointer_packet((0x7fff + x) as u16, (0x7fff + y) as u16, buttons);
+            dx -= x;
+            dy -= y;
+            if dx == 0 && dy == 0 {
+                break;
+            }
+        }
+    }
+
+    fn pointer_packet(&self, x: u16, y: u16, buttons: u8) {
+        let mut msg = vec![5, buttons];
+        msg.extend_from_slice(&x.to_be_bytes());
+        msg.extend_from_slice(&y.to_be_bytes());
+        let _ = self.send(&msg);
+    }
+
+    pub fn reset_pointer(&self) {
+        *self.last.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// Releases every forwarded key and mouse button, including non-modifier keys.
+    pub fn release_input(&self) {
+        let keys =
+            std::mem::take(&mut *self.pressed_keys.lock().unwrap_or_else(|e| e.into_inner()));
+        for key in keys {
+            self.key(key, false);
+        }
+        let absolute = self.frame.lock().unwrap_or_else(|e| e.into_inner()).absolute;
+        let last = self.last.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let (x, y) = if absolute == Some(false) {
+            (0x7fff, 0x7fff)
+        } else {
+            last.unwrap_or((0, 0))
+        };
+        self.pointer_packet(x, y, 0);
+    }
+
+    fn read_loop(&self, mut s: Box<dyn Stream>) -> Result<()> {
+        let mut row = Vec::new();
+        loop {
+            match u8_(&mut s)? {
+                0 => {
+                    skip(&mut s, 1)?;
+                    let count = u16_(&mut s)?;
+                    for _ in 0..count {
+                        let x = u16_(&mut s)? as usize;
+                        let y = u16_(&mut s)? as usize;
+                        let w = u16_(&mut s)? as usize;
+                        let h = u16_(&mut s)? as usize;
+                        let encoding = i32::from_be_bytes(array(&mut s)?);
+                        match encoding {
+                            0 => {
+                                {
+                                    let f = self.frame.lock().unwrap_or_else(|e| e.into_inner());
+                                    validate_rect(x, y, w, h, f.width as usize, f.height as usize)?;
+                                }
+                                row.resize(w * h * 4, 0);
+                                s.read_exact(&mut row)?;
+                                for px in row.chunks_exact_mut(4) {
+                                    px[3] = 255;
+                                }
+                                let mut f = self.frame.lock().unwrap_or_else(|e| e.into_inner());
+                                let stride = f.width as usize * 4;
+                                for line in 0..h {
+                                    let start = (y + line) * stride + x * 4;
+                                    f.pixels[start..start + w * 4]
+                                        .copy_from_slice(&row[line * w * 4..(line + 1) * w * 4]);
+                                }
+                                f.mark_damage(Damage::new(x, y, w, h));
+                            }
+                            1 => {
+                                let sx = u16_(&mut s)? as usize;
+                                let sy = u16_(&mut s)? as usize;
+                                let mut f = self.frame.lock().unwrap_or_else(|e| e.into_inner());
+                                validate_rect(x, y, w, h, f.width as usize, f.height as usize)?;
+                                validate_rect(sx, sy, w, h, f.width as usize, f.height as usize)?;
+                                let stride = f.width as usize * 4;
+                                let lines: Vec<usize> = if sy < y {
+                                    (0..h).rev().collect()
+                                } else {
+                                    (0..h).collect()
+                                };
+                                for line in lines {
+                                    let from = (sy + line) * stride + sx * 4;
+                                    let to = (y + line) * stride + x * 4;
+                                    if from + w * 4 <= f.pixels.len()
+                                        && to + w * 4 <= f.pixels.len()
+                                    {
+                                        f.pixels.copy_within(from..from + w * 4, to);
+                                    }
+                                }
+                                f.mark_damage(Damage::new(x, y, w, h));
+                            }
+                            -239 => {
+                                // Cursor pseudo-encoding: x, y are the hotspot.
+                                ensure!(
+                                    w <= 1024 && h <= 1024,
+                                    "The guest cursor size is unsupported."
+                                );
+                                let mut pixels = vec![0u8; w * h * 4];
+                                s.read_exact(&mut pixels)?;
+                                let stride = w.div_ceil(8);
+                                let mut mask = vec![0u8; stride * h];
+                                s.read_exact(&mut mask)?;
+                                for row in 0..h {
+                                    for col in 0..w {
+                                        let on =
+                                            mask[row * stride + col / 8] & (0x80 >> (col % 8)) != 0;
+                                        pixels[(row * w + col) * 4 + 3] = if on {
+                                            255
+                                        } else {
+                                            0
+                                        };
+                                    }
+                                }
+                                let mut f = self.frame.lock().unwrap_or_else(|e| e.into_inner());
+                                f.cursor = (w > 0 && h > 0).then_some(Cursor {
+                                    width: w as u32,
+                                    height: h as u32,
+                                    hot_x: x as u32,
+                                    hot_y: y as u32,
+                                    pixels,
+                                });
+                                f.cursor_generation += 1;
+                            }
+                            -257 => {
+                                // QEMU pointer type change: x is 1 when the guest pointer is absolute.
+                                let absolute = x == 1;
+                                if std::env::var_os("HYDROXL_DEBUG_POINTER").is_some() {
+                                    eprintln!(
+                                        "guest pointer is {}",
+                                        if absolute {
+                                            "absolute"
+                                        } else {
+                                            "relative"
+                                        }
+                                    );
+                                }
+                                self.frame.lock().unwrap_or_else(|e| e.into_inner()).absolute =
+                                    Some(absolute);
+                                self.reset_pointer();
+                            }
+                            EXTENDED_DESKTOP_SIZE | -223 => {
+                                let layout = if encoding == EXTENDED_DESKTOP_SIZE {
+                                    let [screens, ..] = array::<4>(&mut s)?;
+                                    let mut single = None;
+                                    for _ in 0..screens {
+                                        let id = u32::from_be_bytes(array(&mut s)?);
+                                        let _geometry = array::<8>(&mut s)?;
+                                        let flags = u32::from_be_bytes(array(&mut s)?);
+                                        if screens == 1 {
+                                            single = Some(ResizeScreen {
+                                                id,
+                                                flags,
+                                            });
+                                        }
+                                    }
+                                    // A server can reject a client request without changing
+                                    // the current layout or revoking resize support.
+                                    if x == 1 && y != 0 {
+                                        continue;
+                                    }
+                                    Some(single)
+                                } else {
+                                    None
+                                };
+                                let mut f = self.frame.lock().unwrap_or_else(|e| e.into_inner());
+                                validate_size(w, h)?;
+                                if let Some(screen) = layout {
+                                    f.resize_screen = screen;
+                                }
+                                if (f.width, f.height) != (w as u32, h as u32) {
+                                    f.width = w as u32;
+                                    f.height = h as u32;
+                                    f.pixels = vec![0; w * h * 4];
+                                    f.damage.clear();
+                                    f.mark_damage(Damage::new(0, 0, w, h));
+                                }
+                            }
+                            other => {
+                                bail!("The guest display sent an unsupported encoding ({other}).")
+                            }
+                        }
+                    }
+                    self.frame.lock().unwrap_or_else(|e| e.into_inner()).generation += 1;
+                    self.request(true)?;
+                }
+                1 => {
+                    skip(&mut s, 3)?;
+                    let n = u16_(&mut s)? as usize;
+                    skip(&mut s, n * 6)?;
+                }
+                2 => {}
+                3 => {
+                    skip(&mut s, 3)?;
+                    let len = i32::from_be_bytes(array(&mut s)?);
+                    let size = len.unsigned_abs() as usize;
+                    if size > MAX_CLIPBOARD_MESSAGE {
+                        skip(&mut s, size)?;
+                        continue;
+                    }
+                    let mut payload = vec![0; size];
+                    s.read_exact(&mut payload)?;
+                    if len >= 0 {
+                        // Classic ServerCutText: Latin-1 text.
+                        self.received_clipboard(payload.iter().map(|&b| b as char).collect());
+                    } else {
+                        self.extended_clipboard(&payload)?;
+                    }
+                }
+                other => bail!("The guest display sent an unknown message ({other})."),
+            }
+        }
+    }
+}
+
+/// QEMU's extended clipboard pseudo-encoding (0xc0a1e5ce) and its message flags.
+const CLIPBOARD_EXT: i32 = 0xc0a1_e5ce_u32 as i32;
+const CLIP_TEXT: u32 = 1;
+const CLIP_CAPS: u32 = 1 << 24;
+const CLIP_REQUEST: u32 = 1 << 25;
+const CLIP_PEEK: u32 = 1 << 26;
+const CLIP_NOTIFY: u32 = 1 << 27;
+const CLIP_PROVIDE: u32 = 1 << 28;
+const MAX_CLIPBOARD_TEXT: usize = 1 << 20;
+const MAX_CLIPBOARD_MESSAGE: usize = 4 << 20;
+
+/// Provide payload: zlib stream of a big-endian size and the NUL-terminated UTF-8 text.
+fn deflate_text(text: &str) -> Result<Vec<u8>> {
+    use std::io::Write as _;
+    let mut raw = Vec::with_capacity(text.len() + 5);
+    raw.extend_from_slice(&((text.len() + 1) as u32).to_be_bytes());
+    raw.extend_from_slice(text.as_bytes());
+    raw.push(0);
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+    encoder.write_all(&raw)?;
+    Ok(encoder.finish()?)
+}
+
+fn inflate_text(data: &[u8]) -> Option<String> {
+    let mut raw = Vec::new();
+    flate2::read::ZlibDecoder::new(data)
+        .take(MAX_CLIPBOARD_TEXT as u64 + 4)
+        .read_to_end(&mut raw)
+        .ok()?;
+    let size = u32::from_be_bytes(raw.get(..4)?.try_into().ok()?) as usize;
+    let text = raw.get(4..4 + size.min(raw.len() - 4))?;
+    Some(String::from_utf8_lossy(text).trim_end_matches('\0').to_owned())
+}
+
+fn validate_size(w: usize, h: usize) -> Result<()> {
+    ensure!(
+        w > 0 && h > 0 && w <= MAX_DESKTOP_SIZE && h <= MAX_DESKTOP_SIZE,
+        "The guest display size is unsupported."
+    );
+    Ok(())
+}
+fn validate_rect(
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+    width: usize,
+    height: usize,
+) -> Result<()> {
+    ensure!(
+        x <= width && y <= height && w <= width - x && h <= height - y,
+        "The guest display sent an out-of-bounds rectangle."
+    );
+    Ok(())
+}
+
+fn handshake(s: &mut Box<dyn Stream>) -> Result<(u32, u32)> {
+    let mut version = [0u8; 12];
+    s.read_exact(&mut version)?;
+    if !version.starts_with(b"RFB ") {
+        bail!("The guest display is not a VNC server.");
+    }
+    s.write_all(b"RFB 003.008\n")?;
+    let count = u8_(s)?;
+    if count == 0 {
+        bail!("The guest display refused the connection.");
+    }
+    let mut types = vec![0u8; count as usize];
+    s.read_exact(&mut types)?;
+    if !types.contains(&1) {
+        bail!("The guest display requires a password.");
+    }
+    s.write_all(&[1])?;
+    if u32::from_be_bytes(array(s)?) != 0 {
+        bail!("The guest display refused the connection.");
+    }
+    s.write_all(&[1])?; // shared
+    let width = u16_(s)? as u32;
+    let height = u16_(s)? as u32;
+    validate_size(width as usize, height as usize)?;
+    skip(s, 16)?;
+    let name_len = u32::from_be_bytes(array(s)?) as usize;
+    skip(s, name_len)?;
+    // 32 bpp, depth 24, little endian, true colour, BGRX in memory (= GPUI's BGRA).
+    let mut format = vec![0, 0, 0, 0, 32, 24, 0, 1];
+    for max in [255u16; 3] {
+        format.extend_from_slice(&max.to_be_bytes());
+    }
+    format.extend_from_slice(&[16, 8, 0, 0, 0, 0]);
+    s.write_all(&format)?;
+    // CopyRect, Raw, DesktopSize, Cursor: QEMU then sends the cursor shape instead of
+    // painting it into the framebuffer, so the client draws it without lag.
+    let encodings = [1, 0, -223, -239, -257, EXTENDED_DESKTOP_SIZE, CLIPBOARD_EXT];
+    let mut msg = vec![2, 0];
+    msg.extend_from_slice(&(encodings.len() as u16).to_be_bytes());
+    for e in encodings {
+        msg.extend_from_slice(&e.to_be_bytes());
+    }
+    s.write_all(&msg)?;
+    Ok((width, height))
+}
+
+fn array<const N: usize>(s: &mut impl Read) -> Result<[u8; N]> {
+    let mut b = [0u8; N];
+    s.read_exact(&mut b)?;
+    Ok(b)
+}
+fn u8_(s: &mut impl Read) -> Result<u8> {
+    Ok(array::<1>(s)?[0])
+}
+fn u16_(s: &mut impl Read) -> Result<u16> {
+    Ok(u16::from_be_bytes(array(s)?))
+}
+fn skip(s: &mut impl Read, n: usize) -> Result<()> {
+    std::io::copy(&mut s.take(n as u64), &mut std::io::sink())?;
+    Ok(())
+}
+
+/// X11 keysym for a GPUI key name, or `None` when the key has no guest meaning.
+pub fn keysym(key: &str) -> Option<u32> {
+    Some(match key {
+        "enter" => 0xff0d,
+        "backspace" => 0xff08,
+        "tab" => 0xff09,
+        "escape" => 0xff1b,
+        "delete" => 0xffff,
+        "insert" => 0xff63,
+        "home" => 0xff50,
+        "end" => 0xff57,
+        "pageup" => 0xff55,
+        "pagedown" => 0xff56,
+        "left" => 0xff51,
+        "up" => 0xff52,
+        "right" => 0xff53,
+        "down" => 0xff54,
+        "space" => 0x20,
+        "capslock" => 0xffe5,
+        "menu" => 0xff67,
+        "printscreen" => 0xff61,
+        k if k.len() > 1 && k.starts_with('f') => {
+            let n: u32 = k[1..].parse().ok()?;
+            if !(1..=24).contains(&n) {
+                return None;
+            }
+            0xffbe + n - 1
+        }
+        k => {
+            let mut chars = k.chars();
+            let c = chars.next()?;
+            if chars.next().is_some() {
+                return None;
+            }
+            let cp = c as u32;
+            if (0x20..=0xff).contains(&cp) {
+                cp
+            } else {
+                0x0100_0000 + cp
+            }
+        }
+    })
+}
+
+/// RFB keysyms for modifier keys: shift, control, alt, super.
+pub const MODIFIERS: [u32; 4] = [0xffe1, 0xffe3, 0xffe9, 0xffeb];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[derive(Clone)]
+    struct TestStream {
+        input: std::io::Cursor<Vec<u8>>,
+        output: Arc<Mutex<Vec<u8>>>,
+    }
+    impl Read for TestStream {
+        fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+            self.input.read(bytes)
+        }
+    }
+    impl Write for TestStream {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.output.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl Stream for TestStream {
+        fn set_read_timeout(&self, _: Option<Duration>) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn duplicate(&self) -> std::io::Result<Box<dyn Stream>> {
+            Ok(Box::new(self.clone()))
+        }
+        fn shutdown(&self) {}
+    }
+    fn local_session(width: u32, height: u32) -> (Session, TestStream, Arc<Mutex<Vec<u8>>>) {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let client = TestStream {
+            input: std::io::Cursor::new(Vec::new()),
+            output: output.clone(),
+        };
+        let session = Session {
+            frame: Arc::new(Mutex::new(Framebuffer {
+                width,
+                height,
+                pixels: vec![0; (width * height * 4) as usize],
+                ..Default::default()
+            })),
+            writer: Mutex::new(Box::new(client.clone())),
+            last: Mutex::new(None),
+            pressed_keys: Mutex::default(),
+            clipboard_offer: Mutex::default(),
+        };
+        (session, client, output)
+    }
+    fn rect(x: u16, y: u16, w: u16, h: u16, encoding: i32, payload: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0, 0, 0, 1];
+        for n in [x, y, w, h] {
+            bytes.extend_from_slice(&n.to_be_bytes());
+        }
+        bytes.extend_from_slice(&encoding.to_be_bytes());
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+    fn apply(session: &Session, mut client: TestStream, _: Arc<Mutex<Vec<u8>>>, message: &[u8]) {
+        client.input = std::io::Cursor::new(message.to_vec());
+        assert!(session.read_loop(Box::new(client)).is_err()); // EOF after the update
+    }
+    #[test]
+    fn clipboard_text_round_trips_through_the_provide_encoding() {
+        for text in ["", "hello", "naïve — ünïcode\nline two"] {
+            assert_eq!(inflate_text(&deflate_text(text).unwrap()).unwrap(), text);
+        }
+    }
+
+    #[test]
+    fn raw_damage_and_copyrect_overlap() {
+        let (session, client, peer) = local_session(4, 3);
+        apply(&session, client, peer, &rect(1, 1, 2, 1, 0, &[1, 2, 3, 0, 4, 5, 6, 0]));
+        let mut f = session.frame.lock().unwrap();
+        let damage = f.take_damage();
+        assert_eq!(damage.len(), 1);
+        assert_eq!(damage[0].1, [1, 2, 3, 255, 4, 5, 6, 255]);
+        assert_eq!(&f.pixels[16..20], &[0; 4]);
+        drop(f);
+        let (session, client, peer) = local_session(2, 3);
+        session.frame.lock().unwrap().pixels = (0..24).collect();
+        apply(&session, client, peer, &rect(0, 1, 2, 2, 1, &[0, 0, 0, 0]));
+        let f = session.frame.lock().unwrap();
+        assert_eq!(&f.pixels[8..24], &(0..16).collect::<Vec<u8>>());
+    }
+    #[test]
+    fn cursor_and_pointer_updates_do_not_damage_pixels() {
+        let (session, client, peer) = local_session(4, 3);
+        let mut message = rect(1, 0, 0, 0, -257, &[]);
+        message.extend(rect(0, 0, 1, 1, -239, &[3, 2, 1, 0, 0x80]));
+        apply(&session, client, peer, &message);
+        let mut f = session.frame.lock().unwrap();
+        assert_eq!(f.absolute, Some(true));
+        assert_eq!(f.cursor_generation, 1);
+        assert_eq!(f.cursor.as_ref().unwrap().pixels, [3, 2, 1, 255]);
+        assert!(f.take_damage().is_empty());
+    }
+    #[test]
+    fn resize_replaces_damage_and_invalid_rect_is_rejected() {
+        let (session, client, peer) = local_session(4, 3);
+        session.frame.lock().unwrap().damage_all();
+        apply(&session, client, peer, &rect(0, 0, 2, 2, -223, &[]));
+        let mut f = session.frame.lock().unwrap();
+        let damage = f.take_damage();
+        assert_eq!(damage.len(), 1);
+        assert_eq!(damage[0].1.len(), 16);
+        drop(f);
+        let (session, client, peer) = local_session(4, 3);
+        apply(&session, client, peer, &rect(3, 0, 2, 1, 0, &[0; 8]));
+        let mut f = session.frame.lock().unwrap();
+        assert_eq!(f.generation, 0);
+        assert!(f.take_damage().is_empty());
+        assert_eq!(f.pixels, vec![0; 48]);
+    }
+    #[test]
+    fn negotiated_guest_resize_uses_the_screen_id_and_preserves_rejected_frames() {
+        let (session, client, peer) = local_session(4, 3);
+        let mut layout = vec![1, 0, 0, 0];
+        layout.extend_from_slice(&7u32.to_be_bytes());
+        for value in [0u16, 0, 4, 3] {
+            layout.extend_from_slice(&value.to_be_bytes());
+        }
+        layout.extend_from_slice(&2u32.to_be_bytes());
+        let advertisement = rect(0, 0, 4, 3, EXTENDED_DESKTOP_SIZE, &layout);
+        apply(&session, client.clone(), peer.clone(), &advertisement);
+        let screen = session.frame.lock().unwrap().resize_screen.unwrap();
+        peer.lock().unwrap().clear();
+        session.resize_desktop((1440, 900), screen).unwrap();
+        assert_eq!(
+            *peer.lock().unwrap(),
+            [251, 0, 5, 160, 3, 132, 1, 0, 0, 0, 0, 7, 0, 0, 0, 0, 5, 160, 3, 132, 0, 0, 0, 2]
+        );
+        let rejected = rect(1, 1, 1440, 900, EXTENDED_DESKTOP_SIZE, &layout);
+        apply(&session, client.clone(), peer.clone(), &rejected);
+        {
+            let frame = session.frame.lock().unwrap();
+            assert_eq!((frame.width, frame.height), (4, 3));
+            assert_eq!(frame.resize_screen, Some(screen));
+        }
+        layout[12..16].copy_from_slice(&[0, 6, 0, 4]);
+        let resized = rect(0, 0, 6, 4, EXTENDED_DESKTOP_SIZE, &layout);
+        apply(&session, client, peer, &resized);
+        let frame = session.frame.lock().unwrap();
+        assert_eq!((frame.width, frame.height), (6, 4));
+        assert_eq!(frame.pixels.len(), 6 * 4 * 4);
+    }
+    #[test]
+    fn relative_packets_preserve_large_deltas_and_release_every_key() {
+        let (session, _client, peer) = local_session(4, 3);
+        session.frame.lock().unwrap().absolute = Some(false);
+        session.relative_pointer(40000, -40000, 1);
+        let packets = std::mem::take(&mut *peer.lock().unwrap());
+        assert_eq!(&packets[..6], &[5, 1, 255, 255, 0, 0]);
+        assert_eq!(&packets[6..], &[5, 1, 156, 63, 99, 190]);
+        session.key(0x61, true);
+        session.key(MODIFIERS[0], true);
+        assert_eq!(std::mem::take(&mut *peer.lock().unwrap()).len(), 16);
+        session.release_input();
+        let up = std::mem::take(&mut *peer.lock().unwrap());
+        assert_eq!(&up[..8], &[4, 0, 0, 0, 0, 0, 0, 0x61]);
+        assert_eq!(&up[8..16], &[4, 0, 0, 0, 0, 0, 0xff, 0xe1]);
+        assert_eq!(&up[16..], &[5, 0, 0x7f, 0xff, 0x7f, 0xff]);
+        assert!(session.pressed_keys.lock().unwrap().is_empty());
+    }
+
+    /// Connects to a live QEMU VNC socket given in `HYDROXL_VNC_SOCKET`, waits for frames,
+    /// and writes the framebuffer to `HYDROXL_VNC_PNG`. Run with `cargo test -- --ignored`.
+    #[test]
+    #[ignore]
+    fn live_qemu_frames() {
+        let socket = std::env::var("HYDROXL_VNC_SOCKET").expect("HYDROXL_VNC_SOCKET");
+        let session = Session::connect(&Endpoint::Unix(socket.into())).expect("connect");
+        let start = std::time::Instant::now();
+        let mut updates = 0;
+        let mut last = 0;
+        while start.elapsed() < std::time::Duration::from_secs(4) {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let f = session.frame.lock().unwrap();
+            assert!(f.closed.is_none(), "{:?}", f.closed);
+            if f.generation != last {
+                last = f.generation;
+                updates += 1;
+            }
+        }
+        session.pointer(10, 10, 0);
+        session.key(0xff0d, true);
+        session.key(0xff0d, false);
+        let f = session.frame.lock().unwrap();
+        assert!(f.width > 0 && f.height > 0);
+        assert!(f.pixels.chunks_exact(4).any(|p| p[0] | p[1] | p[2] != 0), "blank frame");
+        eprintln!("{}x{} after {updates} updates", f.width, f.height);
+        if let Ok(path) = std::env::var("HYDROXL_VNC_PNG") {
+            let mut rgba = f.pixels.clone();
+            for px in rgba.chunks_exact_mut(4) {
+                px.swap(0, 2);
+            }
+            image::RgbaImage::from_raw(f.width, f.height, rgba).unwrap().save(path).unwrap();
+        }
+    }
+}

@@ -1,0 +1,41 @@
+[package]
+name = "hydroxl"
+version = "0.1.0"
+edition = "2024"
+description = "A quiet, native QEMU/KVM workspace for Linux"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+gpui-kit = "=0.9.0"
+libloading = "0.8"
+roxmltree = "0.21"
+rfd = "0.15"
+serde = "1"
+serde_json = "1"
+tar = "0.4"
+tempfile = "3"
+flate2 = "1"
+percent-encoding = "2"
+sha1 = "0.10"
+sha2 = "0.10"
+image = { version = "0.25", default-features = false, features = ["png", "pnm"] }
+zbus = { version = "5.19", features = ["p2p"] }
+
+# Only crates with local changes are patched; GPUI Kit/platform stay upstream.
+[patch.crates-io]
+gpui-pre = { path = "vendor/gpui-pre" }
+gpui-pre-linux = { path = "vendor/gpui-pre-linux" }
+gpui-pre-wgpu = { path = "vendor/gpui-pre-wgpu" }
+
+[profile.dev]
+debug = 0
+opt-level = 1
+
+# GPUI renders and animates in dependency code; unoptimized it drops frames.
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
+strip = true
