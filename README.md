@@ -34,6 +34,34 @@ For desktop integration, install the launcher in `share/applications` and
 `packaging/dev.hydroxl.Hydroxl.svg` in `share/icons/hicolor/scalable/apps`
 under the same installation prefix as the binary.
 
+## Arch Linux package
+
+Build an x86-64 package from your checkout with `makepkg`. From the repository
+root, install Arch's packaging tools, then build as a regular user.
+
+```sh
+sudo pacman -S --needed base-devel
+cd packaging/arch
+makepkg --syncdeps
+```
+
+`makepkg` installs missing dependencies through `pacman` and writes a
+`hydroxl-*.pkg.tar.zst` archive by default. If `pacman` prompts for a Vulkan
+driver, choose the one for your GPU. From the same directory, install the archive
+and launch the desktop preview.
+
+```sh
+sudo pacman -U "$(makepkg --packagelist)"
+hydroxl --demo
+```
+
+Use `makepkg --force` to rebuild after changing the checkout if an archive with
+the same version already exists. For live virtual machines, check your session
+connection with `virsh -c qemu:///session list --all`. See the
+[ArchWiki libvirt setup guide](https://wiki.archlinux.org/title/Libvirt) for
+host configuration. Install a file-picker portal backend for your desktop,
+such as `xdg-desktop-portal-gtk`, if one is missing.
+
 ## Requirements
 
 - A current stable Rust toolchain and the Linux development libraries required
@@ -135,13 +163,18 @@ activity indicator in the sidebar to see progress while an operation runs.
 
 Hardware, device changes, exports, cloning, and snapshot restoration require a
 powered-off guest where indicated. Shared clipboard needs SPICE guest tools;
-shared folders use a 9p mount tag. USB devices are listed from sysfs and use the permissions granted by libvirt. Advanced configuration edits the
-native domain XML and preserves the VM UUID.
+shared folders use a 9p mount tag. USB devices are listed from sysfs and use the
+permissions granted by libvirt. **Hardware → Advanced → Edit XML** updates the
+machine's registered libvirt configuration and preserves the VM UUID. The
+`machine.xml` beside the disks records how the machine was created or imported.
 
-Snapshots use libvirt's internal snapshot support; writable disks must support
-it, typically QCOW2. Snapshot display names are stored separately from their
-stable engine identities. Renaming does not rewrite a disk's internal snapshot
-name. Overwrite saves a replacement before removing the old snapshot.
+Snapshots use libvirt's internal snapshot support. QCOW2 stores the snapshot
+data inside the disk images, including guest memory for a running full-system
+snapshot. Libvirt keeps the snapshot XML and parent relationships. Hydroxl
+stores display names in `$XDG_DATA_HOME/hydroxl/snapshots/<vm-uuid>.json`,
+defaulting to `~/.local/share` when `XDG_DATA_HOME` is unset. Shut down VirGL
+guests before taking or overwriting a snapshot. Overwrite saves a replacement
+before removing the old snapshot.
 
 Disposable mode uses separate QCOW2 overlays and a transient guest; it never
 merges disk changes back. It currently rejects machines with NVRAM, TPM, shared

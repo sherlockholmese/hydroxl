@@ -25,8 +25,7 @@ use crate::backend::{Connection, Machine};
 use anyhow::Result;
 pub use architecture::available as available_architectures;
 pub use guest::{
-    GuestOs, GuestSetup, ShareDriver, WINDOWS_COMMAND, WINDOWS_UNMOUNT_COMMAND, linux_command,
-    linux_mount_point, linux_unmount_command,
+    GuestOs, GuestSetup, ShareDriver, WINDOWS_COMMAND, linux_command,
 };
 pub use inspect::{details, has_agent_channel};
 pub use platform::{NicChange, Platform, log_path, open_path, random_mac, read_log};

@@ -71,11 +71,12 @@ impl Config {
 
 pub fn xml(m: &Machine, xml: String) -> FormSpec {
     let machine = m.clone();
-    FormSpec::new("Libvirt XML", "Save", vec![F::xml(xml)], move |v| {
+    FormSpec::new("Machine configuration XML", "Save", vec![F::xml(xml)], move |v| {
         roxmltree::Document::parse(&v[0])
             .map_err(|_| anyhow::anyhow!("Fix the XML before saving."))?;
         Ok(operation(machine.clone(), Op::SaveXml(v[0].clone())))
     })
+    .note("Save updates the configuration in libvirt. The machine.xml beside the disks records the original setup.")
 }
 
 /// One device in the boot order list.

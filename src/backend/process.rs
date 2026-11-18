@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use std::{
     io::{BufReader, Read},
     process::{Command, Stdio},
@@ -184,31 +184,87 @@ fn run_inner(
     if !status.success() {
         // Detailed diagnostics stay in the process log, not the product interface.
         eprintln!("{program}: {}", error.trim());
-        let lower = error.to_ascii_lowercase();
-        if lower.contains("tpm")
-            && (lower.contains("not supported")
-                || lower.contains("swtpm")
-                || lower.contains("unsupported"))
-        {
-            bail!(super::tpm::UNAVAILABLE);
-        }
-        if error.contains("already active") {
-            bail!("The machine is already running. Refresh its state.");
-        }
-        if error.contains("permission denied")
-            || error.contains("authentication")
-            || error.contains("not authorized")
-        {
-            bail!("Access denied. Check your libvirt permissions and retry.");
-        }
-        bail!("The operation failed. Check the libvirt connection and retry.");
+        return Err(command_failure(program, args, &error));
     }
     Ok(output)
+}
+
+#[derive(Debug)]
+pub(crate) struct SnapshotNotFound;
+
+impl std::fmt::Display for SnapshotNotFound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("This snapshot no longer exists. Refresh the machine and try again.")
+    }
+}
+
+impl std::error::Error for SnapshotNotFound {}
+
+fn command_failure(program: &str, args: &[&str], error: &str) -> anyhow::Error {
+    let lower = error.to_ascii_lowercase();
+    if program == "virsh" {
+        match args {
+            ["--connect", _, "snapshot-create-as", ..]
+                if lower.contains("virgl is not yet migratable") =>
+            {
+                return anyhow!(
+                    "VirGL prevents snapshots while the machine is running. Shut it down and retry."
+                );
+            }
+            ["--connect", _, "snapshot-dumpxml" | "snapshot-delete" | "snapshot-revert", ..]
+                if lower.contains("domain snapshot not found") =>
+            {
+                return SnapshotNotFound.into();
+            }
+            _ => {}
+        }
+    }
+    if lower.contains("tpm")
+        && (lower.contains("not supported")
+            || lower.contains("swtpm")
+            || lower.contains("unsupported"))
+    {
+        return anyhow!(super::tpm::UNAVAILABLE);
+    }
+    if error.contains("already active") {
+        return anyhow!("The machine is already running. Refresh its state.");
+    }
+    if error.contains("permission denied")
+        || error.contains("authentication")
+        || error.contains("not authorized")
+    {
+        return anyhow!("Access denied. Check your libvirt permissions and retry.");
+    }
+    anyhow!("The operation failed. Check the libvirt connection and retry.")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explains_virgl_snapshot_failure() {
+        let error = "error: Requested operation is not valid: cannot migrate domain: virgl is not yet migratable";
+        let connection = "qemu:///session";
+        assert_eq!(
+            command_failure("virsh", &["--connect", connection, "snapshot-create-as"], error)
+                .to_string(),
+            "VirGL prevents snapshots while the machine is running. Shut it down and retry."
+        );
+        assert_eq!(
+            command_failure("virsh", &["--connect", connection, "managedsave"], error).to_string(),
+            "The operation failed. Check the libvirt connection and retry."
+        );
+    }
+
+    #[test]
+    fn distinguishes_a_missing_snapshot_from_other_lookup_errors() {
+        let args = ["--connect", "qemu:///session", "snapshot-dumpxml", "machine", "backup"];
+        let missing =
+            "error: Domain snapshot not found: no domain snapshot with matching name 'backup'";
+        assert!(command_failure("virsh", &args, missing).is::<SnapshotNotFound>());
+        assert!(!command_failure("virsh", &args, "permission denied").is::<SnapshotNotFound>());
+    }
 
     #[test]
     fn parses_qemu_img_progress_records() {

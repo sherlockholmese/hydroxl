@@ -111,7 +111,11 @@ pub fn details(c: Connection, id: &str) -> Result<Details> {
     let labels = snapshot_labels(id);
     let mut snapshots = Vec::new();
     for name in snapshot_names.lines().filter(|s| !s.is_empty()) {
-        let snapshot_xml = backend::virsh(c, &["snapshot-dumpxml", id, name])?;
+        let snapshot_xml = match backend::virsh(c, &["snapshot-dumpxml", id, name]) {
+            Ok(xml) => xml,
+            Err(error) if error.is::<backend::SnapshotNotFound>() => continue,
+            Err(error) => return Err(error),
+        };
         let doc = roxmltree::Document::parse(&snapshot_xml)?;
         let state = doc
             .descendants()
@@ -128,7 +132,7 @@ pub fn details(c: Connection, id: &str) -> Result<Details> {
         snapshots.push(Snapshot {
             name: name.into(),
             label: labels.get(name).cloned().unwrap_or_else(|| name.into()),
-            state: State::from_virsh(state).label().into(),
+            state: snapshot_state_label(state).into(),
             parent,
         });
     }
@@ -196,6 +200,16 @@ pub fn details(c: Connection, id: &str) -> Result<Details> {
     })
 }
 
+fn snapshot_state_label(state: &str) -> &'static str {
+    match state.trim() {
+        "shutoff" => State::Stopped.label(),
+        "disk-snapshot" => "Disk only",
+        "blocked" => "Blocked",
+        "shutdown" => "Shutting down",
+        _ => State::from_virsh(state).label(),
+    }
+}
+
 /// Whether the domain has the QEMU guest agent's virtio channel.
 pub fn has_agent_channel(xml: &str) -> bool {
     xml.contains("org.qemu.guest_agent.0")
@@ -238,4 +252,16 @@ fn host_bridges() -> Vec<String> {
         .unwrap_or_default();
     bridges.sort();
     bridges
+}
+
+#[cfg(test)]
+mod tests {
+    use super::snapshot_state_label;
+
+    #[test]
+    fn labels_libvirt_snapshot_states() {
+        assert_eq!(snapshot_state_label("shutoff"), "Powered off");
+        assert_eq!(snapshot_state_label("disk-snapshot"), "Disk only");
+        assert_eq!(snapshot_state_label("running"), "Running");
+    }
 }

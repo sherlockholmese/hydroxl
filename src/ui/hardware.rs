@@ -1229,7 +1229,7 @@ impl Workspace {
         p: Palette,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        use crate::operations::{GuestOs, GuestSetup, ShareDriver};
+        use crate::operations::{GuestOs, ShareDriver};
         let m = machine.clone();
         let mut group = section(
             "Shared folders",
@@ -1281,8 +1281,6 @@ impl Workspace {
                         let weak = cx.entity().downgrade();
                         let busy = self.busy();
                         let device = (*share).clone();
-                        let running = machine.state == State::Running;
-                        let tag = share.target.clone();
                         Button::new(("share-actions", i))
                             .ghost()
                             .small()
@@ -1331,47 +1329,8 @@ impl Workspace {
                                             });
                                         })
                                 };
-                                let unmount = {
-                                    let weak = weak.clone();
-                                    let share = (tag.clone(), driver);
-                                    PopupMenuItem::new("Unmount in guest")
-                                        .icon(super::primitives::glyph("folder-x"))
-                                        .disabled(busy || !running)
-                                        .on_click(move |_, _, cx| {
-                                            let share = share.clone();
-                                            let _ = weak.update(cx, |this, cx| {
-                                                if let Some(m) = this.selected_machine().cloned() {
-                                                    let op =
-                                                        Operation::Guest(GuestSetup::Unmount {
-                                                            os,
-                                                            shares: vec![share],
-                                                        });
-                                                    this.begin(Job::Operation(m, op), None, cx);
-                                                }
-                                            });
-                                        })
-                                };
-                                let copy = {
-                                    let command = match os {
-                                        GuestOs::Linux => {
-                                            crate::operations::linux_unmount_command(&tag, true)
-                                        }
-                                        GuestOs::Windows => {
-                                            crate::operations::WINDOWS_UNMOUNT_COMMAND.to_owned()
-                                        }
-                                    };
-                                    PopupMenuItem::new("Copy unmount command")
-                                        .icon(super::primitives::glyph("copy"))
-                                        .on_click(move |_, _, cx| {
-                                            cx.write_to_clipboard(ClipboardItem::new_string(
-                                                command.clone(),
-                                            ))
-                                        })
-                                };
                                 menu.min_w(px(super::primitives::MENU_MIN_WIDTH))
                                     .item(edit)
-                                    .item(unmount)
-                                    .item(copy)
                                     .separator()
                                     .item(remove)
                             })
@@ -1381,22 +1340,17 @@ impl Workspace {
         }
         group = group.child(super::primitives::item_list(share_rows, p));
 
-        // In the guest: one command per system, copied or typed straight into the guest.
+        // In the guest: the command that mounts the folders, beside the button that runs it.
         let running = machine.state == State::Running;
-        let commands: Vec<(String, String)> = match os {
+        let commands: Vec<String> = match os {
             GuestOs::Linux => shares
                 .iter()
                 .map(|share| {
                     let driver = ShareDriver::from_xml(&share.xml);
-                    (
-                        crate::operations::linux_mount_point(&share.target),
-                        crate::operations::linux_command(&share.target, driver, true),
-                    )
+                    crate::operations::linux_command(&share.target, driver, true)
                 })
                 .collect(),
-            GuestOs::Windows => {
-                vec![("Administrator prompt".into(), crate::operations::WINDOWS_COMMAND.into())]
-            }
+            GuestOs::Windows => vec![crate::operations::WINDOWS_COMMAND.into()],
         };
         let id = machine.id.clone();
         let picker = self.segmented_with(
@@ -1447,69 +1401,84 @@ impl Workspace {
                     .into_any_element(),
             ));
         }
-        rows.push(row(
-            "Mount automatically".into(),
-            Button::new("setup-shares")
-                .outline()
-                .small()
-                .label("Run")
-                .disabled(!running || self.busy())
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    if let Some(m) = this.selected_machine().cloned() {
-                        let op = Operation::Guest(crate::operations::GuestSetup::Shares {
-                            os,
-                            shares: setup_shares.clone(),
-                        });
-                        this.begin(Job::Operation(m, op), None, cx);
-                    }
-                }))
-                .into_any_element(),
-        ));
-        for (i, (title, command)) in commands.into_iter().enumerate() {
-            let typed = command.clone();
-            rows.push(
-                v_flex()
-                    .py_3()
-                    .gap_1()
-                    .child(
-                        h_flex()
-                            .gap_1()
-                            .child(div().flex_1().min_w_0().truncate().child(title))
-                            .child(
-                                Button::new(("type-mount", i))
-                                    .ghost()
-                                    .xsmall()
-                                    .icon(super::primitives::glyph("keyboard"))
-                                    .accessibility_label("Type in guest")
-                                    .tooltip("Type in guest")
-                                    .disabled(!running || self.busy())
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        if let Some(m) = this.selected_machine().cloned() {
-                                            let op = Operation::Guest(
-                                                crate::operations::GuestSetup::Type(typed.clone()),
-                                            );
-                                            this.begin(Job::Operation(m, op), None, cx);
-                                        }
-                                    })),
-                            )
-                            .child(
-                                Clipboard::new(("copy-mount", i))
-                                    .value(command.clone())
-                                    .accessibility_label("Copy command")
-                                    .tooltip("Copy"),
-                            ),
-                    )
+        // One row: what runs (each command, copyable where it reads) and the button that
+        // runs it. Mounting is one task, so it is one row, not a setting plus a recipe.
+        let mut lines = v_flex().flex_1().min_w_0().gap_2();
+        for (i, command) in commands.into_iter().enumerate() {
+            lines = lines.child(
+                h_flex()
+                    .items_start()
+                    .gap_2()
                     .child(
                         div()
+                            .flex_1()
+                            .min_w_0()
                             .font_family(mono.clone())
                             .text_size(px(CAPTION_SIZE))
                             .line_height(relative(1.6))
                             .text_color(p.muted)
-                            .child(command),
+                            .child(command.clone()),
                     )
-                    .into_any_element(),
+                    .child(
+                        Clipboard::new(("copy-mount", i))
+                            .value(command)
+                            .accessibility_label("Copy command")
+                            .tooltip("Copy"),
+                    ),
             );
         }
+        rows.push(
+            h_flex()
+                .items_start()
+                .gap_6()
+                .py_3()
+                .child(lines)
+                .child({
+                    // Opposite actions on the same folders, side by side; the one that adds
+                    // is the stronger of the two.
+                    let unmount_shares = setup_shares.clone();
+                    h_flex()
+                        .gap_2()
+                        .flex_shrink_0()
+                        .child(
+                            Button::new("unmount-shares")
+                                .ghost()
+                                .small()
+                                .label("Unmount")
+                                .disabled(!running || self.busy())
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if let Some(m) = this.selected_machine().cloned() {
+                                        let op = Operation::Guest(
+                                            crate::operations::GuestSetup::Unmount {
+                                                os,
+                                                shares: unmount_shares.clone(),
+                                            },
+                                        );
+                                        this.begin(Job::Operation(m, op), None, cx);
+                                    }
+                                })),
+                        )
+                        .child(
+                            Button::new("setup-shares")
+                                .outline()
+                                .small()
+                                .label("Mount")
+                                .disabled(!running || self.busy())
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if let Some(m) = this.selected_machine().cloned() {
+                                        let op = Operation::Guest(
+                                            crate::operations::GuestSetup::Shares {
+                                                os,
+                                                shares: setup_shares.clone(),
+                                            },
+                                        );
+                                        this.begin(Job::Operation(m, op), None, cx);
+                                    }
+                                })),
+                        )
+                })
+                .into_any_element(),
+        );
         group
             .child(div().h(px(16.)))
             .child(section("In the guest", Some(picker), p))
