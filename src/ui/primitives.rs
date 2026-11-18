@@ -121,7 +121,7 @@ pub(crate) fn segmented(
 }
 
 /// Hardware groups, shown the way System Settings shows them on macOS: a list of
-/// categories beside the selected one. A narrow pane puts the categories in a bar on top.
+/// categories beside the selected one. A narrow pane puts them in one row of icons on top.
 pub(crate) struct Sections(pub Vec<(&'static str, &'static str, AnyElement)>);
 
 impl Sections {
@@ -150,55 +150,75 @@ impl Sections {
         const ITEM: f32 = 34.;
         const GAP: f32 = 2.;
         // One highlight that travels between categories; the items themselves never fade.
+        // Wide: a labelled list, travelling down. Narrow: one row of equal icon cells,
+        // travelling across. The group's own heading names the selection, so the row
+        // carries no labels and never wraps.
+        let step = ITEM + GAP;
         let highlight = div()
             .absolute()
-            .left_0()
-            .w_full()
+            .when(split, |h| h.left_0().w_full())
+            .when(!split, |h| h.top_0().w(px(ITEM)))
             .h(px(ITEM))
             .rounded_md()
             .bg(p.sidebar_accent)
             .with_animation(
-                SharedString::from(format!("hardware-highlight-{from}-{selected}")),
+                SharedString::from(format!("hardware-highlight-{split}-{from}-{selected}")),
                 gpui_kit::Animation::new(crate::theme::motion::SWAP)
                     .with_easing(crate::theme::motion::ease_out),
                 move |el, t| {
-                    let y = |i: usize| i as f32 * (ITEM + GAP);
-                    el.top(px(y(from) + (y(selected) - y(from)) * t))
+                    let at = px((from as f32 + (selected as f32 - from as f32) * t) * step);
+                    if split {
+                        el.top(at)
+                    } else {
+                        el.left(at)
+                    }
                 },
             );
         let mut nav = if split {
             v_flex().relative().w(px(196.)).flex_shrink_0().gap(px(GAP)).child(highlight)
         } else {
-            // Too narrow for a side list: the categories wrap into a bar on top, all visible.
-            h_flex().flex_wrap().gap_1()
+            // Cells and highlight share one coordinate system, so they cannot drift apart.
+            let count = self.0.len() as f32;
+            div().relative().flex_shrink_0().h(px(ITEM)).w(px(count * step - GAP)).child(highlight)
         };
         let mut content = None;
         for (i, (title, icon, group)) in self.0.into_iter().enumerate() {
             let on = i == selected;
+            let tone = if on {
+                p.text
+            } else {
+                p.muted
+            };
             nav = nav.child(
                 h_flex()
                     .id(("hardware-section", i))
                     .relative()
                     .h(px(ITEM))
-                    .px_2p5()
-                    .gap_2p5()
+                    .flex_shrink_0()
                     .rounded_md()
                     .cursor_pointer()
-                    .flex_shrink_0()
                     .text_size(px(BODY_SIZE))
-                    .when(!split && on, |item| item.bg(p.sidebar_accent))
-                    .text_color(if on {
-                        p.text
-                    } else {
-                        p.muted
-                    })
+                    .text_color(tone)
                     .when(!on, |item| item.hover(|style| style.text_color(p.text)))
-                    .child(glyph(icon).size_4().text_color(if on {
-                        p.text
-                    } else {
-                        p.muted
-                    }))
-                    .child(title)
+                    .map(|item| {
+                        if split {
+                            item.px_2p5()
+                                .gap_2p5()
+                                .child(glyph(icon).size_4().text_color(tone))
+                                .child(title)
+                        } else {
+                            item.absolute()
+                                .top_0()
+                                .left(px(i as f32 * step))
+                                .w(px(ITEM))
+                                .justify_center()
+                                .child(glyph(icon).size_4().text_color(tone))
+                                .tooltip(move |window, cx| {
+                                    gpui_kit::component::tooltip::Tooltip::new(title)
+                                        .build(window, cx)
+                                })
+                        }
+                    })
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if this.hardware_section != i {
                             this.hardware_section_from = this.hardware_section;

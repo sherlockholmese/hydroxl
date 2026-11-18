@@ -64,6 +64,7 @@ pub(super) fn apply_new_disk(
             target,
             bus,
         },
+        &Default::default(),
     );
     // A failed connection does not prove that attachment failed; keep the new disk.
     result?;

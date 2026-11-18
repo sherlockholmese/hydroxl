@@ -21,8 +21,8 @@ Tabs: Overview (display well and one ledger column), Hardware, Snapshots.
 
 Hardware follows macOS System Settings: a category list beside the selected category.
 The highlight slides between categories; only the content fades. When the pane is
-narrow the categories wrap into a bar above the content. Devices live in their category
-(drives in Storage, cards and forwards in Network, USB in USB and input). Repeated items
+narrow the categories become one row of icons above the content, named on hover.
+Devices live in their category (drives in Storage, cards and forwards in Network, USB in USB and input). Repeated items
 sit in one inset group divided by hairlines.
 
 The actions menu is flat: only actions that apply in the current state, grouped by what

@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use std::{
-    io::{BufRead as _, BufReader, Read},
+    io::{BufReader, Read},
     process::{Command, Stdio},
     thread,
     time::{Duration, Instant},
@@ -22,7 +22,83 @@ pub(crate) fn qemu_convert(
     let mut command = vec!["convert", "-p"];
     command.extend_from_slice(args);
     progress.update(stage.clone(), Some(0));
-    run_inner("qemu-img", &command, Some((progress, stage)), None).map(|_| ())
+    let meter = Meter {
+        reporter: progress,
+        stage,
+        parse: qemu_percent,
+        stderr: false,
+    };
+    run_inner("qemu-img", &command, Some(meter), None).map(|_| ())
+}
+
+/// Runs a virsh command that takes `--verbose` and reports `Name: [ 42.10 %]` on stderr.
+pub(crate) fn virsh_with_progress(
+    connection: super::Connection,
+    args: &[&str],
+    progress: &super::progress::Reporter,
+    stage: &str,
+) -> Result<()> {
+    let mut all = vec!["--connect", connection.uri()];
+    all.extend_from_slice(args);
+    all.push("--verbose");
+    progress.update(stage, Some(0));
+    let meter = Meter {
+        reporter: progress.clone(),
+        stage: stage.to_owned(),
+        parse: virsh_percent,
+        stderr: true,
+    };
+    run_inner("virsh", &all, Some(meter), None).map(|_| ())
+}
+
+/// A progress reading taken from one output stream of a running command.
+struct Meter {
+    reporter: super::progress::Reporter,
+    stage: String,
+    parse: fn(&str) -> Option<u8>,
+    stderr: bool,
+}
+
+impl Meter {
+    /// Reads `stream` record by record (records end in `\r` or `\n`), publishing each
+    /// new percentage. Records that are not progress are returned for diagnostics.
+    fn follow(self, stream: impl Read) -> String {
+        let mut stream = BufReader::new(stream);
+        let mut rest = String::new();
+        let mut last = None;
+        let mut record = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            let done = !matches!(stream.read(&mut byte), Ok(1));
+            if !done && byte[0] != b'\r' && byte[0] != b'\n' {
+                record.push(byte[0]);
+                continue;
+            }
+            let text = String::from_utf8_lossy(&record);
+            match (self.parse)(&text) {
+                Some(value) if Some(value) != last => {
+                    self.reporter.update(&self.stage, Some(value));
+                    last = Some(value);
+                }
+                Some(_) => {}
+                None if !text.trim().is_empty() => {
+                    rest.push_str(&text);
+                    rest.push('\n');
+                }
+                None => {}
+            }
+            record.clear();
+            if done {
+                return rest;
+            }
+        }
+    }
+}
+
+fn virsh_percent(record: &str) -> Option<u8> {
+    let (_, tail) = record.split_once(": [")?;
+    let value = tail.strip_suffix("%]")?.trim().parse::<f32>().ok()?;
+    (value.is_finite() && (0. ..=100.).contains(&value)).then_some(value.floor() as u8)
 }
 
 fn qemu_percent(chunk: &str) -> Option<u8> {
@@ -34,7 +110,7 @@ fn qemu_percent(chunk: &str) -> Option<u8> {
 fn run_inner(
     program: &str,
     args: &[&str],
-    progress: Option<(super::progress::Reporter, String)>,
+    progress: Option<Meter>,
     input: Option<String>,
 ) -> Result<String> {
     let mut child = Command::new(program)
@@ -57,35 +133,35 @@ fn run_inner(
     }
     let mut stdout = child.stdout.take().context("Could not read command output.")?;
     let mut stderr = child.stderr.take().context("Could not read command errors.")?;
-    let out = thread::spawn(move || {
-        if let Some((progress, stage)) = progress {
-            let mut stdout = BufReader::new(stdout);
-            let mut chunk = Vec::new();
-            let mut last = None;
-            while stdout.read_until(b'\r', &mut chunk).is_ok_and(|size| size > 0) {
-                let value = qemu_percent(&String::from_utf8_lossy(&chunk));
-                if let Some(value) = value.filter(|value| Some(*value) != last) {
-                    progress.update(&stage, Some(value));
-                    last = Some(value);
-                }
-                chunk.clear();
-            }
+    let (out_meter, err_meter) = match progress {
+        Some(meter) if meter.stderr => (None, Some(meter)),
+        meter => (meter, None),
+    };
+    let out = thread::spawn(move || match out_meter {
+        Some(meter) => {
+            meter.follow(stdout);
             String::new()
-        } else {
+        }
+        None => {
             let mut s = String::new();
             let _ = stdout.read_to_string(&mut s);
             s
         }
     });
-    let err = thread::spawn(move || {
-        let mut s = String::new();
-        let _ = stderr.read_to_string(&mut s);
-        s
+    let err = thread::spawn(move || match err_meter {
+        Some(meter) => meter.follow(stderr),
+        None => {
+            let mut s = String::new();
+            let _ = stderr.read_to_string(&mut s);
+            s
+        }
     });
     let timeout = if program == "curl"
         || program == "qemu-img"
         || program == "virt-clone"
-        || args.iter().any(|a| ["managedsave", "snapshot-create-as", "snapshot-revert"].contains(a))
+        || args
+            .iter()
+            .any(|a| ["dump", "managedsave", "snapshot-create-as", "snapshot-revert"].contains(a))
     {
         Duration::from_secs(3600)
     } else {
@@ -138,6 +214,9 @@ mod tests {
     fn parses_qemu_img_progress_records() {
         assert_eq!(qemu_percent("    (33.21/100%)\r"), Some(33));
         assert_eq!(qemu_percent("    (100.00/100%)\n"), Some(100));
+        assert_eq!(virsh_percent("Dump: [ 56.64 %]"), Some(56));
+        assert_eq!(virsh_percent("Dump: [100 %]"), Some(100));
+        assert_eq!(virsh_percent("error: Failed to core dump"), None);
         assert_eq!(qemu_percent("qemu-img: Could not open disk"), None);
         assert_eq!(qemu_percent("(NaN/100%)"), None);
     }

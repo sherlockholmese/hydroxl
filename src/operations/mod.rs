@@ -32,13 +32,18 @@ pub use inspect::{details, has_agent_channel};
 pub use platform::{NicChange, Platform, log_path, open_path, random_mac, read_log};
 pub use types::{Details, Device, Operation, Snapshot};
 pub use usb::host_usb;
-pub fn execute(c: Connection, machine: &Machine, op: Operation) -> Result<()> {
+pub fn execute(
+    c: Connection,
+    machine: &Machine,
+    op: Operation,
+    progress: &crate::backend::progress::Reporter,
+) -> Result<()> {
     match op {
         Operation::Sequence(steps) => {
             if steps.iter().any(|step| matches!(step, Operation::NestedVirtualization(true))) {
                 nesting::host_feature(machine)?;
             }
-            steps.into_iter().try_for_each(|step| execute(c, machine, step))
+            steps.into_iter().try_for_each(|step| execute(c, machine, step, progress))
         }
         Operation::NestedVirtualization(enabled) => nesting::apply(c, machine, enabled),
         Operation::Resources {
@@ -162,6 +167,6 @@ pub fn execute(c: Connection, machine: &Machine, op: Operation) -> Result<()> {
         Operation::MemoryDump {
             path,
             format,
-        } => capture::apply_memory_dump(c, machine, path, format),
+        } => capture::apply_memory_dump(c, machine, path, format, progress),
     }
 }

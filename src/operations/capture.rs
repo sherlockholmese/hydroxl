@@ -45,6 +45,7 @@ pub(super) fn apply_memory_dump(
     machine: &Machine,
     path: PathBuf,
     format: String,
+    progress: &backend::progress::Reporter,
 ) -> Result<()> {
     if !["elf", "kdump-zlib", "win-dmp"].contains(&format.as_str()) {
         anyhow::bail!("Choose a memory dump format.");
@@ -53,9 +54,11 @@ pub(super) fn apply_memory_dump(
         anyhow::bail!("Choose a new file name for the memory dump.");
     }
     std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path)?;
-    let result = backend::virsh(
+    let result = backend::virsh_with_progress(
         c,
-        &["dump", &machine.id, path_text(&path)?, "--memory-only", "--live", "--format", &format],
+        &["dump", &machine.id, path_text(&path)?, "--memory-only", "--format", &format],
+        progress,
+        "Saving memory dump",
     );
     if result.is_err() {
         let _ = fs::remove_file(&path);

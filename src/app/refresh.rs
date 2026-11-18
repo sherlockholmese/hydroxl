@@ -41,6 +41,7 @@ impl Workspace {
             return false;
         }
         let label = job.label();
+        let done = job.done();
         let c = self.preferences.connection;
         let hardware_save = match &job {
             Job::Operation(machine, Operation::Sequence(_)) => Some(machine.id.clone()),
@@ -90,7 +91,7 @@ impl Workspace {
                     format,
                 } => backend::disk_convert::convert(&source, &destination, &format, &progress),
                 Job::Appliance(spec) => appliance::import(c, &spec, &progress),
-                Job::Operation(m, op) => operations::execute(c, &m, op),
+                Job::Operation(m, op) => operations::execute(c, &m, op, &progress),
             }
             .map_err(|e| e.to_string());
             if outcome.is_ok()
@@ -146,6 +147,7 @@ impl Workspace {
             receiver: rx,
             form,
             label,
+            done,
             reporter,
             progress: Default::default(),
         });
@@ -222,17 +224,7 @@ impl Workspace {
                     if pending.hardware_save.is_some() && pending.hardware_save == self.selected {
                         self.saved_hardware_for = pending.hardware_save;
                     }
-                    self.notice = Some(
-                        match pending.label {
-                            "Requesting shutdown" => "Shutdown requested",
-                            "Starting machine" => "Start requested",
-                            "Opening display" => "Display opened",
-                            "Converting disk" => "Converted disk saved",
-                            "Restarting machine" => "Machine restarted",
-                            _ => "Changes saved",
-                        }
-                        .into(),
-                    );
+                    self.notice = Some(pending.done.clone());
                     if let Some(form) = pending.form {
                         let open = form
                             .update(cx, |form, cx| {

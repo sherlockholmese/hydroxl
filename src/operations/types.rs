@@ -269,3 +269,155 @@ impl Details {
         }
     }
 }
+
+impl Operation {
+    /// What happened, said once the operation succeeds. Names the thing that changed so a
+    /// notice never reads as a generic "saved".
+    pub(crate) fn done(&self) -> String {
+        use super::GuestSetup;
+        let file = |p: &PathBuf| {
+            p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+        };
+        let on = |b: bool| {
+            if b {
+                "on"
+            } else {
+                "off"
+            }
+        };
+        match self {
+            Self::Sequence(steps) => match steps.as_slice() {
+                [one] => one.done(),
+                _ => "Hardware saved".into(),
+            },
+            Self::Resources {
+                ..
+            } => "Processor and memory saved".into(),
+            Self::BootOrder(_) => "Boot order saved".into(),
+            Self::Platform(_) => "Platform settings saved".into(),
+            Self::Nic(_) => "Network adapter saved".into(),
+            Self::DiskBus {
+                target,
+                ..
+            } => format!("Bus changed for {target}"),
+            Self::AddSerial {
+                ..
+            } => "Serial port added".into(),
+            Self::ShowFiles => "Files shown".into(),
+            Self::Reset => "Machine reset".into(),
+            Self::OpenLog => "Log opened".into(),
+            Self::Notes(_) => "Notes saved".into(),
+            Self::Firmware(uefi) => if *uefi {
+                "Firmware set to UEFI"
+            } else {
+                "Firmware set to BIOS"
+            }
+            .into(),
+            Self::NestedVirtualization(enabled) => {
+                format!("Nested virtualization turned {}", on(*enabled))
+            }
+            Self::CloneConfiguration(name) => format!("Configuration copied to {name}"),
+            Self::MoveStorage(path) => format!("Storage moved to {}", path.display()),
+            Self::CompactDisk(target) => format!("{target} compacted"),
+            Self::AddCdrom {
+                ..
+            } => "CD drive added".into(),
+            Self::GuestTools(_) => "Guest tools inserted".into(),
+            Self::System {
+                ..
+            } => "System settings saved".into(),
+            Self::Display {
+                ..
+            } => "Display and sound saved".into(),
+            Self::PortForward {
+                protocol,
+                host,
+                guest,
+            } => {
+                format!("Forwarding {} {host} to {guest}", protocol.to_uppercase())
+            }
+            Self::DetachDevice(_) => "Device removed".into(),
+            Self::RemovePortForward(_) => "Port forward removed".into(),
+            Self::Reboot => "Machine restarted".into(),
+            Self::ForceStop => "Machine forced off".into(),
+            Self::SaveState => "Machine state saved".into(),
+            Self::DiscardState => "Saved state discarded".into(),
+            Self::Disposable => "Disposable copy started".into(),
+            Self::Autostart(enabled) => format!("Start with host turned {}", on(*enabled)),
+            Self::Rename(name) => format!("Renamed to {name}"),
+            Self::Clone(name) => format!("Cloned as {name}"),
+            Self::Export(path) | Self::ExportOva(path) => format!("Exported {}", file(path)),
+            Self::Remove {
+                delete_disks,
+            } => if *delete_disks {
+                "Machine and disks removed"
+            } else {
+                "Machine removed"
+            }
+            .into(),
+            Self::SnapshotCreate(name) => format!("Snapshot {name} saved"),
+            Self::SnapshotRestore(name) => format!("Restored {name}"),
+            Self::SnapshotDelete(name) => format!("Snapshot {name} deleted"),
+            Self::SnapshotRename {
+                new,
+                ..
+            } => format!("Snapshot renamed to {new}"),
+            Self::SnapshotOverwrite(name) => format!("Snapshot {name} replaced"),
+            Self::AttachDisk {
+                path,
+                ..
+            } => format!("{} attached", file(path)),
+            Self::NewDisk {
+                size_gib,
+                ..
+            } => format!("{size_gib} GB disk added"),
+            Self::DetachDisk(target) => format!("{target} removed"),
+            Self::MountIso {
+                path,
+                ..
+            } => format!("{} inserted", file(path)),
+            Self::EjectIso(_) => "Disc ejected".into(),
+            Self::ResizeDisk {
+                target,
+                size_gib,
+            } => format!("{target} resized to {size_gib} GB"),
+            Self::Network {
+                ..
+            } => "Network saved".into(),
+            Self::Share {
+                tag,
+                ..
+            } => format!("Sharing {tag}"),
+            Self::Architecture(arch) => format!("Architecture set to {arch}"),
+            Self::OperatingSystem(uri) => {
+                if uri.is_empty() {
+                    "Operating system cleared".into()
+                } else {
+                    let name = crate::backend::os_name(uri).unwrap_or("the chosen system");
+                    format!("Operating system set to {name}")
+                }
+            }
+            Self::Guest(GuestSetup::Shares {
+                ..
+            }) => "Shared folders mounted".into(),
+            Self::Guest(GuestSetup::Unmount {
+                ..
+            }) => "Shared folders unmounted".into(),
+            Self::Guest(GuestSetup::Type(_)) => "Text typed".into(),
+            Self::AddAgentChannel => "Guest agent channel added".into(),
+            Self::UsbAttach {
+                ..
+            } => "USB device connected".into(),
+            Self::UsbDetach {
+                ..
+            } => "USB device disconnected".into(),
+            Self::SaveXml(_) => "Configuration saved".into(),
+            Self::Console => "Console opened".into(),
+            Self::Screenshot(path) => format!("Saved {}", file(path)),
+            Self::MemoryDump {
+                path,
+                ..
+            } => format!("Memory dump saved to {}", file(path)),
+        }
+    }
+}

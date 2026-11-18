@@ -24,6 +24,45 @@ pub enum Job {
     Network(crate::backend::network::HostNetwork),
 }
 impl Job {
+    /// The notice shown when the job succeeds: what changed, not that something saved.
+    pub(crate) fn done(&self) -> String {
+        match self {
+            Self::Refresh => "Library refreshed".into(),
+            Self::Icon(..) => "Icon saved".into(),
+            Self::Network(
+                backend::network::HostNetwork::Virtual {
+                    name,
+                    ..
+                }
+                | backend::network::HostNetwork::Bridge {
+                    name,
+                    ..
+                },
+            ) => format!("Network {name} created"),
+            Self::Create(spec) => format!("{} created", spec.name.trim()),
+            Self::Import(path)
+            | Self::ConvertDisk {
+                destination: path,
+                ..
+            } => {
+                let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+                match self {
+                    Self::Import(_) => format!("Imported {}", name.unwrap_or_default()),
+                    _ => format!("Converted disk saved as {}", name.unwrap_or_default()),
+                }
+            }
+            Self::Appliance(_) => "Appliance imported".into(),
+            Self::Operation(_, op) => op.done(),
+            Self::Action(machine, action) => match action {
+                Action::Start => format!("{} starting", machine.name),
+                Action::Shutdown => format!("Shutdown requested for {}", machine.name),
+                Action::Pause => format!("{} paused", machine.name),
+                Action::Resume => format!("{} resumed", machine.name),
+                Action::Display => "Display opened".into(),
+            },
+        }
+    }
+
     pub(crate) fn label(&self) -> &'static str {
         match self {
             Self::Refresh => "Refreshing",
@@ -77,6 +116,8 @@ pub(crate) struct Pending {
     pub(crate) receiver: Receiver<JobEvent>,
     pub(crate) form: Option<WeakEntity<EditorForm>>,
     pub(crate) label: &'static str,
+    /// Notice for success, from `Job::done`.
+    pub(crate) done: String,
     pub(crate) reporter: backend::progress::Reporter,
     pub(crate) progress: backend::progress::Progress,
 }
