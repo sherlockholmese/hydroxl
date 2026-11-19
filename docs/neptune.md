@@ -67,8 +67,14 @@ type.
    appears under **Display adapters** in Device Manager. Check the feature
    levels in `dxdiag` and run a Direct3D application to verify acceleration.
 
-Local SPICE GL is the default accelerated display. An existing peer-to-peer
-QEMU D-Bus display can also carry the accelerated scanout. The Linux host needs
+Local SPICE GL is the default accelerated display. To use the local QEMU D-Bus
+viewer, power off the VM, choose **D-Bus** under **Hardware → Display and sound
+→ Viewer**, and save. Accelerated D-Bus can share the scanout with Hydroxl using
+DMA-BUF. Two-way text clipboard sharing requires the SPICE guest agent in
+Windows and a QEMU build with `qemu-vdagent`. The viewer's USB menu attaches
+and detaches host devices in the running VM through libvirt.
+
+The Linux host needs
 a Vulkan GPU, an EGL render node accessible to QEMU, and access to
 `/dev/udmabuf` for shared buffers. Hydroxl leaves the guest's Secure Boot and
 TPM settings in place. The bundled QEMU starts its private renderer process

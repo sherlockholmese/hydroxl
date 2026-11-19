@@ -27,8 +27,9 @@ pub use architecture::available as available_architectures;
 pub use guest::{GuestOs, GuestSetup, ShareDriver, WINDOWS_COMMAND, linux_command};
 pub use inspect::{details, has_agent_channel};
 pub use platform::{NicChange, Platform, log_path, open_path, random_mac, read_log};
-pub use types::{Details, Device, Operation, Snapshot};
+pub use types::{Details, Device, DisplaySettings, Operation, Snapshot};
 pub use usb::host_usb;
+pub(crate) use usb::toggle_live_usb;
 pub fn execute(
     c: Connection,
     machine: &Machine,
@@ -79,13 +80,9 @@ pub fn execute(
             boot,
         } => boot::apply_system(c, machine, cpu, machine_type, boot),
         Operation::Display {
-            model,
-            heads,
-            accel3d,
-            sound,
-            clipboard,
-            vram,
-        } => display::apply_display(c, machine, model, heads, accel3d, sound, clipboard, vram),
+            settings,
+            local_dbus,
+        } => display::apply_display(c, machine, settings, local_dbus),
         Operation::PortForward {
             protocol,
             host,

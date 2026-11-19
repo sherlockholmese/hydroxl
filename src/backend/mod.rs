@@ -19,13 +19,16 @@ pub use gpu::{
     HOSTMEM_BYTES, NEPTUNE_HOST_MISSING, TRITON_ARCH_UNSUPPORTED, gpu_features, triton_arch,
 };
 pub use hardware::{Topology, configure, nested_host_feature};
-pub(crate) use library::{DisplayTarget, SpiceOptions, display_target};
+pub(crate) use library::{DisplayTarget, SpiceOptions, display_target, is_peer_dbus};
 pub use library::{action, demo_machines, ensure_live_tablet, machines, virsh};
 pub use model::{ARCHITECTURES, Action, Connection, Machine, NewMachine, State};
 pub(crate) use process::{
     SnapshotNotFound, qemu_convert, run, run_with_input, virsh_with_progress,
 };
 pub use qemu::{QemuBackend, QemuBuild};
-pub(crate) use spice::remove_vnc_for_spice_gl;
+pub(crate) use spice::{
+    host_audio_backend, is_agent_channel, peer_clipboard, remove_vnc_for_spice_gl,
+    route_agent_clipboard,
+};
 
 pub(crate) use library::ensure_stopped;

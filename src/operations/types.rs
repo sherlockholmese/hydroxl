@@ -39,6 +39,17 @@ impl Drop for Details {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DisplaySettings {
+    pub model: String,
+    pub heads: u32,
+    pub accel3d: bool,
+    pub sound: String,
+    pub clipboard: bool,
+    /// Video memory in MiB; 0 keeps the model default.
+    pub vram: u32,
+}
+
 #[derive(Clone, Debug)]
 pub enum Operation {
     /// Runs each step in order and stops at the first failure.
@@ -83,13 +94,8 @@ pub enum Operation {
         boot: String,
     },
     Display {
-        model: String,
-        heads: u32,
-        accel3d: bool,
-        sound: String,
-        clipboard: bool,
-        /// Video memory in MiB; 0 keeps the model default.
-        vram: u32,
+        settings: Option<DisplaySettings>,
+        local_dbus: Option<bool>,
     },
     PortForward {
         protocol: String,

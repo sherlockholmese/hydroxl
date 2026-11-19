@@ -1,4 +1,6 @@
 //! QEMU Display1 over two local libvirt-authorized peer-to-peer D-Bus sockets.
+mod clipboard;
+
 use super::{
     damage::Damage,
     graphics_fd::GraphicsFd,
@@ -33,12 +35,27 @@ type Frame = Arc<Mutex<Framebuffer>>;
 pub(crate) struct Session {
     pub frame: Frame,
     commands: mpsc::Sender<Option<Input>>,
+    clipboard: Option<mpsc::Sender<clipboard::Command>>,
+    usb: Option<(Connection, String, Arc<Mutex<()>>)>,
 }
 
 impl Session {
-    pub fn connect(connection: Connection, id: &str, graphics: u32, gpu: bool) -> Result<Self> {
+    pub fn connect(
+        connection: Connection,
+        id: &str,
+        graphics: u32,
+        gpu: bool,
+        share_clipboard: bool,
+        usb: bool,
+    ) -> Result<Self> {
         let stream = UnixStream::from(GraphicsFd::new(connection.uri(), id)?.open(graphics)?);
-        let control = peer(stream).build().context("Could not connect to the QEMU display.")?;
+        let frame = Frame::default();
+        let clipboard = share_clipboard.then(|| clipboard::Clipboard::new(frame.clone()));
+        let mut builder = peer(stream);
+        if let Some(clipboard) = &clipboard {
+            builder = builder.serve_at(clipboard::PATH, clipboard.clone())?;
+        }
+        let control = builder.build().context("Could not connect to the QEMU display.")?;
         let consoles: OwnedValue = control
             .call_method(
                 None::<&str>,
@@ -53,23 +70,14 @@ impl Session {
         let console = *consoles.first().context("QEMU has no display console.")?;
         let path = format!("/org/qemu/Display1/Console_{console}");
         let (listener, qemu) = UnixStream::pair()?;
-        let frame = Frame::default();
-        let scanout = Arc::new(Mutex::new(None));
+        let display = Listener {
+            frame: frame.clone(),
+            scanout: Arc::new(Mutex::new(None)),
+            gpu,
+        };
         let listener_builder = peer(listener)
-            .serve_at(
-                LISTENER,
-                Listener {
-                    frame: frame.clone(),
-                    scanout: scanout.clone(),
-                    gpu,
-                },
-            )?
-            .serve_at(
-                LISTENER,
-                ListenerV2 {
-                    scanout,
-                },
-            )?;
+            .serve_at(LISTENER, display.clone())?
+            .serve_at(LISTENER, ListenerV2(display))?;
         control
             .call_method(
                 None::<&str>,
@@ -82,6 +90,13 @@ impl Session {
         drop(qemu);
         let listener =
             listener_builder.build().context("Could not open the QEMU display listener.")?;
+        let clipboard = clipboard.and_then(|clipboard| match clipboard.connect(&control) {
+            Ok(commands) => Some(commands),
+            Err(error) => {
+                eprintln!("Could not register QEMU clipboard sharing: {error:#}");
+                None
+            }
+        });
         let (commands, receive) = mpsc::channel();
         let state = frame.clone();
         std::thread::spawn(move || {
@@ -101,6 +116,8 @@ impl Session {
         Ok(Self {
             frame,
             commands,
+            clipboard,
+            usb: usb.then(|| (connection, id.into(), Arc::default())),
         })
     }
 
@@ -108,7 +125,44 @@ impl Session {
         let _ = self.commands.send(Some(command));
     }
 
+    pub(super) fn send_clipboard(&self, text: String) {
+        if let Some(clipboard) = &self.clipboard {
+            let _ = clipboard.send(clipboard::Command::Offer(text));
+        }
+    }
+
+    pub(super) fn read_clipboard(&self) -> Result<mpsc::Receiver<Result<String>>> {
+        let clipboard =
+            self.clipboard.as_ref().context("QEMU clipboard sharing is unavailable.")?;
+        let (send, receive) = mpsc::channel();
+        clipboard.send(clipboard::Command::Read(send)).context("The QEMU display disconnected.")?;
+        Ok(receive)
+    }
+
+    pub(super) fn can_toggle_usb(&self) -> bool {
+        self.usb.is_some()
+    }
+
+    pub(super) fn toggle_usb(&self, bus: u8, address: u8) -> Result<mpsc::Receiver<Result<bool>>> {
+        let (connection, id, lock) =
+            self.usb.clone().context("The guest needs a USB controller.")?;
+        let (send, receive) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _guard = lock.lock().unwrap_or_else(|error| error.into_inner());
+            let _ = send.send(crate::operations::toggle_live_usb(
+                connection,
+                &id,
+                u16::from(bus),
+                u16::from(address),
+            ));
+        });
+        Ok(receive)
+    }
+
     pub fn close(&self) {
+        if let Some(clipboard) = &self.clipboard {
+            let _ = clipboard.send(clipboard::Command::Close);
+        }
         let _ = self.commands.send(None);
     }
 }
@@ -273,8 +327,11 @@ struct Buffer {
     _fds: Vec<OwnedFd>,
     surface: scanout::Scanout,
     crop: Damage,
+    fresh: bool,
+    gpu_failed: bool,
 }
 
+#[derive(Clone)]
 struct Listener {
     frame: Frame,
     scanout: Arc<Mutex<Option<Buffer>>>,
@@ -306,18 +363,17 @@ impl Listener {
         y: i32,
         width: i32,
         height: i32,
-        stride: i32,
+        stride: u32,
         pixman_format: u32,
         data: Vec<u8>,
     ) -> fdo::Result<()> {
-        let [x, y, width, height, stride] =
-            [x, y, width, height, stride].map(|value| value.max(0) as u32);
+        let [x, y, width, height] = [x, y, width, height].map(|value| value.max(0) as u32);
         self.software_scanout((x, y, width, height), stride, pixman_format, &data, false)
     }
 
     #[allow(clippy::too_many_arguments)]
     #[zbus(name = "ScanoutDMABUF")]
-    fn scanout_dmabuf(
+    async fn scanout_dmabuf(
         &self,
         dma_buf: OwnedFd,
         width: u32,
@@ -337,74 +393,13 @@ impl Listener {
             modifier,
             y0_top,
         )?;
-        *self.scanout.lock().unwrap_or_else(|error| error.into_inner()) = Some(buffer);
-        Ok(())
+        self.install_buffer(buffer).await
     }
 
     #[zbus(name = "UpdateDMABUF")]
-    async fn update_dmabuf(&mut self, x: i32, y: i32, width: i32, height: i32) -> fdo::Result<()> {
-        // Copy what the draw needs; the buffer stays installed while this call is
-        // pending because the listener handles one message at a time.
-        let (surface, crop) = {
-            let scanout = self.scanout.lock().unwrap_or_else(|error| error.into_inner());
-            let Some(buffer) = scanout.as_ref() else {
-                return Ok(());
-            };
-            (buffer.surface, buffer.crop)
-        };
-        let full = crop == Damage::new(0, 0, surface.width as usize, surface.height as usize);
-        // Returning from this method acknowledges the draw. Await the UI's GPU copy
-        // instead of blocking the connection's thread, so replies to our input calls
-        // keep arriving while a frame is in flight.
-        let mut gpu = false;
-        if self.gpu && full {
-            let [x, y, width, height] = [x, y, width, height].map(|value| value.max(0) as usize);
-            let damage = Damage::new(x, y, width, height);
-            if let Some(outcome) = scanout::offer_scanout(&self.frame, surface, Some(damage), None)
-            {
-                gpu = outcome.await;
-            }
-            if gpu {
-                scanout::scanout_copied(&self.frame, surface);
-            }
-        }
-        if full && !gpu {
-            self.gpu = false;
-        }
-        let want_preview = gpu
-            && std::mem::take(
-                &mut self.frame.lock().unwrap_or_else(|error| error.into_inner()).preview_requested,
-            );
-        if gpu && !want_preview {
-            return Ok(());
-        }
-        let readback = (|| -> Result<Vec<u8>> {
-            let renderer = scanout::renderer()?;
-            let imported = renderer.import(surface)?;
-            let mut pixels = Vec::new();
-            imported.read(crop, &mut pixels)?;
-            Ok(pixels)
-        })();
-        let mut frame = self.frame.lock().unwrap_or_else(|error| error.into_inner());
-        match readback {
-            Ok(pixels) if gpu => {
-                frame.thumbnail = thumbnail::sample(crop.width, crop.height, &pixels)
-            }
-            Ok(pixels) => {
-                frame.width = crop.width;
-                frame.height = crop.height;
-                frame.pixels = pixels;
-                frame.damage_all();
-                frame.generation += 1;
-            }
-            Err(error) if !gpu => {
-                frame.closed = Some(format!("Could not import the QEMU scanout. {error:#}"));
-                frame.generation += 1;
-                return Err(fdo::Error::Failed(error.to_string()));
-            }
-            Err(_) => {}
-        }
-        Ok(())
+    async fn update_dmabuf(&self, x: i32, y: i32, width: i32, height: i32) -> fdo::Result<()> {
+        let [x, y, width, height] = [x, y, width, height].map(|value| value.max(0) as usize);
+        self.draw_buffer(Some(Damage::new(x, y, width, height))).await
     }
 
     fn disable(&self) {
@@ -449,6 +444,102 @@ impl Listener {
 }
 
 impl Listener {
+    async fn install_buffer(&self, buffer: Buffer) -> fdo::Result<()> {
+        *self.scanout.lock().unwrap_or_else(|error| error.into_inner()) = Some(buffer);
+        // Scanout is also a draw. A desktop at rest may never send UpdateDMABUF.
+        self.draw_buffer(None).await
+    }
+
+    async fn draw_buffer(&self, damage: Option<Damage>) -> fdo::Result<()> {
+        // Copy what the draw needs; the buffer stays installed while this call is
+        // pending because the listener handles one message at a time.
+        let (surface, crop, fresh, try_gpu) = {
+            let mut scanout = self.scanout.lock().unwrap_or_else(|error| error.into_inner());
+            let Some(buffer) = scanout.as_mut() else {
+                return Ok(());
+            };
+            (
+                buffer.surface,
+                buffer.crop,
+                std::mem::take(&mut buffer.fresh),
+                self.gpu && !buffer.gpu_failed,
+            )
+        };
+        let full = crop == Damage::new(0, 0, surface.width as usize, surface.height as usize);
+        // Returning from this method acknowledges the draw. Await the UI's GPU copy
+        // instead of blocking the connection's thread, so replies to our input calls
+        // keep arriving while a frame is in flight.
+        let mut gpu = false;
+        if try_gpu && full {
+            let damage = if fresh {
+                None
+            } else {
+                damage
+            };
+            if let Some(outcome) = scanout::offer_scanout(&self.frame, surface, damage, None) {
+                gpu = outcome.await;
+            }
+            if gpu {
+                scanout::scanout_copied(&self.frame, surface);
+            } else if let Some(buffer) =
+                self.scanout.lock().unwrap_or_else(|error| error.into_inner()).as_mut()
+            {
+                buffer.gpu_failed = true;
+            }
+        }
+        if fresh && std::env::var_os("HYDROXL_DEBUG_DISPLAY").is_some() {
+            eprintln!(
+                "D-Bus scanout {}x{}, buffer {}x{}, fourcc {:?}, modifier {:#x}, {}",
+                crop.width,
+                crop.height,
+                surface.width,
+                surface.height,
+                String::from_utf8_lossy(&surface.format.to_le_bytes()),
+                surface.modifier,
+                if gpu {
+                    "GPU copy"
+                } else {
+                    "EGL readback"
+                },
+            );
+        }
+        let want_preview = gpu
+            && std::mem::take(
+                &mut self.frame.lock().unwrap_or_else(|error| error.into_inner()).preview_requested,
+            );
+        if gpu && !want_preview {
+            return Ok(());
+        }
+        let readback = (|| -> Result<Vec<u8>> {
+            let renderer = scanout::renderer()?;
+            let imported = renderer.import(surface)?;
+            let mut pixels = Vec::new();
+            scanout::wait_for_writes(surface.fds[0], 100);
+            imported.read(crop, &mut pixels)?;
+            Ok(pixels)
+        })();
+        let mut frame = self.frame.lock().unwrap_or_else(|error| error.into_inner());
+        match readback {
+            Ok(pixels) if gpu => {
+                frame.thumbnail = thumbnail::sample(crop.width, crop.height, &pixels)
+            }
+            Ok(pixels) => {
+                frame.width = crop.width;
+                frame.height = crop.height;
+                frame.pixels = pixels;
+                frame.damage_all();
+                frame.generation += 1;
+            }
+            Err(error) if !gpu => {
+                frame.closed = Some(format!("Could not import the QEMU scanout. {error:#}"));
+                frame.generation += 1;
+                return Err(fdo::Error::Failed(error.to_string()));
+            }
+            Err(_) => {}
+        }
+        Ok(())
+    }
+
     fn software_scanout(
         &self,
         rect: (u32, u32, u32, u32),
@@ -500,15 +591,13 @@ impl Listener {
     }
 }
 
-struct ListenerV2 {
-    scanout: Arc<Mutex<Option<Buffer>>>,
-}
+struct ListenerV2(Listener);
 
 #[zbus::interface(name = "org.qemu.Display1.Listener.Unix.ScanoutDMABUF2", spawn = false)]
 impl ListenerV2 {
     #[allow(clippy::too_many_arguments)]
     #[zbus(name = "ScanoutDMABUF2")]
-    fn scanout_dmabuf2(
+    async fn scanout_dmabuf2(
         &self,
         fds: Vec<OwnedFd>,
         x: u32,
@@ -537,8 +626,7 @@ impl ListenerV2 {
             modifier,
             y0_top,
         )?;
-        *self.scanout.lock().unwrap_or_else(|error| error.into_inner()) = Some(buffer);
-        Ok(())
+        self.0.install_buffer(buffer).await
     }
 }
 
@@ -588,6 +676,8 @@ fn buffer(
         _fds: fds,
         surface,
         crop: Damage::new(x as usize, y as usize, width as usize, height as usize),
+        fresh: true,
+        gpu_failed: false,
     })
 }
 
@@ -606,6 +696,42 @@ mod tests {
     use zbus::object_server::Interface;
 
     #[test]
+    #[ignore = "requires a running local D-Bus VM and a GPU"]
+    fn live_dbus_desktop_delivers_visible_pixels() -> anyhow::Result<()> {
+        let name = std::env::var("HYDROXL_DBUS_TEST_VM")
+            .context("Set HYDROXL_DBUS_TEST_VM to a running session VM.")?;
+        let connection = Connection::Session;
+        let id = crate::backend::virsh(connection, &["domuuid", &name])?;
+        let id = id.trim();
+        let crate::backend::DisplayTarget::Dbus {
+            graphics,
+            ..
+        } = crate::backend::display_target(connection, id, false)?
+        else {
+            anyhow::bail!("This VM does not use peer-to-peer D-Bus graphics.");
+        };
+        let session = Session::connect(connection, id, graphics, false, false, false)?;
+        let started = std::time::Instant::now();
+        while started.elapsed() < Duration::from_secs(5) {
+            {
+                let frame = session.frame.lock().unwrap();
+                if let Some(error) = &frame.closed {
+                    anyhow::bail!("{error}");
+                }
+                if frame.pixels.chunks_exact(4).any(|pixel| pixel[..3] != [0; 3]) {
+                    eprintln!(
+                        "Received visible pixels from a {}×{} D-Bus frame.",
+                        frame.width, frame.height
+                    );
+                    return Ok(());
+                }
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        anyhow::bail!("The connected D-Bus display supplied no visible pixels.");
+    }
+
+    #[test]
     fn software_listener_validates_and_copies_partial_frames() -> fdo::Result<()> {
         let frame = Frame::default();
         let listener = Listener {
@@ -621,23 +747,28 @@ mod tests {
     }
 
     #[test]
-    fn listener_exports_qemus_dma_buf_method_names() {
+    fn listener_exports_qemus_display_signatures() -> anyhow::Result<()> {
         let mut metadata = String::new();
-        let scanout = Arc::new(Mutex::new(None));
-        Listener {
+        let listener = Listener {
             frame: Frame::default(),
-            scanout: scanout.clone(),
+            scanout: Arc::new(Mutex::new(None)),
             gpu: false,
-        }
-        .introspect_to_writer(&mut metadata, 0);
-        ListenerV2 {
-            scanout,
-        }
-        .introspect_to_writer(&mut metadata, 0);
+        };
+        listener.introspect_to_writer(&mut metadata, 0);
+        ListenerV2(listener).introspect_to_writer(&mut metadata, 0);
         for method in ["ScanoutDMABUF", "ScanoutDMABUF2", "UpdateDMABUF"] {
             assert!(metadata.contains(&format!("method name=\"{method}\"")), "{metadata}");
         }
         assert!(metadata.contains("type=\"h\""));
         assert!(metadata.contains("type=\"ah\""));
+        let interfaces = format!("<node>{metadata}</node>");
+        let doc = roxmltree::Document::parse(&interfaces)?;
+        let update = doc
+            .descendants()
+            .find(|node| node.has_tag_name("method") && node.attribute("name") == Some("Update"))
+            .context("Missing QEMU software update method")?;
+        let args: Vec<_> = update.children().filter_map(|node| node.attribute("type")).collect();
+        assert_eq!(args, ["i", "i", "i", "i", "u", "u", "ay"]);
+        Ok(())
     }
 }

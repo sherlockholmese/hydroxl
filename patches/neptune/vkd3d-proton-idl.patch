@@ -1,0 +1,41 @@
+--- a/include/meson.build
++++ b/include/meson.build
+@@ -18,22 +18,19 @@ vkd3d_idl = [
+   'vkd3d_core_interface.idl',
+ ]
+
+-# idl_generator.process() returns GeneratedList
+-# even when called with single item so we process
+-# each idl file in a loop generating and installing
+-# them to avoid calling process() twice
+ vkd3d_header_files = []
+ foreach idl_file : vkd3d_idl
+-  header_file = idl_generator.process(idl_file)
+-  vkd3d_header_files += header_file
+-
+   if target_machine.system() == 'linux'
++    # The compiler and installer must depend on the same generated header.
+     header_name = idl_file.split('.')[0] + '.h'
+-    custom_target('install_' + header_name,
+-        input : header_file,
++    header_file = custom_target(header_name,
++        input : idl_file,
+         output : header_name,
+-        command : ['cp', '@INPUT@', '@OUTPUT@'],
++        command : [idl_compiler, '-h', '-o', '@OUTPUT@', '@INPUT@'],
+         install : true,
+         install_dir : get_option('includedir') / 'vkd3d-proton')
++  else
++    header_file = idl_generator.process(idl_file)
+   endif
++  vkd3d_header_files += header_file
+ endforeach
+--- a/libs/vkd3d-common/meson.build
++++ b/libs/vkd3d-common/meson.build
+@@ -13,5 +13,6 @@ vkd3d_common_lib = static_library('vkd3d_common', vkd3d_common_src, vkd3d_header_files,
+   dependencies        : vkd3d_extra_libs)
+
+ vkd3d_common_dep = declare_dependency(
++  sources             : target_machine.system() == 'linux' ? vkd3d_header_files : [],
+   link_with           : vkd3d_common_lib,
+   include_directories : [ vkd3d_public_includes, vkd3d_common_lib.private_dir_include() ])

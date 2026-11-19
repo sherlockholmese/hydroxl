@@ -58,7 +58,8 @@ fn parse_machine(id: &str, xml: &str, state: State) -> Result<Machine> {
         .to_owned();
     let display = root
         .descendants()
-        .find(|n| n.has_tag_name("graphics"))
+        .find(|&n| is_peer_dbus(n))
+        .or_else(|| root.descendants().find(|n| n.has_tag_name("graphics")))
         .map(|n| match n.attribute("type").unwrap_or("") {
             "spice" => "SPICE",
             "vnc" => "VNC",
@@ -232,6 +233,9 @@ pub(crate) fn ensure_stopped(
 /// stopped machine that lacks one, so Hydroxl can show the guest in its own window.
 pub fn ensure_display(connection: Connection, id: &str) -> Result<()> {
     let original = virsh(connection, &["dumpxml", id, "--inactive"])?;
+    if roxmltree::Document::parse(&original)?.descendants().any(is_peer_dbus) {
+        return Ok(());
+    }
     // GPU scanout for a 2D display is only a SPICE delivery choice; drop it when the
     // VNC viewer is chosen, since QEMU cannot serve VNC alongside a SPICE GL context.
     let xml = super::spice::drop_scanout_gl(&original)?.unwrap_or_else(|| original.clone());
@@ -241,12 +245,13 @@ pub fn ensure_display(connection: Connection, id: &str) -> Result<()> {
         None => xml,
     };
     // Clipboard over VNC: the guest agent talks to QEMU's built-in agent.
-    let xml = super::spice::route_agent(&xml, true)?.unwrap_or(xml);
+    let xml = if super::qemu::supports_vdagent(connection, &xml).unwrap_or(false) {
+        super::spice::route_agent(&xml, true)?.unwrap_or(xml)
+    } else {
+        xml
+    };
     let doc = roxmltree::Document::parse(&xml)?;
     let has = |pick: &dyn Fn(roxmltree::Node) -> bool| doc.descendants().any(|n| pick(n));
-    if has(&is_peer_dbus) {
-        return Ok(());
-    }
     // 3D acceleration requires SPICE GL. Remove stale VNC entries.
     if super::spice::gl_enabled(&doc) {
         return super::spice::prepare(connection, id);
@@ -285,7 +290,11 @@ pub fn ensure_display(connection: Connection, id: &str) -> Result<()> {
 pub(crate) enum DisplayTarget {
     Vnc(String),
     Spice(SpiceOptions),
-    Dbus(u32),
+    Dbus {
+        graphics: u32,
+        clipboard: bool,
+        usb: bool,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -320,7 +329,17 @@ pub(crate) fn display_target(
     let spice = graphics.iter().position(|node| node.attribute("type") == Some("spice"));
     let vnc = graphics.iter().any(|node| node.attribute("type") == Some("vnc"));
     if let Some(index) = graphics.iter().copied().position(is_peer_dbus) {
-        return Ok(DisplayTarget::Dbus(index as u32));
+        let clipboard = super::spice::peer_clipboard(&doc);
+        let usb = domain.descendants().any(|node| {
+            node.has_tag_name("controller")
+                && node.attribute("type") == Some("usb")
+                && node.attribute("model") != Some("none")
+        });
+        return Ok(DisplayTarget::Dbus {
+            graphics: index as u32,
+            clipboard,
+            usb,
+        });
     }
     if let Some(index) = spice {
         let gl = super::spice::gl_enabled(&doc);
@@ -348,7 +367,7 @@ pub(crate) fn display_target(
     bail!("The guest has no SPICE, VNC, or peer D-Bus display.")
 }
 
-pub(super) fn is_peer_dbus(node: roxmltree::Node<'_, '_>) -> bool {
+pub(crate) fn is_peer_dbus(node: roxmltree::Node<'_, '_>) -> bool {
     node.has_tag_name("graphics")
         && node.attribute("type") == Some("dbus")
         && node.attribute("p2p") == Some("yes")

@@ -375,3 +375,332 @@
  };
  
  pixman_format_code_t qemu_drm_format_to_pixman(uint32_t drm_format)
+--- a/ui/dbus-listener.c
++++ b/ui/dbus-listener.c
+@@ -45,6 +45,11 @@
+
+ static void dbus_gfx_switch(DisplayChangeListener *dcl,
+                             struct DisplaySurface *new_surface);
++static void ddl_scanout(DBusDisplayListener *ddl);
++#ifdef CONFIG_GBM
++static void dbus_gl_gfx_update(DisplayChangeListener *dcl,
++                               int x, int y, int w, int h);
++#endif
+
+ enum share_kind {
+     SHARE_KIND_NONE,
+@@ -88,6 +93,16 @@
+     QemuDBusDisplay1ListenerUnixScanoutDMABUF2 *scanout_dmabuf_v2_proxy;
+ #endif
+
++#ifdef CONFIG_GBM
++    /* Only guest DMA-BUFs have a matching release notification. */
++    QemuDmaBuf *guest_dmabuf;
++    enum {
++        SCANOUT_DISABLED,
++        SCANOUT_SOFTWARE,
++        SCANOUT_EXPORTED,
++    } scanout;
++#endif
++
+     guint dbus_filter;
+     guint32 display_serial_to_discard;
+     guint32 cursor_serial_to_discard;
+@@ -115,10 +130,24 @@
+ }
+
+ #ifdef CONFIG_OPENGL
++static void dbus_clear_gl_damage(DBusDisplayListener *ddl)
++{
++#ifdef CONFIG_PIXMAN
++    pixman_region32_clear(&ddl->gl_damage);
++#else
++    ddl->gl_damage = 0;
++#endif
++}
++
+ static void dbus_scanout_disable(DisplayChangeListener *dcl)
+ {
+     DBusDisplayListener *ddl = container_of(dcl, DBusDisplayListener, dcl);
+
++#ifdef CONFIG_GBM
++    ddl->guest_dmabuf = NULL;
++    ddl->scanout = SCANOUT_DISABLED;
++    dbus_clear_gl_damage(ddl);
++#endif
+     ddl_discard_display_messages(ddl);
+
+     qemu_dbus_display1_listener_call_disable(
+@@ -251,6 +280,12 @@
+ {
+ #if defined(CONFIG_GBM) || defined(WIN32)
+     DBusDisplayListener *ddl = container_of(dcl, DBusDisplayListener, dcl);
++#endif
++
++#ifdef CONFIG_GBM
++    if (ddl->scanout != SCANOUT_EXPORTED) {
++        return;
++    }
+ #endif
+
+     trace_dbus_update_gl(x, y, w, h);
+@@ -297,7 +332,7 @@
+ }
+
+ #ifdef CONFIG_GBM
+-static void dbus_scanout_dmabuf_v1(DBusDisplayListener *ddl,
++static bool dbus_scanout_dmabuf_v1(DBusDisplayListener *ddl,
+                                    QemuDmaBuf *dmabuf)
+ {
+     g_autoptr(GError) err = NULL;
+@@ -311,7 +346,7 @@
+     fd_list = g_unix_fd_list_new();
+     if (g_unix_fd_list_append(fd_list, fd, &err) != 0) {
+         error_report("Failed to setup dmabuf fdlist: %s", err->message);
+-        return;
++        return false;
+     }
+
+     ddl_discard_display_messages(ddl);
+@@ -329,9 +364,10 @@
+         width, height, stride, fourcc, modifier,
+         y0_top, G_DBUS_CALL_FLAGS_NONE,
+         -1, fd_list, NULL, NULL, NULL);
+-}
+-
+-static void dbus_scanout_dmabuf_v2(DBusDisplayListener *ddl,
++    return true;
++}
++
++static bool dbus_scanout_dmabuf_v2(DBusDisplayListener *ddl,
+                                    QemuDmaBuf *dmabuf)
+ {
+     g_autoptr(GError) err = NULL;
+@@ -363,7 +399,7 @@
+         fd_index[num_fds] = g_unix_fd_list_append(fd_list, plane_fd, &err);
+         if (fd_index[num_fds] < 0) {
+             error_report("Failed to setup dmabuf fdlist: %s", err->message);
+-            return;
++            return false;
+         }
+     }
+
+@@ -393,6 +429,20 @@
+         ddl->scanout_dmabuf_v2_proxy, fd, x, y, width, height, offset, stride,
+         num_planes, fourcc, backing_width, backing_height, modifier, y0_top,
+         G_DBUS_CALL_FLAGS_NONE, -1, fd_list, NULL, NULL, NULL);
++    return true;
++}
++
++static bool dbus_send_scanout_dmabuf(DBusDisplayListener *ddl,
++                                     QemuDmaBuf *dmabuf)
++{
++    if (ddl->scanout_dmabuf_v2_proxy) {
++        return dbus_scanout_dmabuf_v2(ddl, dmabuf);
++    }
++    if (qemu_dmabuf_get_num_planes(dmabuf) != 1) {
++        g_debug("org.qemu.Display1.Listener.ScanoutDMABUF requires one plane");
++        return false;
++    }
++    return dbus_scanout_dmabuf_v1(ddl, dmabuf);
+ }
+
+ static void dbus_scanout_dmabuf(DisplayChangeListener *dcl,
+@@ -400,15 +450,13 @@
+ {
+     DBusDisplayListener *ddl = container_of(dcl, DBusDisplayListener, dcl);
+
+-    if (ddl->scanout_dmabuf_v2_proxy) {
+-        dbus_scanout_dmabuf_v2(ddl, dmabuf);
+-    } else {
+-        if (qemu_dmabuf_get_num_planes(dmabuf) > 1) {
+-            g_debug("org.qemu.Display1.Listener.ScanoutDMABUF "
+-                    "does not support mutli plane");
+-            return;
+-        }
+-        dbus_scanout_dmabuf_v1(ddl, dmabuf);
++    if (dbus_send_scanout_dmabuf(ddl, dmabuf)) {
++        ddl->guest_dmabuf = dmabuf;
++        ddl->scanout = SCANOUT_EXPORTED;
++        dbus_clear_gl_damage(ddl);
++        /* A viewer opened after boot also needs a draw on a static desktop. */
++        dbus_gl_gfx_update(dcl, 0, 0, qemu_dmabuf_get_width(dmabuf),
++                           qemu_dmabuf_get_height(dmabuf));
+     }
+ }
+ #endif /* GBM */
+@@ -580,6 +628,41 @@
+ #endif /* WIN32 */
+
+ #ifdef CONFIG_OPENGL
++#ifdef CONFIG_GBM
++static bool dbus_export_texture(DBusDisplayListener *ddl,
++                                uint32_t tex_id, bool backing_y_0_top,
++                                uint32_t backing_width, uint32_t backing_height,
++                                uint32_t x, uint32_t y, uint32_t w, uint32_t h)
++{
++    g_autoptr(QemuDmaBuf) dmabuf = NULL;
++    int fd[DMABUF_MAX_PLANES], num_planes;
++    uint32_t offset[DMABUF_MAX_PLANES], stride[DMABUF_MAX_PLANES], fourcc;
++    uint64_t modifier;
++    bool sent;
++
++    if (!tex_id) {
++        return false;
++    }
++    if (!egl_dmabuf_export_texture(tex_id, fd, (EGLint *)offset, (EGLint *)stride,
++                                   (EGLint *)&fourcc, &num_planes, &modifier)) {
++        warn_report_once("D-Bus could not export the display texture as a DMA-BUF");
++        return false;
++    }
++
++    dmabuf = qemu_dmabuf_new(w, h, offset, stride, x, y, backing_width,
++                            backing_height, fourcc, modifier, fd, num_planes,
++                            false, backing_y_0_top);
++    sent = dbus_send_scanout_dmabuf(ddl, dmabuf);
++    qemu_dmabuf_close(dmabuf);
++    if (sent) {
++        ddl->guest_dmabuf = NULL;
++        ddl->scanout = SCANOUT_EXPORTED;
++        dbus_clear_gl_damage(ddl);
++    }
++    return sent;
++}
++#endif
++
+ static void dbus_scanout_texture(DisplayChangeListener *dcl,
+                                  uint32_t tex_id,
+                                  bool backing_y_0_top,
+@@ -592,23 +675,10 @@
+     trace_dbus_scanout_texture(tex_id, backing_y_0_top,
+                                backing_width, backing_height, x, y, w, h);
+ #ifdef CONFIG_GBM
+-    g_autoptr(QemuDmaBuf) dmabuf = NULL;
+-    int fd[DMABUF_MAX_PLANES], num_planes;
+-    uint32_t offset[DMABUF_MAX_PLANES], stride[DMABUF_MAX_PLANES], fourcc;
+-    uint64_t modifier;
+-
+-    assert(tex_id);
+-    if (!egl_dmabuf_export_texture(tex_id, fd, (EGLint *)offset, (EGLint *)stride,
+-                                   (EGLint *)&fourcc, &num_planes, &modifier)) {
+-        error_report("%s: failed to export dmabuf for texture", __func__);
+-        return;
+-    }
+-    dmabuf = qemu_dmabuf_new(w, h, offset, stride, x, y, backing_width,
+-                             backing_height, fourcc, modifier, fd, num_planes,
+-                             false, backing_y_0_top);
+-
+-    dbus_scanout_dmabuf(dcl, dmabuf);
+-    qemu_dmabuf_close(dmabuf);
++    DBusDisplayListener *ddl = container_of(dcl, DBusDisplayListener, dcl);
++
++    dbus_export_texture(ddl, tex_id, backing_y_0_top,
++                        backing_width, backing_height, x, y, w, h);
+ #endif
+
+ #ifdef WIN32
+@@ -686,7 +756,12 @@
+ static void dbus_release_dmabuf(DisplayChangeListener *dcl,
+                                 QemuDmaBuf *dmabuf)
+ {
+-    dbus_scanout_disable(dcl);
++    DBusDisplayListener *ddl = container_of(dcl, DBusDisplayListener, dcl);
++
++    /* VirtIO announces the new buffer before releasing the old one. */
++    if (ddl->guest_dmabuf == dmabuf) {
++        dbus_scanout_disable(dcl);
++    }
+ }
+ #endif /* GBM */
+
+@@ -704,6 +779,14 @@
+                                 uint32_t x, uint32_t y,
+                                 uint32_t w, uint32_t h)
+ {
++#ifdef CONFIG_GBM
++    DBusDisplayListener *ddl = container_of(dcl, DBusDisplayListener, dcl);
++
++    /* This draw also delivers the first frame of a newly installed DMA-BUF. */
++    if (ddl->guest_dmabuf) {
++        dbus_clear_gl_damage(ddl);
++    }
++#endif
+     dbus_call_update_gl(dcl, x, y, w, h);
+ }
+
+@@ -727,14 +810,13 @@
+         dbus_call_update_gl(dcl, box->x1, box->y1,
+                             box->x2 - box->x1, box->y2 - box->y1);
+     }
+-    pixman_region32_clear(&ddl->gl_damage);
+ #else
+     if (ddl->gl_damage) {
+         dbus_call_update_gl(dcl, 0, 0,
+                             surface_width(ddl->ds), surface_height(ddl->ds));
+-        ddl->gl_damage = 0;
+-    }
+-#endif
++    }
++#endif
++    dbus_clear_gl_damage(ddl);
+ }
+ #endif /* OPENGL */
+
+@@ -749,6 +831,15 @@
+ {
+     DBusDisplayListener *ddl = container_of(dcl, DBusDisplayListener, dcl);
+
++#ifdef CONFIG_GBM
++    if (ddl->scanout == SCANOUT_SOFTWARE) {
++        dbus_gfx_update(dcl, x, y, w, h);
++        return;
++    }
++    if (ddl->scanout != SCANOUT_EXPORTED) {
++        return;
++    }
++#endif
+ #ifdef CONFIG_PIXMAN
+     pixman_region32_t rect_region;
+     pixman_region32_init_rect(&rect_region, x, y, w, h);
+@@ -862,13 +953,23 @@
+
+     ddl->ds = new_surface;
+     ddl->ds_share = SHARE_KIND_NONE;
++    dbus_clear_gl_damage(ddl);
+     if (ddl->ds) {
+         int width = surface_width(ddl->ds);
+         int height = surface_height(ddl->ds);
+
+-        /* TODO: lazy send dmabuf (there are unnecessary sent otherwise) */
++#ifdef CONFIG_GBM
++        if (!dbus_export_texture(ddl, ddl->ds->texture, false,
++                                 width, height, 0, 0, width, height)) {
++            /* Reset and mode changes can leave a Pixman surface without GL. */
++            ddl->guest_dmabuf = NULL;
++            ddl->scanout = SCANOUT_SOFTWARE;
++            ddl_scanout(ddl);
++        }
++#else
+         dbus_scanout_texture(&ddl->dcl, ddl->ds->texture, false,
+                              width, height, 0, 0, width, height, NULL);
++#endif
+     }
+ }
+ #endif
+@@ -1204,6 +1305,7 @@
+             "Update",
+ #ifdef CONFIG_GBM
+             "ScanoutDMABUF",
++            "ScanoutDMABUF2",
+             "UpdateDMABUF",
+ #endif
+             "ScanoutMap",
+@@ -1276,7 +1378,7 @@
+     con = qemu_console_lookup_by_index(dbus_display_console_get_index(console));
+     assert(con);
+ #ifdef CONFIG_OPENGL
+-    if (display_opengl) {
++    if (display_opengl && qemu_console_is_graphic(con)) {
+         ops = &dbus_gl_dcl_ops;
+     }
+ #endif

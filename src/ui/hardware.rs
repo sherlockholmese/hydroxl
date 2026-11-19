@@ -335,27 +335,40 @@ impl Workspace {
                 ))
             })
             .child(setting("Viewer", {
-                if machine.display == "D-Bus" {
-                    return div().child("D-Bus").into_any_element();
-                }
                 let id = machine.id.clone();
-                let viewer = self.segmented_with(
+                let selected = if d.local_dbus {
+                    2
+                } else {
+                    usize::from(machine.spice_viewer || d.accel3d)
+                };
+                let options: &[_] = if editable || d.local_dbus {
+                    &["VNC", "SPICE", "D-Bus"]
+                } else {
+                    &["VNC", "SPICE"]
+                };
+                self.segmented_with(
                     "viewer",
-                    &["VNC", "SPICE"],
-                    usize::from(machine.spice_viewer || d.accel3d),
-                    !self.busy() && (!d.accel3d || editable),
+                    options,
+                    selected,
+                    editable || (!self.busy() && !d.local_dbus && !d.accel3d),
                     move |this, i, cx| {
-                        if i == 0 && this.hardware_values().is_some_and(|(_, d)| d.accel3d) {
-                            if !this.selected_machine().is_some_and(Machine::can_edit) {
-                                return;
-                            }
-                            this.edit_hardware(|d| d.accel3d = false, cx);
+                        if editable {
+                            this.edit_hardware(
+                                |d| {
+                                    d.local_dbus = i == 2;
+                                    if i == 0 {
+                                        d.accel3d = false;
+                                    }
+                                },
+                                cx,
+                            );
                         }
-                        this.set_spice_viewer(id.clone(), i == 1, cx);
+                        if i != 2 {
+                            this.set_spice_viewer(id.clone(), i == 1, cx);
+                        }
                     },
                     cx,
-                );
-                viewer
+                )
             }))
             .child(setting("Displays", self.heads_toggle(d.heads, editable, cx)))
             .child(setting(
@@ -376,7 +389,7 @@ impl Workspace {
                                     && if windows {
                                         triton_arch && self.details.neptune_ready
                                     } else {
-                                        machine.display != "D-Bus"
+                                        machine.display != "D-Bus" || original.local_dbus
                                     })),
                         |d, on| d.accel3d = on,
                         cx,

@@ -21,7 +21,8 @@ mkdir -p "$work" "$cache"
 exec 9>"$work/.build.lock"
 flock 9
 
-key=$({ sha256sum "$repo/scripts/neptune-sources.txt" "$repo/patches/neptune/qemu-11.1.3.patch" "$repo/scripts/build-neptune.sh"
+key=$({ sha256sum "$repo/scripts/neptune-sources.txt" "$repo/patches/neptune/qemu-11.1.3.patch" \
+            "$repo/patches/neptune/vkd3d-proton-idl.patch" "$repo/scripts/build-neptune.sh"
         printf '%s\n' "$prefix"
     } | sha256sum | cut -c1-16)
 build="$work/$key"
@@ -98,6 +99,7 @@ if [[ ! -f "$sources/.prepared" ]]; then
     unpack dxil-dxbc-src.tar.gz vkd3d/subprojects/dxil-spirv/subprojects/dxbc-spirv
     unpack dxbc-spirv-headers.tar.gz vkd3d/subprojects/dxil-spirv/subprojects/dxbc-spirv/submodules/spirv_headers
     patch --directory "$sources/qemu" -p1 < "$repo/patches/neptune/qemu-11.1.3.patch"
+    patch --directory "$sources/vkd3d" -p1 < "$repo/patches/neptune/vkd3d-proton-idl.patch"
     touch "$sources/.prepared"
 fi
 
@@ -139,7 +141,7 @@ mkdir -p "$build/qemu"
         --without-default-features --disable-download --disable-docs --disable-debug-info --enable-system \
         --enable-tools --enable-kvm --enable-tcg --enable-fdt=system \
         --enable-pixman --enable-gio --enable-tpm --enable-passt \
-        --enable-opengl --enable-virglrenderer --enable-spice --enable-dbus-display \
+        --enable-opengl --enable-virglrenderer --enable-spice --enable-spice-protocol --enable-dbus-display \
         --enable-slirp --enable-usb-redir --enable-libusb --enable-libudev --enable-vnc \
         --enable-vhost-user --enable-vhost-kernel --enable-vhost-net --enable-virtfs \
         --enable-attr --enable-cap-ng \
@@ -165,6 +167,8 @@ for architecture in x86_64 aarch64; do
     [[ "$architecture" != x86_64 ]] || device=virtio-vga-gl
     "$stage/bin/qemu-system-$architecture" -device "$device,help" |
         grep -E '^[[:space:]]+neptune='
+    "$stage/bin/qemu-system-$architecture" -machine none -chardev help |
+        grep -E '^[[:space:]]+qemu-vdagent$'
 done
 "$stage/bin/qemu-img" --version
 touch "$stamp"

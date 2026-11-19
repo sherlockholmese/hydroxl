@@ -91,6 +91,7 @@ pub struct Framebuffer {
     pub dbus_resize: bool,
     pub spice_usb: bool,
     pub spice_clipboard: bool,
+    pub dbus_clipboard: bool,
     /// QEMU's VNC clipboard extension is active (guest agent through qemu-vdagent).
     pub vnc_clipboard: bool,
     /// Latest guest clipboard text received over VNC.
@@ -102,6 +103,12 @@ pub struct Framebuffer {
     pub(crate) draw_waker: Option<std::task::Waker>,
     pub(crate) preview_requested: bool,
     pub(crate) thumbnail: Option<image::RgbaImage>,
+}
+
+impl Framebuffer {
+    pub(crate) fn shares_clipboard(&self) -> bool {
+        self.spice_clipboard || self.vnc_clipboard || self.dbus_clipboard
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

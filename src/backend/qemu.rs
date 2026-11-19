@@ -140,6 +140,41 @@ pub(crate) fn domain_arch<'a>(domain: roxmltree::Node<'a, '_>) -> Option<&'a str
         .attribute("arch")
 }
 
+pub(crate) fn supports_vdagent(connection: super::Connection, xml: &str) -> Result<bool> {
+    let doc = roxmltree::Document::parse(xml)?;
+    let domain = doc.root_element();
+    let mut args = vec!["domcapabilities"];
+    if let Some(emulator) = domain_emulator(domain) {
+        args.extend(["--emulatorbin", emulator]);
+    } else if let Some(arch) = domain_arch(domain) {
+        args.extend(["--arch", arch]);
+    }
+    if let Some(kind) = domain.attribute("type") {
+        args.extend(["--virttype", kind]);
+    }
+    let capabilities = super::virsh(connection, &args)?;
+    let doc = roxmltree::Document::parse(&capabilities)?;
+    let kinds = doc.descendants().find(|node| node.has_tag_name("console")).and_then(|node| {
+        node.children()
+            .find(|node| node.has_tag_name("enum") && node.attribute("name") == Some("type"))
+    });
+    if let Some(kinds) = kinds {
+        return Ok(kinds
+            .children()
+            .any(|node| node.has_tag_name("value") && node.text() == Some("qemu-vdagent")));
+    }
+    // Older libvirt versions do not expose the chardev enum in domain capabilities.
+    let binary = doc
+        .root_element()
+        .children()
+        .find(|node| node.has_tag_name("path"))
+        .and_then(|node| node.text())
+        .context("Libvirt did not report the QEMU emulator path.")?;
+    Ok(super::run(binary, &["-machine", "none", "-chardev", "help"])?
+        .lines()
+        .any(|line| line.trim() == "qemu-vdagent"))
+}
+
 pub(crate) fn domain_backend(domain: roxmltree::Node<'_, '_>, arch: &str) -> QemuBackend {
     let Some(path) = domain_emulator(domain).map(Path::new) else {
         return QemuBackend::Unknown;

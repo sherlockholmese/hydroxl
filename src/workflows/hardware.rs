@@ -211,6 +211,7 @@ pub struct HardwareDraft {
     pub graphics: String,
     pub heads: u32,
     pub accel3d: bool,
+    pub local_dbus: bool,
     pub sound: String,
     pub clipboard: bool,
     /// Video memory in MiB; 0 is the model default.
@@ -346,6 +347,7 @@ impl HardwareDraft {
             .and_then(|v| v.parse::<u32>().ok())
             .map_or(0, |kib| kib / 1024);
         let topology = topology(&doc);
+        let local_dbus = doc.descendants().any(crate::backend::is_peer_dbus);
         Some(Self {
             id: machine.id.clone(),
             topology: topology.unwrap_or(crate::backend::Topology {
@@ -367,8 +369,13 @@ impl HardwareDraft {
             graphics: c.graphics,
             heads: c.heads.parse().unwrap_or(1),
             accel3d: c.accel3d,
+            local_dbus,
             sound: c.sound,
-            clipboard: c.clipboard,
+            clipboard: if local_dbus {
+                crate::backend::peer_clipboard(&doc)
+            } else {
+                c.clipboard
+            },
             vram,
             platform: platform(&doc),
             nics: nics(&doc),
@@ -403,23 +410,13 @@ impl HardwareDraft {
         if self.uefi != original.uefi {
             ops.push(Op::Firmware(self.uefi));
         }
-        if (&self.graphics, self.heads, self.accel3d, &self.sound, self.clipboard, self.vram)
-            != (
-                &original.graphics,
-                original.heads,
-                original.accel3d,
-                &original.sound,
-                original.clipboard,
-                original.vram,
-            )
-        {
+        let settings = self.display_settings();
+        let local_dbus = (self.local_dbus != original.local_dbus).then_some(self.local_dbus);
+        let settings = (settings != original.display_settings()).then_some(settings);
+        if settings.is_some() || local_dbus.is_some() {
             ops.push(Op::Display {
-                model: self.graphics.clone(),
-                heads: self.heads,
-                accel3d: self.accel3d,
-                sound: self.sound.clone(),
-                clipboard: self.clipboard,
-                vram: self.vram,
+                settings,
+                local_dbus,
             });
         }
         if self.platform != original.platform {
@@ -443,6 +440,17 @@ impl HardwareDraft {
             ));
         }
         ops
+    }
+
+    fn display_settings(&self) -> crate::operations::DisplaySettings {
+        crate::operations::DisplaySettings {
+            model: self.graphics.clone(),
+            heads: self.heads,
+            accel3d: self.accel3d,
+            sound: self.sound.clone(),
+            clipboard: self.clipboard,
+            vram: self.vram,
+        }
     }
 }
 

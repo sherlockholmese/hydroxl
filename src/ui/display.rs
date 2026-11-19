@@ -1,4 +1,4 @@
-//! The guest display window: renders VNC and SPICE, captures keyboard and pointer on
+//! The guest display window renders QEMU displays, captures keyboard and pointer on
 //! click (Ctrl+Alt releases), and carries power controls and special keys in a top bar.
 use super::primitives::{MENU_MIN_WIDTH, glyph};
 use crate::app::{Job, Workspace};
@@ -298,9 +298,11 @@ impl DisplayView {
                             DisplayTarget::Spice(options) => {
                                 Session::spice(connection, id, options, gpu)
                             }
-                            DisplayTarget::Dbus(index) => {
-                                Session::dbus(connection, &id, index, gpu)
-                            }
+                            DisplayTarget::Dbus {
+                                graphics,
+                                clipboard,
+                                usb,
+                            } => Session::dbus(connection, &id, graphics, gpu, clipboard, usb),
                         }
                     })
                     .await;
@@ -339,6 +341,9 @@ impl DisplayView {
         self.frame_scheduled = false;
         self.guest_resize = None;
         self.last_preview = None;
+        self.guest_clipboard_seen = 0;
+        self.copy_requested = false;
+        self.clipboard_text = None;
         self.generation = u64::MAX;
         self.cursor_generation = 0;
         if let Some((cursor, _)) = self.cursor.take() {
@@ -349,6 +354,9 @@ impl DisplayView {
             self.status = Some("Connecting".into());
         }
         self.focus.focus(window, cx);
+        if matches!(session.as_ref(), Session::Dbus(_)) && window.is_window_active() {
+            self.offer_host_clipboard(cx);
+        }
         if frame_clock {
             self.schedule_spice_upload(window, cx);
         }
@@ -548,6 +556,7 @@ impl DisplayView {
         if let Some(error) = frame.closed.clone() {
             drop(frame);
             self.release(window);
+            session.close();
             self.session = None;
             if let Some(image) = self.image.take() {
                 window.drop_texture(image);
@@ -939,7 +948,7 @@ impl DisplayView {
         };
         let shared = {
             let frame = session.frame().lock().unwrap_or_else(|e| e.into_inner());
-            frame.spice_clipboard || frame.vnc_clipboard
+            frame.shares_clipboard()
         };
         if !shared {
             return;
@@ -956,21 +965,19 @@ impl DisplayView {
     /// Guest to host: copies new guest clipboard text to the host as soon as it is announced.
     fn copy_guest_clipboard(
         &mut self,
-        session: &Session,
+        session: &Arc<Session>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let (serial, vnc_text) = {
             let mut frame = session.frame().lock().unwrap_or_else(|e| e.into_inner());
-            if !(frame.spice_clipboard || frame.vnc_clipboard)
-                || frame.guest_clipboard == self.guest_clipboard_seen
-            {
+            if !frame.shares_clipboard() || frame.guest_clipboard == self.guest_clipboard_seen {
                 return;
             }
             (frame.guest_clipboard, frame.clipboard_text.take())
         };
         self.guest_clipboard_seen = serial;
-        // VNC delivers the text with the announcement; SPICE is asked for it.
+        // VNC delivers the text with the announcement. SPICE and D-Bus request it.
         if let Some(text) = vnc_text {
             self.clipboard_text = Some(text.clone());
             cx.write_to_clipboard(ClipboardItem::new_string(text));
@@ -983,6 +990,7 @@ impl DisplayView {
         let Ok(rx) = session.read_clipboard() else {
             return;
         };
+        let origin = Arc::downgrade(session);
         cx.spawn_in(window, async move |view, cx| {
             let text =
                 cx.background_executor()
@@ -992,6 +1000,15 @@ impl DisplayView {
                     .await;
             if let Some(text) = text.filter(|t| !t.is_empty()) {
                 let _ = view.update_in(cx, |view, window, cx| {
+                    if view.guest_clipboard_seen != serial
+                        || !origin.upgrade().is_some_and(|session| {
+                            view.session
+                                .as_ref()
+                                .is_some_and(|current| Arc::ptr_eq(current, &session))
+                        })
+                    {
+                        return;
+                    }
                     view.clipboard_text = Some(text.clone());
                     cx.write_to_clipboard(ClipboardItem::new_string(text));
                     if announce {
@@ -1010,9 +1027,9 @@ impl DisplayView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let (spice, vnc) = {
+        let (shared, vnc) = {
             let frame = session.frame().lock().unwrap_or_else(|e| e.into_inner());
-            (frame.spice_clipboard, frame.vnc_clipboard)
+            (frame.shares_clipboard(), frame.vnc_clipboard)
         };
         if vnc {
             self.copy_requested = true;
@@ -1020,10 +1037,12 @@ impl DisplayView {
                 self.copy_requested = false;
                 window.push_notification(error.to_string(), cx);
             }
-        } else if spice {
-            Self::receive_spice_result(
+        } else if shared {
+            let view = cx.entity().downgrade();
+            Self::receive_session_result(
                 session.read_clipboard(),
-                |text, window, cx| {
+                move |text, window, cx| {
+                    let _ = view.update(cx, |view, _| view.clipboard_text = Some(text.clone()));
                     cx.write_to_clipboard(ClipboardItem::new_string(text));
                     window.push_notification("Guest clipboard copied", cx);
                 },
@@ -1051,7 +1070,7 @@ impl DisplayView {
         let _ = self.workspace.update(cx, |w, cx| w.begin(job, None, cx));
     }
 
-    fn receive_spice_result<T: Send + 'static>(
+    fn receive_session_result<T: Send + 'static>(
         result: anyhow::Result<mpsc::Receiver<anyhow::Result<T>>>,
         done: impl FnOnce(T, &mut Window, &mut App) + 'static,
         window: &mut Window,
@@ -1202,9 +1221,7 @@ impl DisplayView {
         };
         let track_menu_capture = track_menu.clone();
         let session = self.session.clone();
-        let spice_usb = session.as_ref().is_some_and(|session| {
-            session.frame().lock().unwrap_or_else(|e| e.into_inner()).spice_usb
-        });
+        let usb = session.as_ref().is_some_and(|session| session.can_toggle_usb());
         let view = cx.entity().downgrade();
         let keys = Button::new("special-keys")
             .ghost()
@@ -1420,11 +1437,11 @@ impl DisplayView {
             .child(div().w(px(1.)).h(px(20.)).mx_1().bg(p.border))
             .child(keys)
             .child(scaling)
-            .when(spice_usb, |toolbar| {
+            .when(usb, |toolbar| {
                 let session = self.session.clone();
                 let view = cx.entity().downgrade();
                 toolbar.child(
-                    icon("spice-usb", Glyph::Usb, "Redirect USB devices")
+                    icon("viewer-usb", Glyph::Usb, "Redirect USB devices")
                         .dropdown_menu_with_anchor(Anchor::TopRight, move |mut menu, _, _| {
                             let devices = crate::operations::host_usb();
                             if devices.is_empty() {
@@ -1448,7 +1465,7 @@ impl DisplayView {
                                     move |_, window, cx| {
                                         if let Some(session) = &session {
                                             let _ = view.update(cx, |_, cx| {
-                                                Self::receive_spice_result(
+                                                Self::receive_session_result(
                                                     session.toggle_usb(bus, address),
                                                     |attached, window, cx| {
                                                         window.push_notification(

@@ -219,7 +219,7 @@ fn enable_gl_scanout(xml: &str) -> Result<Option<String>> {
 /// Where guest sound plays: through the SPICE viewer, or straight to the host's sound
 /// server so a VNC viewer has audio too. Only backends Hydroxl manages are switched;
 /// a backend chosen by hand (ALSA, JACK, D-Bus) is left alone.
-pub(super) fn route_audio(xml: &str, backend: &str) -> Result<Option<String>> {
+pub(crate) fn route_audio(xml: &str, backend: &str) -> Result<Option<String>> {
     const MANAGED: [&str; 3] = ["spice", "pipewire", "pulseaudio"];
     let doc = roxmltree::Document::parse(xml)?;
     let Some(devices) = doc.root_element().children().find(|n| n.has_tag_name("devices")) else {
@@ -244,34 +244,38 @@ pub(super) fn route_audio(xml: &str, backend: &str) -> Result<Option<String>> {
 /// The guest agent channel (spice-vdagent's `com.redhat.spice.0` port) connects either to
 /// the SPICE server or, for a VNC viewer, to QEMU's built-in agent, which serves the
 /// clipboard over VNC. Only one can own the port, so it follows the viewer.
-pub(super) fn route_agent(xml: &str, vnc: bool) -> Result<Option<String>> {
+pub(crate) fn route_agent(xml: &str, vnc: bool) -> Result<Option<String>> {
+    route_agent_clipboard(xml, vnc, None)
+}
+
+pub(crate) fn route_agent_clipboard(
+    xml: &str,
+    vdagent: bool,
+    clipboard: Option<bool>,
+) -> Result<Option<String>> {
     let doc = roxmltree::Document::parse(xml)?;
     let Some(devices) = doc.root_element().children().find(|n| n.has_tag_name("devices")) else {
         return Ok(None);
     };
-    let channel = devices.children().find(|n| {
-        n.has_tag_name("channel")
-            && n.children().any(|t| {
-                t.has_tag_name("target") && t.attribute("name") == Some("com.redhat.spice.0")
-            })
-    });
-    let (wanted, other) = if vnc {
+    let channel = devices.children().find(|&node| is_agent_channel(node));
+    let (wanted, other) = if vdagent {
         ("qemu-vdagent", "spicevmc")
     } else {
         ("spicevmc", "qemu-vdagent")
     };
-    let copypaste = !doc
-        .descendants()
-        .any(|n| n.has_tag_name("clipboard") && n.attribute("copypaste") == Some("no"));
-    let element = if vnc {
+    let copypaste = if clipboard.unwrap_or_else(|| {
+        !doc.descendants()
+            .any(|n| n.has_tag_name("clipboard") && n.attribute("copypaste") == Some("no"))
+    }) {
+        "yes"
+    } else {
+        "no"
+    };
+    let element = if vdagent {
         format!(
             "<channel type='qemu-vdagent'><source><clipboard copypaste='{}'/></source>\
              <target type='virtio' name='com.redhat.spice.0'/></channel>",
-            if copypaste {
-                "yes"
-            } else {
-                "no"
-            }
+            copypaste,
         )
     } else {
         "<channel type='spicevmc'><target type='virtio' name='com.redhat.spice.0'/></channel>"
@@ -279,19 +283,74 @@ pub(super) fn route_agent(xml: &str, vnc: bool) -> Result<Option<String>> {
     };
     let mut edited = xml.to_owned();
     match channel {
-        Some(node) if node.attribute("type") == Some(wanted) => return Ok(None),
+        Some(node) if node.attribute("type") == Some(wanted) => {
+            if clipboard.is_none() || !vdagent {
+                return Ok(None);
+            }
+            let source = node.children().find(|n| n.has_tag_name("source"));
+            let clip = source.and_then(|n| n.children().find(|n| n.has_tag_name("clipboard")));
+            if let Some(clip) = clip {
+                if let Some(attr) = clip.attribute_node("copypaste") {
+                    edited.replace_range(attr.range_value(), copypaste);
+                } else {
+                    edited.insert_str(
+                        clip.range().start + "<clipboard".len(),
+                        &format!(" copypaste='{copypaste}'"),
+                    );
+                }
+            } else {
+                let clip = format!("<clipboard copypaste='{copypaste}'/>");
+                if let Some(source) = source {
+                    if xml[source.range()].ends_with("/>") {
+                        let end = source.range().end;
+                        edited.replace_range(end - 2..end, &format!(">{clip}</source>"));
+                    } else {
+                        edited.insert_str(source.range().end - "</source>".len(), &clip);
+                    }
+                } else {
+                    let target = node
+                        .children()
+                        .find(|n| n.has_tag_name("target"))
+                        .context("The agent channel has no target.")?;
+                    edited.insert_str(target.range().start, &format!("<source>{clip}</source>"));
+                }
+            }
+        }
         Some(node) if node.attribute("type") == Some(other) => {
             edited.replace_range(node.range(), &element);
         }
         Some(_) => return Ok(None),
-        None if vnc => edited.insert_str(devices.range().end - "</devices>".len(), &element),
+        None if vdagent || clipboard.is_some() => {
+            if xml[devices.range()].ends_with("/>") {
+                let end = devices.range().end;
+                edited.replace_range(end - 2..end, &format!(">{element}</devices>"));
+            } else {
+                edited.insert_str(devices.range().end - "</devices>".len(), &element);
+            }
+        }
         None => return Ok(None),
     }
     Ok(Some(edited))
 }
 
+pub(crate) fn is_agent_channel(node: roxmltree::Node<'_, '_>) -> bool {
+    node.has_tag_name("channel")
+        && node.children().any(|target| {
+            target.has_tag_name("target") && target.attribute("name") == Some("com.redhat.spice.0")
+        })
+}
+
+pub(crate) fn peer_clipboard(doc: &roxmltree::Document) -> bool {
+    doc.descendants().filter(|&node| is_agent_channel(node)).any(|node| {
+        node.attribute("type") == Some("qemu-vdagent")
+            && node.descendants().any(|child| {
+                child.has_tag_name("clipboard") && child.attribute("copypaste") == Some("yes")
+            })
+    })
+}
+
 /// The host sound server QEMU can play to directly, for viewers without an audio channel.
-pub(super) fn host_audio_backend() -> Option<&'static str> {
+pub(crate) fn host_audio_backend() -> Option<&'static str> {
     let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from)?;
     if runtime.join("pipewire-0").exists() {
         Some("pipewire")

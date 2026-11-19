@@ -6,6 +6,7 @@ fn main() {
         "scripts/neptune-sources.txt",
         "scripts/triton",
         "patches/neptune/qemu-11.1.3.patch",
+        "patches/neptune/vkd3d-proton-idl.patch",
     ] {
         println!("cargo:rerun-if-changed={input}");
     }

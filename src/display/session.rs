@@ -39,8 +39,12 @@ impl Session {
         id: &str,
         index: u32,
         gpu: bool,
+        clipboard: bool,
+        usb: bool,
     ) -> Result<Arc<Self>> {
-        Ok(Arc::new(Self::Dbus(dbus::Session::connect(connection, id, index, gpu)?)))
+        Ok(Arc::new(Self::Dbus(dbus::Session::connect(
+            connection, id, index, gpu, clipboard, usb,
+        )?)))
     }
 
     pub(crate) fn frame(&self) -> &Mutex<Framebuffer> {
@@ -125,24 +129,37 @@ impl Session {
         }
     }
 
+    pub(crate) fn can_toggle_usb(&self) -> bool {
+        match self {
+            Self::Spice(session) => {
+                session.frame.lock().unwrap_or_else(|e| e.into_inner()).spice_usb
+            }
+            Self::Dbus(session) => session.can_toggle_usb(),
+            Self::Vnc(_) => false,
+        }
+    }
+
     pub(crate) fn toggle_usb(&self, bus: u8, address: u8) -> Result<mpsc::Receiver<Result<bool>>> {
-        let Self::Spice(session) = self else {
-            anyhow::bail!("USB redirection requires a SPICE connection.");
-        };
-        let (result, rx) = mpsc::channel();
-        session.send(Input::Usb {
-            bus,
-            address,
-            result,
-        });
-        Ok(rx)
+        match self {
+            Self::Spice(session) => {
+                let (result, rx) = mpsc::channel();
+                session.send(Input::Usb {
+                    bus,
+                    address,
+                    result,
+                });
+                Ok(rx)
+            }
+            Self::Dbus(session) => session.toggle_usb(bus, address),
+            Self::Vnc(_) => anyhow::bail!("USB redirection is unavailable for this display."),
+        }
     }
 
     pub(crate) fn send_clipboard(&self, text: String) {
         match self {
             Self::Spice(session) => session.send(Input::SendClipboard(text)),
             Self::Vnc(session) => session.offer_clipboard(text),
-            Self::Dbus(_) => {}
+            Self::Dbus(session) => session.send_clipboard(text),
         }
     }
 
@@ -155,11 +172,14 @@ impl Session {
     }
 
     pub(crate) fn read_clipboard(&self) -> Result<mpsc::Receiver<Result<String>>> {
-        let Self::Spice(session) = self else {
-            anyhow::bail!("Clipboard sharing requires a SPICE connection.");
-        };
-        let (result, rx) = mpsc::channel();
-        session.send(Input::ReadClipboard(result));
-        Ok(rx)
+        match self {
+            Self::Spice(session) => {
+                let (result, rx) = mpsc::channel();
+                session.send(Input::ReadClipboard(result));
+                Ok(rx)
+            }
+            Self::Dbus(session) => session.read_clipboard(),
+            Self::Vnc(_) => anyhow::bail!("Use a VNC clipboard request."),
+        }
     }
 }

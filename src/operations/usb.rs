@@ -32,15 +32,26 @@ pub(super) fn usb(
 ) -> Result<()> {
     let bus: u16 = bus.parse().context("Use a numeric USB bus.")?;
     let device: u16 = device.parse().context("Use a numeric USB device.")?;
+    let mode = if machine.state == State::Stopped {
+        "--config"
+    } else {
+        "--live"
+    };
+    change_usb(c, &machine.id, bus, device, mode, attach)
+}
+
+fn change_usb(
+    c: Connection,
+    id: &str,
+    bus: u16,
+    device: u16,
+    mode: &str,
+    attach: bool,
+) -> Result<()> {
     let xml = format!(
         "<hostdev mode='subsystem' type='usb' managed='yes'><source><address bus='{bus}' device='{device}'/></source></hostdev>"
     );
     temporary_xml(&xml, |path| {
-        let mode = if machine.state == State::Stopped {
-            "--config"
-        } else {
-            "--live"
-        };
         backend::virsh(
             c,
             &[
@@ -49,13 +60,37 @@ pub(super) fn usb(
                 } else {
                     "detach-device"
                 },
-                &machine.id,
+                id,
                 path,
                 mode,
             ],
         )
         .map(|_| ())
     })
+}
+
+/// Same-host viewer attachment. The saved domain is never edited.
+pub(crate) fn toggle_live_usb(c: Connection, id: &str, bus: u16, device: u16) -> Result<bool> {
+    let xml = backend::virsh(c, &["dumpxml", id])?;
+    let doc = roxmltree::Document::parse(&xml)?;
+    anyhow::ensure!(
+        doc.root_element().attribute("id").is_some(),
+        "Start the guest to connect USB devices."
+    );
+    let attached = doc.descendants().any(|node| {
+        node.has_tag_name("hostdev")
+            && node.attribute("type") == Some("usb")
+            && node
+                .children()
+                .find(|child| child.has_tag_name("source"))
+                .and_then(|source| source.children().find(|child| child.has_tag_name("address")))
+                .is_some_and(|address| {
+                    address.attribute("bus").and_then(|n| n.parse().ok()) == Some(bus)
+                        && address.attribute("device").and_then(|n| n.parse().ok()) == Some(device)
+                })
+    });
+    change_usb(c, id, bus, device, "--live", !attached)?;
+    Ok(!attached)
 }
 
 pub fn host_usb() -> Vec<(String, String)> {
