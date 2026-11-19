@@ -33,7 +33,7 @@ this matrix as a release claim.
 | Operating system | Set from the libosinfo catalog in libvirt metadata | |
 | Guest agent | Channel added to new machines; one action adds it to existing ones | qemu-guest-agent in the guest |
 | Multiple displays | Configurable video heads | Guest, video model and viewer support required |
-| Graphics / 3D | VirtIO, QXL, VGA, Bochs, RAM framebuffer | 3D requires VirtIO and host graphics support |
+| Graphics / 3D | VirtIO, QXL, VGA, Bochs, RAM framebuffer. Windows 11 DirectX through the bundled Neptune QEMU and signed Triton driver disc | Requires VirtIO and host graphics support. Windows acceleration is experimental. See [Neptune setup](neptune.md). |
 | Sound | HD Audio, AC97, AudioPCI, SB16 over SPICE | Model support depends on guest and architecture |
 | Serial console | virsh console in configured terminal | External terminal; advanced serial device setup uses XML |
 | CPU / RAM | Inline sockets, cores, threads; memory in MB | Powered-off configuration changes |

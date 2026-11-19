@@ -1731,6 +1731,10 @@ impl PlatformWindow for WaylandWindow {
         let state = self.0.state.borrow();
         state.client.capture_cursor(&state.surface, hidden)
     }
+    fn set_cursor_image(&mut self, image: Option<gpui::CursorImage>) -> anyhow::Result<()> {
+        let state = self.0.state.borrow();
+        state.client.capture_cursor_image(&state.surface, image)
+    }
     fn lock_pointer(&mut self, lock: bool) -> anyhow::Result<()> {
         let state = self.0.state.borrow();
         state.client.capture_pointer(&state.surface, lock)

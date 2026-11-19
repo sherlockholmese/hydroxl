@@ -1,0 +1,13 @@
+Install Triton in Windows 11
+
+Start Windows with VGA or QXL graphics. Open this disc, run
+Install-Triton.cmd, and approve the Windows administrator prompt.
+The installer removes the older VirtIO display-only driver when present
+and installs the signed Triton driver. If the old driver is running,
+restart Windows when prompted so setup can finish in the background.
+
+Shut down Windows. In Hydroxl, select VirtIO graphics and enable DirectX,
+then start the VM again. In Windows Device Manager, look for Red Hat VirtIO
+GPU D3D controller under Display adapters.
+
+The setup log is in %SystemRoot%\Logs\Hydroxl-Triton.log.

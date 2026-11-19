@@ -159,10 +159,8 @@ fn local_encoding(xml: &str) -> Result<Option<String>> {
     let text = &xml[spice.range()];
     if !missing.is_empty() {
         if text.ends_with("/>") {
-            edits.push((
-                spice.range(),
-                format!("{}>{missing}</graphics>", &text[..text.len() - 2]),
-            ));
+            edits
+                .push((spice.range(), format!("{}>{missing}</graphics>", &text[..text.len() - 2])));
         } else {
             let at = spice.range().end - "</graphics>".len();
             edits.push((at..at, missing));
@@ -269,7 +267,11 @@ pub(super) fn route_agent(xml: &str, vnc: bool) -> Result<Option<String>> {
         format!(
             "<channel type='qemu-vdagent'><source><clipboard copypaste='{}'/></source>\
              <target type='virtio' name='com.redhat.spice.0'/></channel>",
-            if copypaste { "yes" } else { "no" }
+            if copypaste {
+                "yes"
+            } else {
+                "no"
+            }
         )
     } else {
         "<channel type='spicevmc'><target type='virtio' name='com.redhat.spice.0'/></channel>"
@@ -367,7 +369,9 @@ mod tests {
     fn agent_channel_follows_the_viewer() -> Result<()> {
         let spice = "<domain><devices><graphics type='spice'><clipboard copypaste='yes'/></graphics><channel type='spicevmc'><target type='virtio' name='com.redhat.spice.0'/><address type='virtio-serial' controller='0' bus='0' port='1'/></channel></devices></domain>";
         let vnc = route_agent(spice, true)?.unwrap();
-        assert!(vnc.contains("<channel type='qemu-vdagent'><source><clipboard copypaste='yes'/></source>"));
+        assert!(vnc.contains(
+            "<channel type='qemu-vdagent'><source><clipboard copypaste='yes'/></source>"
+        ));
         assert!(!vnc.contains("spicevmc"));
         assert!(route_agent(&vnc, true)?.is_none());
         let back = route_agent(&vnc, false)?.unwrap();
@@ -399,8 +403,12 @@ mod tests {
     fn local_spice_sends_exact_images_without_video_streams() -> Result<()> {
         let xml = "<domain><devices><graphics type='spice'><listen type='none'/><streaming mode='filter'/></graphics></devices></domain>";
         let edited = local_encoding(xml)?.unwrap();
-        for element in ["<image compression='lz'/>", "<jpeg compression='never'/>",
-            "<zlib compression='never'/>", "<streaming mode='off'/>"] {
+        for element in [
+            "<image compression='lz'/>",
+            "<jpeg compression='never'/>",
+            "<zlib compression='never'/>",
+            "<streaming mode='off'/>",
+        ] {
             assert!(edited.contains(element), "{element} missing: {edited}");
         }
         assert!(!edited.contains("filter"));

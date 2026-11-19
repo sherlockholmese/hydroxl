@@ -1,7 +1,7 @@
 use super::devices::human_bytes;
 use super::primitives::caption;
 use crate::app::{Job, Workspace};
-use crate::backend::{Machine, State};
+use crate::backend::{Machine, QemuBackend, State};
 use crate::operations::Operation;
 use crate::theme::{BODY_SIZE, LABEL_WIDTH, Palette, WELL_HEIGHT};
 use crate::workflows;
@@ -92,18 +92,6 @@ impl Workspace {
         let os_name = crate::backend::os_name(&machine.os)
             .map(str::to_owned)
             .unwrap_or_else(|| "Not set".to_owned());
-        let os_button = h_flex().child({
-            let m = machine.clone();
-            Button::new("change-os")
-                .outline()
-                .small()
-                .label(os_name)
-                .dropdown_caret(true)
-                .disabled(self.busy())
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.open_form(workflows::operating_system(&m), window, cx)
-                }))
-        });
         let processor = vcpus(machine.cpus);
         let firmware = match &config {
             Some(c) => {
@@ -126,12 +114,39 @@ impl Workspace {
             "Emulated"
         };
         let system = v_flex()
-            .child(row("Operating system", os_button, p))
-            .child(row("Architecture", self.architecture_control(machine, cx), p))
+            .child(row("Operating system", text(os_name), p))
+            .child(row("Architecture", text(machine.architecture().to_owned()), p))
             .child(row("Processor", text(processor), p))
             .child(row("Memory", text(machine.memory()), p))
             .child(row("Firmware", text(firmware), p))
-            .child(row("Execution", text(acceleration), p));
+            .child(row("Execution", text(acceleration), p))
+            .child(row(
+                "QEMU backend",
+                h_flex().items_center().gap_3().child(text(machine.qemu_backend.label())).when(
+                    machine.qemu_backend != QemuBackend::Bundled && machine.can_edit(),
+                    |row| {
+                        let machine = machine.clone();
+                        row.child(
+                            Button::new("switch-to-bundled-qemu")
+                                .outline()
+                                .small()
+                                .label("Use bundled")
+                                .disabled(self.busy())
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.begin(
+                                        Job::Operation(
+                                            machine.clone(),
+                                            Operation::SwitchToBundledQemu,
+                                        ),
+                                        None,
+                                        cx,
+                                    );
+                                })),
+                        )
+                    },
+                ),
+                p,
+            ));
 
         // Storage and connections
         let disks: Vec<String> = details

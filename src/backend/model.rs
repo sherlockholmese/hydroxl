@@ -38,6 +38,7 @@ pub struct Machine {
     pub network: String,
     pub display: String,
     pub acceleration: String,
+    pub qemu_backend: super::QemuBackend,
     pub autostart: bool,
     pub saved_state: bool,
     pub notes: String,
@@ -118,6 +119,7 @@ pub struct NewMachine {
     /// Folder that receives the machine's own folder and disk.
     pub location: PathBuf,
     pub architecture: String,
+    pub qemu_build: super::QemuBuild,
     pub os_variant: String,
     pub emulate: bool,
     pub uefi: bool,

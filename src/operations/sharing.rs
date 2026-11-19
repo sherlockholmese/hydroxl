@@ -77,7 +77,10 @@ pub(super) fn with_shared_memory(xml: &str) -> Result<Option<String>> {
             if !node.children().any(|n| n.has_tag_name("source")) {
                 inner.push_str("<source type='memfd'/>");
             }
-            inner.push_str("<access mode='shared'/>");
+            let access = node.children().find(|n| n.has_tag_name("access"));
+            if access.is_none() {
+                inner.push_str("<access mode='shared'/>");
+            }
             let text = &xml[node.range()];
             let mut result = xml.to_owned();
             if text.ends_with("/>") {
@@ -88,6 +91,9 @@ pub(super) fn with_shared_memory(xml: &str) -> Result<Option<String>> {
             } else {
                 let at = node.range().end - "</memoryBacking>".len();
                 result.insert_str(at, &inner);
+                if let Some(access) = access {
+                    result.replace_range(access.range(), "<access mode='shared'/>");
+                }
             }
             result
         }

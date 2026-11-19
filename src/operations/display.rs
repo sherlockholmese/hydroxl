@@ -9,7 +9,10 @@ const VIDEO_ALIAS: &str = "video0";
 
 /// Replaces the QEMU device properties Hydroxl sets on the primary video device.
 /// Other overrides and command-line arguments are left alone.
-pub(super) fn set_video_properties(xml: &str, properties: &[(&str, &str, String)]) -> Result<String> {
+pub(super) fn set_video_properties(
+    xml: &str,
+    properties: &[(&str, &str, String)],
+) -> Result<String> {
     let doc = roxmltree::Document::parse(xml)?;
     let root = doc.root_element();
     let prefix = root.lookup_prefix(QEMU_NS).unwrap_or("qemu").to_owned();
@@ -101,18 +104,29 @@ pub(super) fn apply_display(
     if accel3d && model != "virtio" {
         bail!("Choose VirtIO for 3D acceleration.");
     }
-    let gpu = backend::gpu_features(&machine.arch);
-    // Windows draws nothing over 3D VirtIO without viogpu3d, whose Direct3D path
-    // needs QEMU's Neptune renderer.
-    if accel3d && GuestOs::of(machine) == GuestOs::Windows && !gpu.neptune {
-        bail!("Windows 3D acceleration needs QEMU with Neptune support.");
-    }
-    let blob = accel3d && (gpu.venus || gpu.neptune);
+    let windows = GuestOs::of(machine) == GuestOs::Windows;
     let mut xml = backend::virsh(c, &["dumpxml", id, "--inactive"])?;
     let doc = roxmltree::Document::parse(&xml)?;
-    let dbus = doc
+    let caps = accel3d
+        .then(|| {
+            backend::gpu_features(&machine.arch, backend::qemu::domain_emulator(doc.root_element()))
+        })
+        .unwrap_or_default();
+    let neptune = accel3d && windows;
+    if neptune && !backend::triton_arch(&machine.arch) {
+        bail!(backend::TRITON_ARCH_UNSUPPORTED);
+    }
+    if neptune && !caps.neptune {
+        bail!(backend::NEPTUNE_HOST_MISSING);
+    }
+    let blob = accel3d && (caps.venus || neptune);
+    let dbus_node = doc
         .descendants()
-        .any(|node| node.has_tag_name("graphics") && node.attribute("type") == Some("dbus"));
+        .find(|node| node.has_tag_name("graphics") && node.attribute("type") == Some("dbus"));
+    let dbus = dbus_node.is_some();
+    if neptune && dbus_node.is_some_and(|node| node.attribute("p2p") != Some("yes")) {
+        bail!("Use peer-to-peer D-Bus or local SPICE to open DirectX in Hydroxl.");
+    }
     let vram = if vram > 0 && ["qxl", "vga", "bochs"].contains(&model.as_str()) {
         if !(8..=512).contains(&vram) {
             bail!("Use 8 to 512 MB of video memory.");
@@ -140,10 +154,10 @@ pub(super) fn apply_display(
     let mut properties = Vec::new();
     if blob {
         properties.push(("hostmem", "unsigned", backend::HOSTMEM_BYTES.to_string()));
-        if gpu.venus {
+        if caps.venus {
             properties.push(("venus", "bool", "true".to_owned()));
         }
-        if gpu.neptune {
+        if neptune {
             properties.push(("neptune", "bool", "true".to_owned()));
         }
         // Blob resources live in guest RAM that the renderer maps.
@@ -165,7 +179,9 @@ pub(super) fn apply_display(
             ""
         }
     );
-    if !dbus {
+    if dbus && windows {
+        xml = dbus_gl(&xml, accel3d)?;
+    } else if !dbus {
         let doc = roxmltree::Document::parse(&xml)?;
         if let Some(spice) = doc
             .descendants()
@@ -210,6 +226,36 @@ pub(super) fn apply_display(
     Ok(())
 }
 
+fn dbus_gl(xml: &str, enabled: bool) -> Result<String> {
+    let doc = roxmltree::Document::parse(xml)?;
+    let graphics = doc
+        .descendants()
+        .find(|node| node.has_tag_name("graphics") && node.attribute("type") == Some("dbus"))
+        .context("The D-Bus display is missing.")?;
+    let mut updated = xml.to_owned();
+    if let Some(node) = graphics.children().find(|node| node.has_tag_name("gl")) {
+        if !enabled {
+            updated.replace_range(node.range(), "");
+        } else if let Some(value) = node.attribute_node("enable") {
+            updated.replace_range(value.range_value(), "yes");
+        } else {
+            updated.insert_str(node.range().start + "<gl".len(), " enable='yes'");
+        }
+    } else if enabled {
+        let gl = "<gl enable='yes'/>";
+        let text = &xml[graphics.range()];
+        if text.ends_with("/>") {
+            updated.replace_range(
+                graphics.range().end - 2..graphics.range().end,
+                &format!(">{gl}</graphics>"),
+            );
+        } else {
+            updated.insert_str(graphics.range().end - "</graphics>".len(), gl);
+        }
+    }
+    Ok(updated)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -250,5 +296,16 @@ mod tests {
     #[test]
     fn clearing_without_override_is_a_no_op() {
         assert_eq!(set_video_properties(DOMAIN, &[]).unwrap(), DOMAIN);
+    }
+
+    #[test]
+    fn enables_dbus_gl_without_discarding_the_render_node() -> Result<()> {
+        let xml = "<domain><devices><graphics type='dbus' p2p='yes'><gl enable='no' rendernode='/dev/dri/renderD129'/></graphics></devices></domain>";
+        let enabled = dbus_gl(xml, true)?;
+        assert!(enabled.contains("<gl enable='yes' rendernode='/dev/dri/renderD129'/>"));
+        assert!(dbus_gl(&enabled, false)?.contains("<graphics type='dbus' p2p='yes'></graphics>"));
+        let self_closing = "<domain><devices><graphics type='dbus' p2p='yes'/></devices></domain>";
+        assert!(dbus_gl(self_closing, true)?.contains("<gl enable='yes'/>"));
+        Ok(())
     }
 }

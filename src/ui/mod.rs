@@ -1,3 +1,4 @@
+mod about;
 mod actions;
 mod detail;
 mod devices;

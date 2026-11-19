@@ -4,6 +4,7 @@ use crate::app::{Job, Workspace};
 use crate::theme::{BODY_SIZE, CAPTION_SIZE, HEADER_HEIGHT, Palette, ROW_HEIGHT, SIDEBAR_WIDTH};
 use gpui_kit::assets::IconName as Glyph;
 use gpui_kit::component::input::Input;
+use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::{button::*, *};
 use gpui_kit::{prelude::*, *};
@@ -76,54 +77,68 @@ impl Workspace {
         for machine in &filtered {
             let id = machine.id.clone();
             let selected = self.selected.as_ref() == Some(&machine.id);
+            let menu = self.machine_context_menu(machine, cx);
+            let row_id = machine.id.clone();
             list = list.child(
-                Button::new(SharedString::from(format!("machine-{}", machine.id)))
-                    .accessibility_label(format!("{}, {}", machine.name, machine.status()))
-                    .custom(
-                        ButtonCustomVariant::new(cx)
-                            .color(if selected {
-                                p.sidebar_accent
-                            } else {
-                                p.sidebar
-                            })
-                            .hover(if selected {
-                                p.sidebar_accent
-                            } else {
-                                p.sidebar_accent.opacity(0.5)
-                            })
-                            .active(p.sidebar_accent)
-                            .foreground(p.text),
-                    )
-                    .selected(selected)
+                div()
+                    .id(SharedString::from(format!("machine-row-{}", machine.id)))
                     .w_full()
-                    .h(px(ROW_HEIGHT))
-                    .px_2()
-                    .child(
-                        h_flex()
-                            .gap_3()
-                            .w_full()
-                            .min_w_0()
-                            .child(logo_tile(machine, 20., p, cx))
-                            .child(
-                                v_flex()
-                                    .min_w_0()
-                                    .flex_1()
-                                    .child(
-                                        div()
-                                            .text_size(px(BODY_SIZE))
-                                            .font_weight(FontWeight::MEDIUM)
-                                            .truncate()
-                                            .child(machine.name.clone()),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(CAPTION_SIZE))
-                                            .text_color(status_color(machine, p))
-                                            .child(machine.status()),
-                                    ),
-                            ),
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, _, _, cx| this.select(row_id.clone(), cx)),
                     )
-                    .on_click(cx.listener(move |this, _, _, cx| this.select(id.clone(), cx))),
+                    .context_menu(menu)
+                    .child(
+                        Button::new(SharedString::from(format!("machine-{}", machine.id)))
+                            .accessibility_label(format!("{}, {}", machine.name, machine.status()))
+                            .custom(
+                                ButtonCustomVariant::new(cx)
+                                    .color(if selected {
+                                        p.sidebar_accent
+                                    } else {
+                                        p.sidebar
+                                    })
+                                    .hover(if selected {
+                                        p.sidebar_accent
+                                    } else {
+                                        p.sidebar_accent.opacity(0.5)
+                                    })
+                                    .active(p.sidebar_accent)
+                                    .foreground(p.text),
+                            )
+                            .selected(selected)
+                            .w_full()
+                            .h(px(ROW_HEIGHT))
+                            .px_2()
+                            .child(
+                                h_flex()
+                                    .gap_3()
+                                    .w_full()
+                                    .min_w_0()
+                                    .child(logo_tile(machine, 20., p, cx))
+                                    .child(
+                                        v_flex()
+                                            .min_w_0()
+                                            .flex_1()
+                                            .child(
+                                                div()
+                                                    .text_size(px(BODY_SIZE))
+                                                    .font_weight(FontWeight::MEDIUM)
+                                                    .truncate()
+                                                    .child(machine.name.clone()),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_size(px(CAPTION_SIZE))
+                                                    .text_color(status_color(machine, p))
+                                                    .child(machine.status()),
+                                            ),
+                                    ),
+                            )
+                            .on_click(
+                                cx.listener(move |this, _, _, cx| this.select(id.clone(), cx)),
+                            ),
+                    ),
             );
         }
         if filtered.is_empty() && !query.is_empty() {

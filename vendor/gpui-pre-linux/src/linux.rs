@@ -1,3 +1,5 @@
+#[cfg(any(feature = "wayland", feature = "x11"))]
+mod cursor_image;
 mod dispatcher;
 mod display_connection;
 mod headless;

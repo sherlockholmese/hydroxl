@@ -1,31 +1,45 @@
 pkgname=hydroxl
 # Keep pkgver in sync with Cargo.toml.
 pkgver=0.1.0
-pkgrel=1
+pkgrel=2
 pkgdesc='A quiet, native QEMU/KVM workspace for Linux'
 arch=('x86_64')
 url='https://github.com/sherlockholmese/hydroxl'
-license=('MIT' 'Apache-2.0' 'OFL-1.1' 'CC0-1.0' 'CC-BY-SA-2.5' 'CC-BY-SA-3.0' 'CC-BY-SA-4.0')
+license=('MIT' 'Apache-2.0' 'OFL-1.1' 'CC0-1.0' 'CC-BY-SA-2.5' 'CC-BY-SA-3.0'
+  'CC-BY-SA-4.0' 'GPL-2.0-only' 'LGPL-2.1-or-later' 'Zlib')
 depends=(
-  'fontconfig' 'freetype2' 'glibc' 'hicolor-icon-theme' 'libgcc' 'libglvnd'
-  'libvirt' 'libx11' 'libxcb' 'libxkbcommon' 'libxkbcommon-x11'
-  'qemu-audio-spice' 'qemu-base' 'qemu-chardev-spice' 'qemu-hw-display-qxl'
-  'qemu-hw-usb-redirect' 'qemu-ui-spice-core' 'spice-gtk' 'virt-install'
-  'vulkan-driver' 'vulkan-icd-loader' 'wayland' 'xdg-desktop-portal'
+  'alsa-lib' 'attr' 'bzip2' 'curl' 'dtc' 'fontconfig' 'freetype2' 'glib2' 'glibc'
+  'gnutls' 'hicolor-icon-theme' 'libaio' 'libcap-ng' 'libdrm' 'libepoxy' 'libgcc'
+  'libglvnd' 'libpipewire' 'libpng' 'libpulse' 'libseccomp' 'libslirp' 'libstdc++'
+  'libtpms' 'liburing' 'libusb' 'libvirt' 'libx11' 'libxcb' 'libxkbcommon' 'libxkbcommon-x11'
+  'lzo' 'mesa' 'numactl' 'pixman' 'qemu-system-x86' 'spice' 'spice-gtk'
+  'swtpm' 'systemd-libs' 'usbredir' 'virt-install' 'vulkan-driver' 'vulkan-icd-loader'
+  'wayland' 'xdg-desktop-portal' 'zlib' 'zstd'
 )
-makedepends=('rust')
+makedepends=('glib2-devel' 'glslang' 'libisoburn' 'meson' 'ninja' 'python-yaml'
+  'rust' 'spice-protocol' 'unzip' 'vulkan-headers' 'wine')
 optdepends=(
   'dnsmasq: libvirt virtual networks with DHCP'
   'networkmanager: host bridge management'
   'passt: shared-network port forwarding'
-  'qemu-hw-usb-host: physical USB passthrough'
-  'qemu-system-aarch64: ARM64 guests'
-  'qemu-ui-dbus: QEMU D-Bus displays'
-  'swtpm: TPM emulation for guests such as Windows 11'
+  'qemu-system-aarch64: libvirt discovery for ARM64 guests'
+  'qemu-system-arm: libvirt discovery for ARM guests'
+  'qemu-system-riscv: libvirt discovery for RISC-V guests'
+  'qemu-system-ppc: libvirt discovery for PowerPC guests'
   'xdg-desktop-portal-impl: desktop file picker backend'
   'xterm: serial consoles when TERMINAL is unset'
 )
 options=('!debug')
+
+source=()
+noextract=()
+sha256sums=()
+while read -r _archive _digest _url; do
+  [[ -n "$_archive" && "$_archive" != \#* ]] || continue
+  source+=("$_archive::$_url")
+  noextract+=("$_archive")
+  sha256sums+=("$_digest")
+done < "$startdir/../../scripts/neptune-sources.txt"
 
 # Build from the checkout containing this recipe. Keep Cargo output in makepkg's work area.
 prepare() {
@@ -45,18 +59,16 @@ build() {
   local IFS=$'\x1f'
 
   cd "$startdir/../.."
-  CARGO_ENCODED_RUSTFLAGS="${rustflags[*]}" cargo build --release --frozen \
+  CARGO_ENCODED_RUSTFLAGS="${rustflags[*]}" \
+    HYDROXL_QEMU_BUILD_PREFIX=/usr/lib/hydroxl/neptune \
+    HYDROXL_QEMU_DESTDIR="$srcdir/neptune-stage" \
+    HYDROXL_QEMU_ARCHIVE_CACHE="$srcdir" \
+    cargo build --release --frozen \
     --target "$CARCH-unknown-linux-gnu" --target-dir "$srcdir/target"
 }
 
 package() {
-  local sharedir="$pkgdir/usr/share"
-  local licensedir="$sharedir/licenses/$pkgname"
-
   cd "$startdir/../.."
-  install -Dm755 "$srcdir/target/$CARCH-unknown-linux-gnu/release/hydroxl" "$pkgdir/usr/bin/hydroxl"
-  install -Dm644 -t "$sharedir/applications" packaging/dev.hydroxl.Hydroxl.desktop
-  install -Dm644 -t "$sharedir/icons/hicolor/scalable/apps" packaging/dev.hydroxl.Hydroxl.svg
-  install -Dm644 -t "$licensedir" LICENSE vendor/LICENSE-APACHE assets/fonts/Geist-OFL.txt
-  install -Dm644 assets/os/LICENSE.md "$licensedir/OS-LOGOS.md"
+  packaging/stage.sh "$srcdir/target/$CARCH-unknown-linux-gnu/release/hydroxl" \
+    "$srcdir/neptune-stage" "$pkgdir"
 }

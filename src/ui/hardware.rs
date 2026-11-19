@@ -138,6 +138,23 @@ impl Workspace {
 
         let system = section("System", None, p)
             .when(machine.can_edit(), |s| s.border_t_0().pt_0())
+            .child(setting("Operating system", {
+                let m = machine.clone();
+                let os = crate::backend::os_name(&machine.os).unwrap_or("Not set").to_owned();
+                h_flex()
+                    .child(
+                        Button::new("change-os")
+                            .outline()
+                            .small()
+                            .label(os)
+                            .dropdown_caret(true)
+                            .disabled(self.busy())
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.open_form(workflows::operating_system(&m), window, cx)
+                            })),
+                    )
+                    .into_any_element()
+            }))
             .child(setting("Architecture", self.architecture_control(machine, cx)))
             .child(
                 h_flex()
@@ -279,6 +296,14 @@ impl Workspace {
 
         let video_memory = ["qxl", "vga", "bochs"].contains(&d.graphics.as_str());
         let vram = d.vram.to_string();
+        let windows =
+            crate::operations::GuestOs::of(machine) == crate::operations::GuestOs::Windows;
+        let triton_arch = crate::backend::triton_arch(&machine.arch);
+        let accel_label = if windows {
+            "DirectX"
+        } else {
+            "3D acceleration"
+        };
         let display = section("Display and sound", None, p)
             .child(setting(
                 "Graphics",
@@ -334,24 +359,52 @@ impl Workspace {
             }))
             .child(setting("Displays", self.heads_toggle(d.heads, editable, cx)))
             .child(setting(
-                "3D acceleration",
+                accel_label,
                 v_flex()
                     .gap_1()
                     .child(self.switch(
                         "accel3d",
-                        "3D acceleration",
+                        if windows {
+                            "DirectX acceleration"
+                        } else {
+                            accel_label
+                        },
                         d.accel3d,
-                        // Windows has no VirtIO GPU 3D driver: with GL on it draws nothing.
-                        // An existing setting can still be turned off.
                         editable
-                            && machine.display != "D-Bus"
                             && (d.accel3d
                                 || (d.graphics == "virtio"
-                                    && crate::operations::GuestOs::of(machine)
-                                        != crate::operations::GuestOs::Windows)),
+                                    && if windows {
+                                        triton_arch && self.details.neptune_ready
+                                    } else {
+                                        machine.display != "D-Bus"
+                                    })),
                         |d, on| d.accel3d = on,
                         cx,
                     ))
+                    .when(
+                        windows
+                            && !d.accel3d
+                            && (!triton_arch
+                                || !self.details.neptune_ready
+                                || d.graphics != "virtio"),
+                        |row| {
+                            let hint = if !triton_arch {
+                                crate::backend::TRITON_ARCH_UNSUPPORTED
+                            } else if !self.details.neptune_ready {
+                                crate::backend::NEPTUNE_HOST_MISSING
+                            } else {
+                                "Choose VirtIO graphics to enable DirectX."
+                            };
+                            row.child(caption(hint, p))
+                        },
+                    )
+                    .when(
+                        windows
+                            && triton_arch
+                            && self.details.neptune_ready
+                            && (d.accel3d || d.graphics == "virtio"),
+                        |row| row.child(caption("Requires the Triton driver from Guest tools.", p)),
+                    )
                     .into_any_element(),
             ))
             .child(setting(
@@ -437,45 +490,7 @@ impl Workspace {
             .add(
                 "Guest tools",
                 "package",
-                section(
-                    "Guest tools",
-                    Some(
-                        Button::new("install-guest-tools")
-                            .outline()
-                            .small()
-                            .label("Install")
-                            .disabled(self.busy() || machine.state == State::Other)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                if let Some(m) = this.selected_machine().cloned() {
-                                    this.open_form(workflows::guest_tools(&m, None), window, cx);
-                                }
-                            }))
-                            .into_any_element(),
-                    ),
-                    p,
-                )
-                .child(setting(
-                    "Guest agent",
-                    if crate::operations::has_agent_channel(&self.details.xml) {
-                        div().child("Configured").into_any_element()
-                    } else {
-                        Button::new("add-agent")
-                            .outline()
-                            .small()
-                            .label("Add channel")
-                            .disabled(!editable)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                if let Some(m) = this.selected_machine().cloned() {
-                                    this.begin(
-                                        Job::Operation(m, Operation::AddAgentChannel),
-                                        None,
-                                        cx,
-                                    );
-                                }
-                            }))
-                            .into_any_element()
-                    },
-                )),
+                self.guest_tools(machine, &original, &d, windows && triton_arch, editable, p, cx),
             )
             .add(
                 "Advanced",
@@ -1342,15 +1357,20 @@ impl Workspace {
 
         // In the guest: the command that mounts the folders, beside the button that runs it.
         let running = machine.state == State::Running;
-        let commands: Vec<String> = match os {
+        // Linux mounts each folder with its own command, so each is labelled with its
+        // folder. Windows maps every folder with one command.
+        let commands: Vec<(Option<String>, String)> = match os {
             GuestOs::Linux => shares
                 .iter()
                 .map(|share| {
                     let driver = ShareDriver::from_xml(&share.xml);
-                    crate::operations::linux_command(&share.target, driver, true)
+                    (
+                        Some(share.target.clone()),
+                        crate::operations::linux_command(&share.target, driver, true),
+                    )
                 })
                 .collect(),
-            GuestOs::Windows => vec![crate::operations::WINDOWS_COMMAND.into()],
+            GuestOs::Windows => vec![(None, crate::operations::WINDOWS_COMMAND.into())],
         };
         let id = machine.id.clone();
         let picker = self.segmented_with(
@@ -1403,27 +1423,40 @@ impl Workspace {
         }
         // One row: what runs (each command, copyable where it reads) and the button that
         // runs it. Mounting is one task, so it is one row, not a setting plus a recipe.
-        let mut lines = v_flex().flex_1().min_w_0().gap_2();
-        for (i, command) in commands.into_iter().enumerate() {
+        let mut lines = v_flex().flex_1().min_w_0().gap_4();
+        for (i, (folder, command)) in commands.into_iter().enumerate() {
             lines = lines.child(
-                h_flex()
-                    .items_start()
-                    .gap_2()
+                v_flex()
+                    .gap_1()
+                    .when_some(folder, |block, folder| {
+                        block.child(
+                            div()
+                                .text_size(px(BODY_SIZE))
+                                .font_weight(FontWeight::MEDIUM)
+                                .truncate()
+                                .child(folder),
+                        )
+                    })
                     .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .font_family(mono.clone())
-                            .text_size(px(CAPTION_SIZE))
-                            .line_height(relative(1.6))
-                            .text_color(p.muted)
-                            .child(command.clone()),
-                    )
-                    .child(
-                        Clipboard::new(("copy-mount", i))
-                            .value(command)
-                            .accessibility_label("Copy command")
-                            .tooltip("Copy"),
+                        h_flex()
+                            .items_start()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .font_family(mono.clone())
+                                    .text_size(px(CAPTION_SIZE))
+                                    .line_height(relative(1.6))
+                                    .text_color(p.muted)
+                                    .child(command.clone()),
+                            )
+                            .child(
+                                Clipboard::new(("copy-mount", i))
+                                    .value(command)
+                                    .accessibility_label("Copy command")
+                                    .tooltip("Copy"),
+                            ),
                     ),
             );
         }
@@ -1483,6 +1516,148 @@ impl Workspace {
             .child(div().h(px(16.)))
             .child(section("In the guest", Some(picker), p))
             .child(super::primitives::item_list(rows, p))
+    }
+
+    /// Windows drivers, the guest agent, and — when the guest can use it — the Triton setup
+    /// as an ordered checklist whose steps tick off from machine state.
+    #[allow(clippy::too_many_arguments)]
+    fn guest_tools(
+        &self,
+        machine: &Machine,
+        original: &HardwareDraft,
+        d: &HardwareDraft,
+        triton: bool,
+        editable: bool,
+        p: Palette,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let windows =
+            crate::operations::GuestOs::of(machine) == crate::operations::GuestOs::Windows;
+        let can_mount = !self.busy() && machine.state != State::Other;
+        let disc = |matches: fn(&str) -> bool| {
+            self.details.devices.iter().any(|device| {
+                device.kind == "cdrom"
+                    && std::path::Path::new(&device.source)
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(matches)
+            })
+        };
+        let row = |label: &'static str, control: AnyElement| {
+            h_flex()
+                .gap_4()
+                .w_full()
+                .min_h(px(40.))
+                .text_size(px(BODY_SIZE))
+                .child(div().w(px(LABEL_WIDTH)).flex_shrink_0().text_color(p.muted).child(label))
+                .child(div().flex_1().min_w_0().child(control))
+        };
+
+        let drivers = if disc(|name| name == "virtio-win.iso") {
+            div().child("Disc mounted").into_any_element()
+        } else {
+            Button::new("install-guest-tools")
+                .outline()
+                .small()
+                .label("Mount disc")
+                .disabled(!can_mount)
+                .on_click(cx.listener(|this, _, window, cx| {
+                    if let Some(m) = this.selected_machine().cloned() {
+                        this.open_form(workflows::guest_tools(&m, None), window, cx);
+                    }
+                }))
+                .into_any_element()
+        };
+
+        let agent = if crate::operations::has_agent_channel(&self.details.xml) {
+            div().child("Added").into_any_element()
+        } else {
+            Button::new("add-agent")
+                .outline()
+                .small()
+                .label("Add channel")
+                .disabled(!editable)
+                .on_click(cx.listener(|this, _, _, cx| {
+                    if let Some(m) = this.selected_machine().cloned() {
+                        this.begin(Job::Operation(m, Operation::AddAgentChannel), None, cx);
+                    }
+                }))
+                .into_any_element()
+        };
+
+        let section = section("Guest tools", None, p)
+            .when(windows, |s| s.child(row("VirtIO drivers", drivers)))
+            .child(row("Guest agent", agent));
+        if !triton {
+            return section;
+        }
+
+        let triton =
+            if original.accel3d {
+                h_flex().h(px(40.)).child("DirectX on").into_any_element()
+            } else {
+                let mounted = disc(|name| name.starts_with("triton-") && name.ends_with(".iso"));
+                let neptune = self.details.neptune_ready;
+                let action = |button: Button| Some(button.outline().small().into_any_element());
+                let mount = (!mounted).then(|| {
+                    Button::new("mount-triton-driver").label("Mount").disabled(!can_mount).on_click(
+                        cx.listener(|this, _, _, cx| {
+                            if let Some(m) = this.selected_machine().cloned() {
+                                this.begin(Job::Operation(m, Operation::TritonDriver), None, cx);
+                            }
+                        }),
+                    )
+                });
+                let bundled = Button::new("triton-bundled-qemu")
+                    .label("Switch")
+                    .disabled(!editable)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(m) = this.selected_machine().cloned() {
+                            this.begin(Job::Operation(m, Operation::SwitchToBundledQemu), None, cx);
+                        }
+                    }));
+                let directx = Button::new("triton-directx")
+                    .label("Turn on")
+                    .disabled(!editable || !neptune)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.edit_hardware(
+                            |d| {
+                                d.graphics = "virtio".into();
+                                d.accel3d = true;
+                            },
+                            cx,
+                        )
+                    }));
+                let mut steps = vec![
+                    ("Mount the driver disc", mounted, mount.and_then(action)),
+                    ("Run Install-Triton.cmd in Windows", false, None),
+                ];
+                if !neptune {
+                    steps.push(("Use bundled QEMU", false, action(bundled)));
+                }
+                steps.push(("Turn on DirectX", d.accel3d, action(directx)));
+                v_flex()
+                    .children(steps.into_iter().enumerate().map(|(i, (label, done, action))| {
+                        triton_step(i + 1, label, done, action, p)
+                    }))
+                    .into_any_element()
+            };
+        section.child(
+            h_flex()
+                .items_start()
+                .gap_4()
+                .w_full()
+                .text_size(px(BODY_SIZE))
+                .child(
+                    h_flex()
+                        .h(px(40.))
+                        .w(px(LABEL_WIDTH))
+                        .flex_shrink_0()
+                        .text_color(p.muted)
+                        .child("Triton driver"),
+                )
+                .child(div().flex_1().min_w_0().child(triton)),
+        )
     }
 
     fn locked_notice(&self, machine: &Machine, p: Palette, cx: &mut Context<Self>) -> AnyElement {
@@ -1547,4 +1722,44 @@ impl Render for BootDrag {
             .child(Icon::new(Glyph::GripVertical).size_4().text_color(p.muted))
             .child(self.label.clone())
     }
+}
+
+/// One Triton setup step: its number, or a check once machine state shows it done.
+fn triton_step(
+    number: usize,
+    label: &'static str,
+    done: bool,
+    action: Option<AnyElement>,
+    p: Palette,
+) -> Div {
+    let marker = div()
+        .size(px(20.))
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_full()
+        .border_1()
+        .border_color(if done {
+            p.positive
+        } else {
+            p.border
+        })
+        .text_size(px(CAPTION_SIZE))
+        .text_color(p.muted)
+        .map(|m| {
+            if done {
+                m.child(Icon::new(Glyph::Check).size_3().text_color(p.positive))
+            } else {
+                m.child(number.to_string())
+            }
+        });
+    h_flex()
+        .h(px(40.))
+        .gap_3()
+        .child(marker)
+        .child(
+            div().flex_1().min_w_0().truncate().when(done, |l| l.text_color(p.muted)).child(label),
+        )
+        .children(action)
 }

@@ -121,11 +121,23 @@ pub(super) fn apply_guest_tools(
     target: Option<String>,
 ) -> Result<()> {
     let iso = guest_tools_iso()?;
-    let iso = path_text(&iso)?;
+    mount_tools(c, machine, &iso, target.as_deref())
+}
+
+pub(super) fn apply_triton_driver(c: Connection, machine: &Machine) -> Result<()> {
+    if super::GuestOs::of(machine) != super::GuestOs::Windows {
+        bail!("Choose a Windows machine for the Triton driver.");
+    }
+    let iso = backend::qemu::triton_iso(&machine.arch)?;
+    mount_tools(c, machine, &iso, None)
+}
+
+fn mount_tools(c: Connection, machine: &Machine, iso: &Path, target: Option<&str>) -> Result<()> {
+    let iso = path_text(iso)?;
     let id = &machine.id;
     let xml = backend::virsh(c, &["dumpxml", id])?;
     let doc = Document::parse(&xml)?;
-    match tools_drive(&doc, iso, target.as_deref())? {
+    match tools_drive(&doc, iso, target)? {
         ToolsDrive::Mounted => Ok(()),
         ToolsDrive::Insert(target) => change_media(c, id, target, "--insert", Some(iso)),
         ToolsDrive::Replace(target) => change_media(c, id, target, "--update", Some(iso)),

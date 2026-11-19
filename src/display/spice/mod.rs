@@ -4,10 +4,7 @@ mod api;
 use super::damage::Damage;
 use super::graphics_fd::GraphicsFd;
 use super::vnc::{Cursor, Framebuffer, MAX_DESKTOP_SIZE};
-use super::{
-    keys,
-    scanout::{self, submit_scanout},
-};
+use super::{keys, scanout};
 use crate::backend::{Connection, SpiceOptions};
 use anyhow::{Context, Result, ensure};
 use api::{Api, GlibError, Object, Primary};
@@ -208,6 +205,7 @@ fn work(api: &'static Api, rx: mpsc::Receiver<Message>) {
             }
         }
         for client in clients.values() {
+            client.advance_gpu_draw();
             // Canvas pointers never leave the decoding thread. GPUI receives only
             // owned pixels, sampled after coalescing the available invalidations.
             unsafe { client.software.borrow_mut().publish(&mut client.frame()) };
@@ -344,11 +342,14 @@ struct Client {
     clipboard_offer: RefCell<String>,
     clipboard_request: RefCell<Option<mpsc::Sender<Result<String>>>>,
     gpu: Cell<bool>,
+    /// A GPU draw QEMU is waiting on. SPICE sends no other draw until it is acknowledged.
+    pending: RefCell<Option<PendingDraw>>,
     scanout: RefCell<Option<(scanout::Scanout, scanout::Imported)>>,
     readback_pixels: RefCell<Vec<u8>>,
     profile: RefCell<Option<ReadbackProfile>>,
-    /// Last scanout described in the log, so each new buffer is reported once.
+    /// Last scanout layout described in the debug log.
     logged_scanout: Cell<Option<(u32, u32, u32, u64, u32)>>,
+    logged_scanout_visible: Cell<Option<bool>>,
 }
 
 #[derive(Default)]
@@ -401,12 +402,14 @@ impl Client {
             clipboard_offer: RefCell::default(),
             clipboard_request: RefCell::default(),
             gpu: Cell::new(gpu),
+            pending: RefCell::default(),
             scanout: RefCell::default(),
             readback_pixels: RefCell::default(),
             profile: RefCell::new(
                 std::env::var_os("HYDROXL_PROFILE_SPICE").is_some().then(ReadbackProfile::default),
             ),
             logged_scanout: Cell::new(None),
+            logged_scanout_visible: Cell::new(None),
         });
         // All handles are acquired and released on this thread. Drop also handles
         // partial initialization, and unregisters callbacks before freeing client data.
@@ -830,115 +833,255 @@ unsafe extern "C" fn on_gl_draw(
     // GL draws own their publication/acknowledgment path; don't later overwrite
     // their pixels with a pending software snapshot.
     client.software.borrow_mut().damage.clear();
-    if std::env::var_os("HYDROXL_DEBUG_DISPLAY").is_some() {
+    let debug = std::env::var_os("HYDROXL_DEBUG_DISPLAY").is_some();
+    if debug {
         eprintln!("gl-draw {x},{y} {width}x{height}");
     }
-    let mut gpu_copied = false;
-    let result = (|| -> Result<()> {
-        let Some(scanout) = (unsafe { client.api.scanout(channel) }) else {
-            if std::env::var_os("HYDROXL_DEBUG_DISPLAY").is_some() {
-                eprintln!("gl-draw without a scanout");
-            }
-            return Ok(());
-        };
-        let described =
-            (scanout.width, scanout.height, scanout.format, scanout.modifier, scanout.planes);
-        let first = client.logged_scanout.get() != Some(described)
-            && std::env::var_os("HYDROXL_DEBUG_DISPLAY").is_some();
-        if first {
-            client.logged_scanout.set(Some(described));
-            eprintln!(
-                "SPICE GL scanout: {}x{} format {:?} modifier {:#x} planes {} stride {} top-down {} direct import {}",
-                scanout.width,
-                scanout.height,
-                String::from_utf8_lossy(&scanout.format.to_le_bytes()),
-                scanout.modifier,
-                scanout.planes,
-                scanout.strides[0],
-                scanout.rows_are_top_down(),
-                client.gpu.get(),
+    let Some(scanout) = (unsafe { client.api.scanout(channel) }) else {
+        if debug {
+            eprintln!("gl-draw without a scanout");
+        }
+        unsafe { (client.api.spice_display_channel_gl_draw_done)(channel) };
+        return;
+    };
+    let described =
+        (scanout.width, scanout.height, scanout.format, scanout.modifier, scanout.planes);
+    let first = debug && client.logged_scanout.get() != Some(described);
+    if first {
+        client.logged_scanout.set(Some(described));
+        eprintln!(
+            "SPICE GL scanout: {}x{} format {:?} modifier {:#x} planes {} stride {} offset {} top-down {} direct import {}",
+            scanout.width,
+            scanout.height,
+            String::from_utf8_lossy(&scanout.format.to_le_bytes()),
+            scanout.modifier,
+            scanout.planes,
+            scanout.strides[0],
+            scanout.offsets[0],
+            scanout.rows_are_top_down(),
+            client.gpu.get(),
+        );
+    }
+    let rect = [x, y, width, height];
+    if client.gpu.get() {
+        // Like UTM: return to GLib at once so input, cursor and audio keep flowing.
+        // The worker loop acknowledges once the producer's fence signals and the
+        // UI's GPU copy completes.
+        *client.pending.borrow_mut() = Some(PendingDraw {
+            channel,
+            scanout,
+            rect,
+            stage: Stage::Fence,
+            since: Instant::now(),
+        });
+        unsafe {
+            (client.api.g_unix_fd_add_full)(
+                0,
+                scanout.fds[0],
+                1, // G_IO_IN: the DMA-BUF's write fences have signaled.
+                wake_on_fd,
+                null_mut(),
+                None,
             );
         }
-        if client.gpu.get() {
-            gpu_copied = unsafe { submit_scanout(&client.frame, scanout) };
-            if !gpu_copied {
-                if first {
+        client.wake_after(DRAW_TIMEOUT);
+        client.advance_gpu_draw();
+        return;
+    }
+    client.read_back(channel, scanout, rect, false, first);
+}
+
+/// How long a GPU draw may wait on the producer's fence or the UI before it falls back.
+const DRAW_TIMEOUT: Duration = Duration::from_millis(100);
+
+struct PendingDraw {
+    channel: Object,
+    scanout: scanout::Scanout,
+    rect: [u32; 4],
+    stage: Stage,
+    since: Instant,
+}
+
+enum Stage {
+    /// The guest's GPU is still writing the buffer.
+    Fence,
+    /// Offered to the UI's next frame; the outcome reports the copy.
+    Copy(scanout::DrawOutcome),
+}
+
+unsafe extern "C" fn wake_on_fd(_: c_int, _: u32, _: Object) -> c_int {
+    0
+}
+
+impl Client {
+    fn wake_after(&self, delay: Duration) {
+        unsafe {
+            (self.api.g_timeout_add_full)(
+                0,
+                delay.as_millis() as u32 + 1,
+                wake_worker,
+                null_mut(),
+                None,
+            );
+        }
+    }
+
+    /// Moves a pending GPU draw forward without blocking the SPICE thread.
+    fn advance_gpu_draw(&self) {
+        let mut slot = self.pending.borrow_mut();
+        let Some(pending) = slot.as_mut() else {
+            return;
+        };
+        let expired = pending.since.elapsed() >= DRAW_TIMEOUT;
+        let outcome = match &pending.stage {
+            Stage::Fence => {
+                if !scanout::writes_finished(pending.scanout.fds[0]) && !expired {
+                    return;
+                }
+                let api = self.api;
+                let wake: Box<dyn Fn() + Send> = Box::new(move || unsafe {
+                    (api.g_idle_add_full)(0, wake_worker, null_mut(), None);
+                });
+                let [x, y, width, height] = pending.rect.map(|value| value as usize);
+                let damage = Damage::new(x, y, width, height);
+                match scanout::offer_scanout(&self.frame, pending.scanout, Some(damage), Some(wake))
+                {
+                    Some(reply) => {
+                        pending.stage = Stage::Copy(reply);
+                        pending.since = Instant::now();
+                        drop(slot);
+                        self.wake_after(DRAW_TIMEOUT);
+                        return;
+                    }
+                    // This layout cannot be copied on the GPU; stay on readback.
+                    None => Some(false),
+                }
+            }
+            Stage::Copy(outcome) => match outcome.try_take() {
+                Some(copied) => Some(copied),
+                None if expired => {
+                    // The UI is not drawing (hidden or minimized). Withdraw the offer and
+                    // read this frame back; once the UI owns the copy, wait for its reply.
+                    if scanout::withdraw_scanout(&self.frame) {
+                        None
+                    } else {
+                        return;
+                    }
+                }
+                None => return,
+            },
+        };
+        let Some(pending) = slot.take() else {
+            return;
+        };
+        drop(slot);
+        match outcome {
+            Some(true) => {
+                scanout::scanout_copied(&self.frame, pending.scanout);
+                if std::mem::take(&mut self.frame().preview_requested) {
+                    self.read_back(pending.channel, pending.scanout, pending.rect, true, false);
+                } else {
+                    unsafe { (self.api.spice_display_channel_gl_draw_done)(pending.channel) };
+                }
+            }
+            Some(false) => {
+                if std::env::var_os("HYDROXL_DEBUG_DISPLAY").is_some() {
                     eprintln!("SPICE GL: direct import declined; using EGL readback.");
                 }
-                client.gpu.set(false);
+                self.gpu.set(false);
+                self.read_back(pending.channel, pending.scanout, pending.rect, false, false);
             }
+            None => self.read_back(pending.channel, pending.scanout, pending.rect, false, false),
         }
-        if gpu_copied && !std::mem::take(&mut client.frame().preview_requested) {
-            return Ok(());
-        }
-        let renderer = scanout::renderer()?;
-        let mut cache = client.scanout.borrow_mut();
-        let new_scanout = cache.as_ref().is_none_or(|(previous, _)| *previous != scanout);
-        if new_scanout {
-            *cache = Some((scanout, renderer.import(scanout)?));
-        }
-        let Some((_, imported)) = cache.as_ref() else {
-            return Ok(());
-        };
-        let (w, h) = (imported.width, imported.height);
-        let resized = {
-            let frame = client.frame();
-            frame.pixels.is_empty() || (frame.width as usize, frame.height as usize) != (w, h)
-        };
-        let (x, y) = (x as usize, y as usize);
-        let (width, height) = (width as usize, height as usize);
-        let fits = x < w && y < h && width > 0 && height > 0;
-        let rect = if gpu_copied || new_scanout || resized || !fits {
-            Damage::new(0, 0, w, h)
-        } else {
-            Damage::new(x, y, width.min(w - x), height.min(h - y))
-        };
-        let mut pixels = client.readback_pixels.borrow_mut();
-        let mut profile = client.profile.borrow_mut();
-        let started = profile.as_ref().map(|_| Instant::now());
-        // QEMU announces a new buffer as soon as it exists; its first frame may still be
-        // drawing on the GPU. Wait for those writes, and re-read a fresh buffer that is
-        // still entirely black, so a resolution change never leaves a black screen behind.
-        scanout::wait_for_writes(scanout.fds[0], 100);
-        imported.read(rect, &mut pixels)?;
+    }
 
-        if first {
-            let lit = pixels.chunks_exact(4).filter(|p| p[0] | p[1] | p[2] != 0).count();
-            eprintln!("SPICE GL readback: {} of {} pixels non-black", lit, pixels.len() / 4);
-        }
-        if let Some((profile, started)) = profile.as_mut().zip(started) {
-            profile.record(started.elapsed(), rect);
-        }
-
-        let mut frame = client.frame();
-        if gpu_copied {
-            frame.thumbnail = super::thumbnail::sample(w as u32, h as u32, &pixels);
-            return Ok(());
-        }
-        if resized {
-            frame.width = w as u32;
-            frame.height = h as u32;
-            frame.discard_damage();
-        }
-        if rect.x == 0 && rect.y == 0 && rect.width as usize == w && rect.height as usize == h {
-            std::mem::swap(&mut frame.pixels, &mut *pixels);
-        } else {
-            let stride = rect.width as usize * 4;
-            for (offset, row) in pixels.chunks_exact(stride).enumerate() {
-                let start = ((rect.y as usize + offset) * w + rect.x as usize) * 4;
-                frame.pixels[start..start + stride].copy_from_slice(row);
+    /// Reads the scanout through EGL, publishes it (or only a thumbnail when the GPU
+    /// already copied it), then acknowledges the draw.
+    fn read_back(
+        &self,
+        channel: Object,
+        scanout: scanout::Scanout,
+        [x, y, width, height]: [u32; 4],
+        gpu_copied: bool,
+        first: bool,
+    ) {
+        let debug = first || std::env::var_os("HYDROXL_DEBUG_DISPLAY").is_some();
+        let result = (|| -> Result<()> {
+            let renderer = scanout::renderer()?;
+            let mut cache = self.scanout.borrow_mut();
+            let new_scanout = cache.as_ref().is_none_or(|(previous, _)| *previous != scanout);
+            if new_scanout {
+                *cache = Some((scanout, renderer.import(scanout)?));
             }
+            let Some((_, imported)) = cache.as_ref() else {
+                return Ok(());
+            };
+            let (w, h) = (imported.width, imported.height);
+            let resized = {
+                let frame = self.frame();
+                frame.pixels.is_empty() || (frame.width as usize, frame.height as usize) != (w, h)
+            };
+            let (x, y) = (x as usize, y as usize);
+            let (width, height) = (width as usize, height as usize);
+            let fits = x < w && y < h && width > 0 && height > 0;
+            let rect = if gpu_copied || new_scanout || resized || !fits {
+                Damage::new(0, 0, w, h)
+            } else {
+                Damage::new(x, y, width.min(w - x), height.min(h - y))
+            };
+            let mut pixels = self.readback_pixels.borrow_mut();
+            let mut profile = self.profile.borrow_mut();
+            let started = profile.as_ref().map(|_| Instant::now());
+            // QEMU can announce the buffer before the producer finishes drawing.
+            scanout::wait_for_writes(scanout.fds[0], 100);
+            imported.read(rect, &mut pixels)?;
+
+            let full_frame =
+                rect.x == 0 && rect.y == 0 && rect.width as usize == w && rect.height as usize == h;
+            if debug && full_frame {
+                let lit = pixels.chunks_exact(4).filter(|p| p[0] | p[1] | p[2] != 0).count();
+                if self.logged_scanout_visible.replace(Some(lit > 0)) != Some(lit > 0) || first {
+                    eprintln!(
+                        "SPICE GL readback: {} of {} pixels non-black",
+                        lit,
+                        pixels.len() / 4
+                    );
+                }
+            }
+            if let Some((profile, started)) = profile.as_mut().zip(started) {
+                profile.record(started.elapsed(), rect);
+            }
+
+            let mut frame = self.frame();
+            if gpu_copied {
+                frame.thumbnail = super::thumbnail::sample(w as u32, h as u32, &pixels);
+                return Ok(());
+            }
+            if resized {
+                frame.width = w as u32;
+                frame.height = h as u32;
+                frame.discard_damage();
+            }
+            if full_frame {
+                std::mem::swap(&mut frame.pixels, &mut *pixels);
+            } else {
+                let stride = rect.width as usize * 4;
+                for (offset, row) in pixels.chunks_exact(stride).enumerate() {
+                    let start = ((rect.y as usize + offset) * w + rect.x as usize) * 4;
+                    frame.pixels[start..start + stride].copy_from_slice(row);
+                }
+            }
+            frame.mark_damage(rect);
+            frame.generation += 1;
+            Ok(())
+        })();
+        // ReadPixels completes the copy before SPICE lets QEMU reuse the producer buffer.
+        unsafe { (self.api.spice_display_channel_gl_draw_done)(channel) };
+        if let Err(error) = result
+            && !gpu_copied
+        {
+            self.disconnect(&format!("Could not draw the SPICE GPU buffer. {error:#}"));
         }
-        frame.mark_damage(rect);
-        frame.generation += 1;
-        Ok(())
-    })();
-    // ReadPixels completes the copy before SPICE lets QEMU reuse the producer buffer.
-    unsafe { (client.api.spice_display_channel_gl_draw_done)(channel) };
-    if let Err(error) = result
-        && !gpu_copied
-    {
-        client.disconnect(&format!("Could not draw the SPICE GPU buffer. {error:#}"));
     }
 }
 
@@ -946,6 +1089,10 @@ unsafe extern "C" fn on_channel_destroy(_: Object, channel: Object, data: Object
     let client = unsafe { &*data.cast::<Client>() };
     if client.display.get() == channel {
         client.software.borrow_mut().destroy();
+    }
+    if client.pending.borrow().as_ref().is_some_and(|pending| pending.channel == channel) {
+        client.pending.take();
+        scanout::withdraw_scanout(&client.frame);
     }
     for current in [&client.main, &client.display, &client.inputs] {
         if current.get() == channel {

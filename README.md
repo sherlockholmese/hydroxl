@@ -9,8 +9,12 @@ is pending.** See [the feature matrix](docs/feature-parity.md).
 ## Run
 
 ```sh
-cargo run --release
+cargo run
 ```
+
+Both `cargo run` and `cargo build --release` build the private Neptune QEMU
+runtime. See [Neptune build and Windows guest setup](docs/neptune.md) for build
+dependencies, the bundled driver disc, and enabling DirectX.
 
 Isolated UI preview:
 
@@ -62,12 +66,33 @@ connection with `virsh -c qemu:///session list --all`. See the
 host configuration. Install a file-picker portal backend for your desktop,
 such as `xdg-desktop-portal-gtk`, if one is missing.
 
+## Debian and Fedora packages
+
+Each release attaches Arch (`.pkg.tar.zst`), Debian (`.deb`) and Fedora (`.rpm`)
+packages for x86-64. The `.deb` targets Debian 13 and the `.rpm` the current
+Fedora release, because the bundled Neptune QEMU links against each one's
+system libraries.
+
+To build one yourself on that distribution, install the build dependencies listed
+in [the release workflow](.github/workflows/release.yml), Rust, and
+[nfpm](https://nfpm.goreleaser.com), then run:
+
+```sh
+packaging/build-release.sh target/stage
+VERSION=0.1.0 STAGE="$PWD/target/stage" nfpm package --config packaging/nfpm.yaml --packager deb
+```
+
+Use `--packager rpm` for Fedora. Pushing a `v*` tag that matches the version in
+`Cargo.toml` and `packaging/arch/PKGBUILD` builds all three and publishes them on
+the release.
+
 ## Requirements
 
 - A current stable Rust toolchain and the Linux development libraries required
   by [GPUI Kit](https://gpui-kit.com/docs/installation/).
 - Working Vulkan graphics, X11 or Wayland, and fonts.
-- QEMU system emulators and `qemu-img`.
+- The bundled Neptune QEMU and `qemu-img` built by Cargo or supplied by the Arch
+  package. System QEMU packages let libvirt discover supported guest architectures.
 - libvirt's QEMU driver, a working user session or system connection, and `virsh`.
 - `virt-install` for machine creation and OVA/OVF import.
 - `virt-clone` for full clones.
@@ -80,8 +105,8 @@ such as `xdg-desktop-portal-gtk`, if one is missing.
 - `passt` for shared-network port forwarding.
 - `curl` for the explicit Windows guest-tools download action.
 - A working desktop file-picker portal for native file and folder selection.
-- UEFI firmware when selecting UEFI. Windows 11 also needs host TPM emulation
-  support. Install `swtpm` and `libtpms` with TPM 2.0 support. Hydroxl checks
+- UEFI firmware when selecting UEFI. The Arch package requires `swtpm` and
+  `libtpms` for TPM 2.0 emulation. Hydroxl checks
   libvirt’s advertised capabilities before creating a disk. For an x86-64 KVM
   guest, check the `<tpm>` section with:
 

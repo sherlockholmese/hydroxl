@@ -58,6 +58,13 @@ bindings! {
         g_idle_add_full: unsafe extern "C" fn(
             c_int, unsafe extern "C" fn(Object) -> c_int, Object, Option<unsafe extern "C" fn(Object)>
         ) -> u32,
+        g_timeout_add_full: unsafe extern "C" fn(
+            c_int, u32, unsafe extern "C" fn(Object) -> c_int, Object, Option<unsafe extern "C" fn(Object)>
+        ) -> u32,
+        g_unix_fd_add_full: unsafe extern "C" fn(
+            c_int, c_int, u32, unsafe extern "C" fn(c_int, u32, Object) -> c_int, Object,
+            Option<unsafe extern "C" fn(Object)>
+        ) -> u32,
         g_signal_connect_data: unsafe extern "C" fn(
             Object, *const c_char, *const c_void, Object, Option<unsafe extern "C" fn(Object, Object)>, u32
         ) -> c_ulong,

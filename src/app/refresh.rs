@@ -50,7 +50,7 @@ impl Workspace {
         let selected = self.selected.clone();
         let cached_machines = matches!(job, Job::ConvertDisk { .. }).then(|| self.machines.clone());
         let previous_ids: Vec<_> = self.machines.iter().map(|m| m.id.clone()).collect();
-        let importing = matches!(&job, Job::Import(_) | Job::Appliance(_));
+        let importing = matches!(&job, Job::Import(..) | Job::Appliance(_));
         let need_architectures = self.architectures.is_empty() && !self.demo;
         let (tx, rx) = mpsc::channel();
         if !refresh {
@@ -84,7 +84,7 @@ impl Workspace {
                 Job::Network(net) => backend::network::create(c, &net),
                 Job::Action(m, action) => backend::action(c, &m.id, action, !m.spice_viewer),
                 Job::Create(spec) => backend::create(c, &spec),
-                Job::Import(path) => backend::import(c, &path),
+                Job::Import(path, qemu_build) => backend::import(c, &path, qemu_build),
                 Job::ConvertDisk {
                     source,
                     destination,

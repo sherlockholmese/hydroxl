@@ -9,8 +9,12 @@ pub(crate) fn emulator_model(
     arch: &str,
     virt_type: &str,
     machine: Option<&str>,
+    emulator: Option<&str>,
 ) -> Result<String> {
     let mut args = vec!["domcapabilities", "--arch", arch, "--virttype", virt_type];
+    if let Some(emulator) = emulator {
+        args.extend(["--emulatorbin", emulator]);
+    }
     if let Some(machine) = machine.filter(|s| !s.is_empty()) {
         args.extend(["--machine", machine]);
     }

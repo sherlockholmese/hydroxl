@@ -37,6 +37,8 @@ struct WgpuAtlasTextures {
     storage: WgpuAtlasStorage,
     pending_uploads: Vec<PendingUpload>,
     next_texture_generation: u64,
+    #[cfg(target_os = "linux")]
+    dma_buf: crate::dma_buf::DmaBufState,
 }
 
 pub struct WgpuTextureInfo {
@@ -53,13 +55,15 @@ impl WgpuAtlas {
     ) -> Self {
         let max_texture_size = device.limits().max_texture_dimension_2d;
         WgpuAtlas(Mutex::new(AtlasState::new(WgpuAtlasTextures {
-            device,
             queue,
             max_texture_size,
             color_texture_format,
             storage: WgpuAtlasStorage::default(),
             pending_uploads: Vec::new(),
             next_texture_generation: 0,
+            #[cfg(target_os = "linux")]
+            dma_buf: crate::dma_buf::DmaBufState::new(device.clone()),
+            device,
         })))
     }
 
@@ -103,6 +107,10 @@ impl WgpuAtlas {
     pub fn handle_device_lost(&self, context: &WgpuContext) {
         self.0.lock().clear(|textures| {
             textures.device = context.device.clone();
+            #[cfg(target_os = "linux")]
+            {
+                textures.dma_buf = crate::dma_buf::DmaBufState::new(context.device.clone());
+            }
             textures.queue = context.queue.clone();
             textures.color_texture_format = context.color_texture_format();
             textures.storage = WgpuAtlasStorage::default();
@@ -144,16 +152,18 @@ impl PlatformAtlas for WgpuAtlas {
                 .context("Could not allocate a scanout tile")
         })?;
         anyhow::ensure!(tile.bounds.size == extent, "DMA-BUF extent changed");
-        let backend = &atlas.backend;
+        let backend = &mut atlas.backend;
         let texture = backend
             .storage
             .get(tile.texture_id)
-            .context("Missing scanout tile")?;
+            .context("Missing scanout tile")?
+            .texture
+            .clone();
         let result = unsafe {
             crate::dma_buf::copy(
-                &backend.device,
+                &mut backend.dma_buf,
                 &backend.queue,
-                &texture.texture,
+                &texture,
                 tile,
                 frame,
                 initialize,

@@ -13,6 +13,7 @@ pub struct ImportSpec {
     pub location: PathBuf,
     pub name: String,
     pub architecture: String,
+    pub qemu_build: crate::backend::QemuBuild,
     pub execution: String,
     pub firmware: String,
 }

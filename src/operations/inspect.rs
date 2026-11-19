@@ -185,7 +185,13 @@ pub fn details(c: Connection, id: &str) -> Result<Details> {
     } else {
         None
     };
+    let neptune_ready = backend::qemu::domain_arch(doc.root_element())
+        .filter(|arch| backend::triton_arch(arch))
+        .is_some_and(|arch| {
+            backend::gpu_features(arch, backend::qemu::domain_emulator(doc.root_element())).neptune
+        });
     Ok(Details {
+        neptune_ready,
         snapshots,
         devices,
         xml,

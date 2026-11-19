@@ -11,7 +11,10 @@ mod workflows;
 use app::{Preferences, Workspace};
 use gpui_kit::*;
 use std::path::PathBuf;
-gpui_kit::actions!(hydroxl, [NewMachineAction, RefreshAction, PreferencesAction, QuitAction]);
+gpui_kit::actions!(
+    hydroxl,
+    [NewMachineAction, RefreshAction, PreferencesAction, AboutAction, QuitAction]
+);
 
 fn main() {
     let args: Vec<_> = std::env::args_os().skip(1).collect();

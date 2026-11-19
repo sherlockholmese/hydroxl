@@ -10,6 +10,8 @@ use wayland_protocols::wp::{
 #[derive(Default)]
 struct WaylandCapture {
     hidden: bool,
+    /// Shown instead of nothing while hidden, so the compositor moves the guest's cursor.
+    image: Option<gpui::CursorImage>,
     locked: bool,
     lock: Option<zwp_locked_pointer_v1::ZwpLockedPointerV1>,
     relative: Option<zwp_relative_pointer_v1::ZwpRelativePointerV1>,
@@ -33,7 +35,103 @@ impl WaylandCapture {
         }
     }
 }
+/// The surface that shows a guest cursor image as the pointer's cursor.
+struct GuestCursorSurface {
+    surface: wl_surface::WlSurface,
+    buffer: Option<wl_buffer::WlBuffer>,
+    /// What the buffer holds: image identity and scales, so it is redrawn only on change.
+    drawn: Option<(usize, usize, u32, i32)>,
+    hot: (i32, i32),
+}
+
+impl Drop for GuestCursorSurface {
+    fn drop(&mut self) {
+        if let Some(buffer) = self.buffer.take() {
+            buffer.destroy();
+        }
+        self.surface.destroy();
+    }
+}
+
 impl WaylandClientState {
+    /// Applies a capture's hidden cursor: its guest image when one is set, else none.
+    fn hide_captured_cursor(&mut self, serial: u32) {
+        let Some(pointer) = self.wl_pointer.clone() else {
+            return;
+        };
+        let focused = self.mouse_focused_window.clone();
+        let image = focused
+            .as_ref()
+            .and_then(|window| self.captures.get(&window.surface_id()))
+            .and_then(|capture| capture.image.clone());
+        let shown = match (image, focused) {
+            (Some(image), Some(window)) => {
+                self.draw_guest_cursor(&image, window.primary_output_scale())
+            }
+            _ => None,
+        };
+        match shown {
+            Some((surface, hot_x, hot_y)) => pointer.set_cursor(serial, Some(&surface), hot_x, hot_y),
+            None => pointer.set_cursor(serial, None, 0, 0),
+        }
+    }
+
+    fn draw_guest_cursor(
+        &mut self,
+        image: &gpui::CursorImage,
+        scale: i32,
+    ) -> Option<(wl_surface::WlSurface, i32, i32)> {
+        use std::io::Write as _;
+        use std::os::fd::{AsFd as _, FromRawFd as _, OwnedFd};
+        let scale = scale.max(1);
+        let key = (image.bgra.as_ptr() as usize, image.bgra.len(), image.scale.to_bits(), scale);
+        let globals = &self.globals;
+        let cursor = self.guest_cursor.get_or_insert_with(|| GuestCursorSurface {
+            surface: globals.compositor.create_surface(&globals.qh, ()),
+            buffer: None,
+            drawn: None,
+            hot: (0, 0),
+        });
+        if cursor.drawn != Some(key) {
+            let scaled = crate::linux::cursor_image::scale_cursor(image, scale as f32)?;
+            // A buffer scale needs dimensions divisible by it; pad with transparency.
+            let pad = |value: u32| value.div_ceil(scale as u32) * scale as u32;
+            let (width, height) = (pad(scaled.width), pad(scaled.height));
+            let mut pixels = vec![0u8; (width * height * 4) as usize];
+            for (row, source) in scaled.bgra.chunks_exact(scaled.width as usize * 4).enumerate() {
+                let start = row * width as usize * 4;
+                pixels[start..start + source.len()].copy_from_slice(source);
+            }
+            let fd = unsafe { libc::memfd_create(c"gpui-guest-cursor".as_ptr(), libc::MFD_CLOEXEC) };
+            if fd < 0 {
+                return None;
+            }
+            let mut file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+            file.write_all(&pixels).ok()?;
+            let pool = globals.shm.create_pool(file.as_fd(), pixels.len() as i32, &globals.qh, ());
+            let buffer = pool.create_buffer(
+                0,
+                width as i32,
+                height as i32,
+                width as i32 * 4,
+                wl_shm::Format::Argb8888,
+                &globals.qh,
+                (),
+            );
+            pool.destroy();
+            cursor.surface.set_buffer_scale(scale);
+            cursor.surface.attach(Some(&buffer), 0, 0);
+            cursor.surface.damage(0, 0, i32::MAX, i32::MAX);
+            cursor.surface.commit();
+            if let Some(previous) = cursor.buffer.replace(buffer) {
+                previous.destroy();
+            }
+            cursor.hot = (scaled.hot_x as i32 / scale, scaled.hot_y as i32 / scale);
+            cursor.drawn = Some(key);
+        }
+        Some((cursor.surface.clone(), cursor.hot.0, cursor.hot.1))
+    }
+
     fn restore_captured_cursor(&mut self, surface: &ObjectId) {
         if self.mouse_focused_window.as_ref().is_some_and(|window| window.surface_id() == *surface)
         {
@@ -81,21 +179,37 @@ impl WaylandClientStatePtr {
                 state.mouse_focused_window.as_ref().is_some_and(|w| w.surface_id() == surface.id()),
                 "pointer is outside this window"
             );
-            let pointer = state.wl_pointer.as_ref().context("seat has no pointer")?;
-            pointer.set_cursor(
-                state.serial_tracker.get(SerialKind::MouseEnter).as_raw(),
-                None,
-                0,
-                0,
-            );
+            state.wl_pointer.as_ref().context("seat has no pointer")?;
             state.cursor_style.get_or_insert(CursorStyle::Arrow);
             let focused = state.mouse_focused_window.clone();
             state.cursor_hidden_window = focused;
             state.captures.entry(surface.id()).or_default().hidden = true;
+            let serial = state.serial_tracker.get(SerialKind::MouseEnter).as_raw();
+            state.hide_captured_cursor(serial);
         } else if let Some(capture) = state.captures.get_mut(&surface.id())
             && std::mem::take(&mut capture.hidden)
         {
             state.restore_captured_cursor(&surface.id());
+        }
+        Ok(())
+    }
+    pub(super) fn capture_cursor_image(
+        &self,
+        surface: &wl_surface::WlSurface,
+        image: Option<gpui::CursorImage>,
+    ) -> anyhow::Result<()> {
+        let client = self.get_client();
+        let mut state = client.borrow_mut();
+        let capture = state.captures.entry(surface.id()).or_default();
+        capture.image = image;
+        let hidden = capture.hidden;
+        let focused = state
+            .mouse_focused_window
+            .as_ref()
+            .is_some_and(|window| window.surface_id() == surface.id());
+        if hidden && focused {
+            let serial = state.serial_tracker.get(SerialKind::MouseEnter).as_raw();
+            state.hide_captured_cursor(serial);
         }
         Ok(())
     }

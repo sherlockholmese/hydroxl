@@ -1397,6 +1397,15 @@ impl PlatformWindow for X11Window {
             .ok_or_else(|| anyhow!("X11 connection closed"))?
             .capture_cursor(self.0.x_window, hidden)
     }
+    fn set_cursor_image(&mut self, image: Option<gpui::CursorImage>) -> anyhow::Result<()> {
+        self.0
+            .state
+            .borrow()
+            .client
+            .get_client()
+            .ok_or_else(|| anyhow!("X11 connection closed"))?
+            .capture_cursor_image(self.0.x_window, image)
+    }
     fn lock_pointer(&mut self, lock: bool) -> anyhow::Result<()> {
         self.0
             .state

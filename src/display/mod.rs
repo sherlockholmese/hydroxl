@@ -7,7 +7,7 @@ pub mod geometry;
 mod graphics_fd;
 pub mod input;
 mod keys;
-mod scanout;
+pub(crate) mod scanout;
 pub(crate) mod session;
 mod spice;
 #[cfg(test)]

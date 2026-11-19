@@ -11,7 +11,7 @@ pub enum Job {
     Refresh,
     Action(Machine, Action),
     Create(backend::NewMachine),
-    Import(PathBuf),
+    Import(PathBuf, backend::QemuBuild),
     ConvertDisk {
         source: PathBuf,
         destination: PathBuf,
@@ -40,14 +40,14 @@ impl Job {
                 },
             ) => format!("Network {name} created"),
             Self::Create(spec) => format!("{} created", spec.name.trim()),
-            Self::Import(path)
+            Self::Import(path, _)
             | Self::ConvertDisk {
                 destination: path,
                 ..
             } => {
                 let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
                 match self {
-                    Self::Import(_) => format!("Imported {}", name.unwrap_or_default()),
+                    Self::Import(..) => format!("Imported {}", name.unwrap_or_default()),
                     _ => format!("Converted disk saved as {}", name.unwrap_or_default()),
                 }
             }
@@ -69,7 +69,7 @@ impl Job {
             Self::Icon(..) => "Saving icon",
             Self::Network(_) => "Creating network",
             Self::Create(_) => "Creating machine",
-            Self::Import(_) => "Importing machine",
+            Self::Import(..) => "Importing machine",
             Self::ConvertDisk {
                 ..
             } => "Converting disk",

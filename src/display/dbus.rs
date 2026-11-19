@@ -3,7 +3,7 @@ use super::{
     damage::Damage,
     graphics_fd::GraphicsFd,
     keys::scancode,
-    scanout::{self, submit_scanout},
+    scanout,
     spice::Input,
     thumbnail,
     vnc::{Cursor, Framebuffer, MAX_DESKTOP_SIZE},
@@ -342,17 +342,32 @@ impl Listener {
     }
 
     #[zbus(name = "UpdateDMABUF")]
-    fn update_dmabuf(&mut self, _x: i32, _y: i32, _width: i32, _height: i32) -> fdo::Result<()> {
-        let scanout = self.scanout.lock().unwrap_or_else(|error| error.into_inner());
-        let Some(buffer) = scanout.as_ref() else {
-            return Ok(());
+    async fn update_dmabuf(&mut self, x: i32, y: i32, width: i32, height: i32) -> fdo::Result<()> {
+        // Copy what the draw needs; the buffer stays installed while this call is
+        // pending because the listener handles one message at a time.
+        let (surface, crop) = {
+            let scanout = self.scanout.lock().unwrap_or_else(|error| error.into_inner());
+            let Some(buffer) = scanout.as_ref() else {
+                return Ok(());
+            };
+            (buffer.surface, buffer.crop)
         };
-        let surface = buffer.surface;
-        let crop = buffer.crop;
         let full = crop == Damage::new(0, 0, surface.width as usize, surface.height as usize);
-        // Returning from this method acknowledges the draw. Keep the producer's
-        // memory reserved until GPUI completes its GPU copy or EGL readback.
-        let gpu = self.gpu && full && unsafe { submit_scanout(&self.frame, surface) };
+        // Returning from this method acknowledges the draw. Await the UI's GPU copy
+        // instead of blocking the connection's thread, so replies to our input calls
+        // keep arriving while a frame is in flight.
+        let mut gpu = false;
+        if self.gpu && full {
+            let [x, y, width, height] = [x, y, width, height].map(|value| value.max(0) as usize);
+            let damage = Damage::new(x, y, width, height);
+            if let Some(outcome) = scanout::offer_scanout(&self.frame, surface, Some(damage), None)
+            {
+                gpu = outcome.await;
+            }
+            if gpu {
+                scanout::scanout_copied(&self.frame, surface);
+            }
+        }
         if full && !gpu {
             self.gpu = false;
         }

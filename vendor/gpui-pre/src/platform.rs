@@ -1252,6 +1252,14 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
             Ok(())
         }
     }
+    /// Shows an image in place of the hidden cursor. Unsupported platforms return an error.
+    fn set_cursor_image(&mut self, image: Option<crate::CursorImage>) -> Result<()> {
+        if image.is_some() {
+            anyhow::bail!("cursor images are unsupported")
+        } else {
+            Ok(())
+        }
+    }
     /// Requests pointer lock. Wayland may activate it asynchronously.
     fn lock_pointer(&mut self, lock: bool) -> Result<()> {
         if lock {
