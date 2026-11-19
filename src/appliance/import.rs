@@ -151,9 +151,12 @@ pub fn import(
             "--noautoconsole",
             "--print-xml=1",
         ];
+        let emulator = spec.qemu_build.emulator(&architecture)?;
+        let mut boot = backend::qemu::installer_boot(&emulator)?;
         if spec.firmware == "uefi" || (spec.firmware == "auto" && definition.uefi) {
-            args.extend(["--boot", "uefi"]);
+            boot.push_str(",uefi");
         }
+        args.extend(["--boot", &boot]);
         if architecture == "aarch64" {
             args.extend(["--controller", "scsi,model=virtio-scsi"]);
         }
@@ -172,7 +175,8 @@ pub fn import(
             }
         }
         progress.update("Registering machine", None);
-        let mut xml = backend::run("virt-install", &args)?;
+        let xml = backend::run("virt-install", &args)?;
+        let mut xml = spec.qemu_build.configure_xml(&xml)?.unwrap_or(xml);
         let insert =
             xml.rfind("</devices>").context("Could not generate the machine configuration.")?;
         xml.insert_str(insert, &disks);

@@ -16,7 +16,6 @@ pub(super) struct WindowTexture {
 
 /// The layout of a producer-owned, single-plane RGB DMA-BUF scanout.
 #[cfg(target_os = "linux")]
-#[derive(Debug)]
 pub struct DmaBufFrame {
     /// A duplicate of the scanout plane's file descriptor.
     pub fd: std::os::fd::OwnedFd,
@@ -32,6 +31,31 @@ pub struct DmaBufFrame {
     pub stride: u32,
     /// Whether row zero is at the top of the image.
     pub top_down: bool,
+    /// The region that changed since the previous frame, in top-down pixels. `None`
+    /// copies the whole frame. A new texture is always copied whole.
+    pub damage: Option<Bounds<DevicePixels>>,
+    /// Called once the GPU copy has completed, from another thread. When set,
+    /// `Window::copy_dma_buf` returns as soon as the copy is queued; the producer may
+    /// reuse its buffer only after this runs. Dropped without being called when the
+    /// copy is not queued.
+    pub on_complete: Option<Box<dyn FnOnce(bool) + Send>>,
+}
+
+#[cfg(target_os = "linux")]
+impl std::fmt::Debug for DmaBufFrame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DmaBufFrame")
+            .field("fd", &self.fd)
+            .field("extent", &self.extent)
+            .field("fourcc", &self.fourcc)
+            .field("modifier", &self.modifier)
+            .field("offset", &self.offset)
+            .field("stride", &self.stride)
+            .field("top_down", &self.top_down)
+            .field("damage", &self.damage)
+            .field("on_complete", &self.on_complete.is_some())
+            .finish()
+    }
 }
 
 impl TextureId {
@@ -51,12 +75,14 @@ impl Window {
         self.sprite_atlas.supports_dma_buf()
     }
 
-    /// Copies a scanout to a texture. Returns after the producer can reuse its buffer.
+    /// Copies a scanout to a texture. Without `on_complete`, returns after the producer
+    /// can reuse its buffer; with it, returns once the copy is queued.
     ///
     /// # Safety
     /// The descriptor must exactly match a valid DMA-BUF in a foreign producer's
     /// GENERAL layout with write fences registered on its reservation object.
-    /// The producer must not start a new write until this call returns.
+    /// The producer must not start a new write until this call returns, or until
+    /// `on_complete` runs when it is set.
     #[cfg(target_os = "linux")]
     pub unsafe fn copy_dma_buf(
         &mut self,

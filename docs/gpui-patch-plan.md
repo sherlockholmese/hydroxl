@@ -17,7 +17,11 @@ In fullscreen, the toolbar overlays the frame and appears at the top edge.
 The pin keeps it visible. F11 toggles fullscreen while input is released.
 
 `Window::set_cursor_hidden` hides the host cursor through a null Wayland cursor
-or XFixes. `Window::lock_pointer` requests capture for guests that report
+or XFixes. `Window::set_cursor_image` shows the guest's cursor shape as the host
+cursor instead: a Wayland cursor surface backed by shm, or an XRender ARGB cursor.
+The compositor moves it with the pointer, so it never trails the way the
+in-window overlay does. The viewer uses it whenever input is captured and the
+pointer is not locked; a locked (relative) pointer keeps the overlay. `Window::lock_pointer` requests capture for guests that report
 relative input. Wayland uses pointer constraints and relative-pointer events.
 X11 confines the pointer with a grab and reads raw XInput2 motion. The app takes
 the accumulated delta through `Window::take_raw_mouse_motion`. Absolute tablet
@@ -72,13 +76,26 @@ readback time and MiB per frame every 120 frames. These timings cover readback
 and color conversion. Test GUI smoothness and frame time separately.
 
 Phase 3 adds peer-to-peer QEMU Display1 and a Vulkan DMA-BUF copy shared by
-SPICE GL and D-Bus. The renderer waits for the producer's DMA-BUF write fence,
-acquires the image from the foreign queue family, and copies it into its own
-atlas texture. It returns ownership and waits for the submission before
-acknowledging the producer. The guest surface stays on the GPU for normal
-display updates. An occasional overview preview can still use EGL readback.
+SPICE GL and D-Bus, modelled on UTM's CocoaSpice:
 
-Enable the experimental Vulkan path with `HYDROXL_VULKAN_SCANOUT=1`.
+- **Copy on arrival.** A GLib fd watch reports the producer's write fence, the
+  scanout is offered, and the UI thread is woken at once to queue the copy. It
+  does not wait for the next vsync. The frame loop only presents the latest copy.
+- **Acknowledge on completion.** A per-device waiter thread waits for the copy's
+  submission and then acknowledges the producer, as UTM acknowledges from Metal's
+  completion handler. Neither the UI thread nor the SPICE thread blocks, so input,
+  cursor and audio keep flowing while a frame is in flight. D-Bus `UpdateDMABUF`
+  awaits the same completion instead of blocking the connection.
+- **Damage only.** The changed rectangle is copied into the atlas tile; a new tile
+  or a frame missed while hidden is copied whole.
+- **Imports cached.** Up to four producer buffers stay imported as Vulkan images,
+  keyed by DMA-BUF inode and layout, so a frame costs one copy and no import.
+
+The renderer acquires the image from the foreign queue family and returns it after
+the copy. A draw the UI does not take within 100 ms is read back instead. An
+occasional overview preview can still use EGL readback.
+
+The Vulkan path is on by default; `HYDROXL_VULKAN_SCANOUT=0` forces EGL readback.
 It requires a compatible Vulkan device, foreign queue ownership support, and
 a single-plane RGB scanout with a supported modifier. Other scanouts use EGL
 readback. For an existing local D-Bus domain, Hydroxl attaches when the libvirt

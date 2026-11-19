@@ -3,6 +3,7 @@ use anyhow::{Context, Result, ensure};
 use ash::vk;
 use gpui::{AtlasTile, DmaBufFrame};
 use std::os::fd::{AsRawFd, BorrowedFd};
+use std::sync::{Arc, mpsc};
 use wgpu::hal::{api::Vulkan, vulkan};
 
 const FOREIGN: &std::ffi::CStr = c"VK_EXT_queue_family_foreign";
@@ -12,7 +13,8 @@ pub(super) fn try_device(
     adapter: &wgpu::Adapter,
     mut descriptor: wgpu::DeviceDescriptor<'_>,
 ) -> Option<(wgpu::Device, wgpu::Queue)> {
-    if std::env::var("HYDROXL_VULKAN_SCANOUT").as_deref() != Ok("1")
+    // On by default; HYDROXL_VULKAN_SCANOUT=0 forces the EGL readback path.
+    if std::env::var("HYDROXL_VULKAN_SCANOUT").as_deref() == Ok("0")
         || !adapter.features().contains(DMA_BUF)
     {
         return None;
@@ -60,30 +62,159 @@ pub(super) fn supported(device: &wgpu::Device) -> bool {
             .is_some_and(|native| native.enabled_device_extensions().contains(&FOREIGN))
 }
 
-struct Source<'a> {
-    device: &'a wgpu::Device,
-    image: Option<vulkan::Texture>,
+/// Imported scanouts kept across frames. QEMU cycles through a few buffers, so
+/// importing each once saves a Vulkan image and memory import per frame, as UTM
+/// keeps its IOSurface texture.
+const CACHED_IMPORTS: usize = 4;
+
+/// Per-device DMA-BUF state: the import cache and the thread that waits for copies.
+pub(super) struct DmaBufState {
+    device: Arc<wgpu::Device>,
+    cache: Vec<Cached>,
+    waiter: Option<mpsc::Sender<Job>>,
 }
 
-impl Drop for Source<'_> {
-    fn drop(&mut self) {
-        use wgpu::hal::Device as _;
-        if let (Some(native), Some(image)) =
-            (unsafe { self.device.as_hal::<Vulkan>() }, self.image.take())
-        {
-            unsafe { native.destroy_texture(image) };
+struct Cached {
+    key: ImportKey,
+    image: Option<vulkan::Texture>,
+    last_use: Option<wgpu::SubmissionIndex>,
+}
+
+/// Identifies one producer buffer: the DMA-BUF's inode plus its layout.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ImportKey {
+    device: u64,
+    inode: u64,
+    fourcc: u32,
+    modifier: u64,
+    offset: u32,
+    stride: u32,
+    extent: (i32, i32),
+}
+
+/// Work for the waiter: once `submission` completes, free `release` and report.
+struct Job {
+    submission: wgpu::SubmissionIndex,
+    release: Option<vulkan::Texture>,
+    done: Option<Box<dyn FnOnce(bool) + Send>>,
+}
+
+impl DmaBufState {
+    pub(super) fn new(device: Arc<wgpu::Device>) -> Self {
+        Self {
+            device,
+            cache: Vec::new(),
+            waiter: None,
+        }
+    }
+
+    /// Hands a finished-later job to the waiter thread, starting it on first use.
+    /// Returns the job when no thread is available so the caller can wait inline.
+    fn defer(&mut self, job: Job) -> Option<Job> {
+        if self.waiter.is_none() {
+            let (sender, jobs) = mpsc::channel::<Job>();
+            let device = self.device.clone();
+            let spawned = std::thread::Builder::new()
+                .name("dma-buf copies".into())
+                .spawn(move || {
+                    for job in jobs {
+                        finish(&device, job);
+                    }
+                });
+            if spawned.is_ok() {
+                self.waiter = Some(sender);
+            }
+        }
+        match &self.waiter {
+            Some(waiter) => waiter.send(job).err().map(|error| error.0),
+            None => Some(job),
         }
     }
 }
 
+impl Drop for DmaBufState {
+    fn drop(&mut self) {
+        // The waiter drains its queue and exits once the sender is gone.
+        self.waiter.take();
+        for mut cached in self.cache.drain(..) {
+            if let Some(submission) = cached.last_use.take() {
+                let _ = self.device.poll(wgpu::PollType::Wait {
+                    submission_index: Some(submission),
+                    timeout: None,
+                });
+            }
+            if let Some(image) = cached.image.take() {
+                destroy(&self.device, image);
+            }
+        }
+    }
+}
+
+fn finish(device: &wgpu::Device, job: Job) {
+    let completed = device
+        .poll(wgpu::PollType::Wait {
+            submission_index: Some(job.submission),
+            timeout: None,
+        })
+        .is_ok();
+    if let Some(image) = job.release {
+        destroy(device, image);
+    }
+    if let Some(done) = job.done {
+        done(completed);
+    }
+}
+
+fn destroy(device: &wgpu::Device, image: vulkan::Texture) {
+    use wgpu::hal::Device as _;
+    if let Some(native) = unsafe { device.as_hal::<Vulkan>() } {
+        unsafe { native.destroy_texture(image) };
+    }
+}
+
+fn import_key(frame: &DmaBufFrame) -> Option<ImportKey> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(frame.fd.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    let stat = unsafe { stat.assume_init() };
+    Some(ImportKey {
+        device: stat.st_dev as u64,
+        inode: stat.st_ino as u64,
+        fourcc: frame.fourcc,
+        modifier: frame.modifier,
+        offset: frame.offset,
+        stride: frame.stride,
+        extent: (frame.extent.width.0, frame.extent.height.0),
+    })
+}
+
+/// The changed region in top-down source pixels, or the whole frame.
+fn copy_region(frame: &DmaBufFrame, whole: bool) -> [i32; 4] {
+    let (w, h) = (frame.extent.width.0, frame.extent.height.0);
+    let Some(damage) = frame.damage.filter(|_| !whole) else {
+        return [0, 0, w, h];
+    };
+    let x0 = damage.origin.x.0.clamp(0, w);
+    let y0 = damage.origin.y.0.clamp(0, h);
+    let x1 = (damage.origin.x.0.saturating_add(damage.size.width.0)).clamp(0, w);
+    let y1 = (damage.origin.y.0.saturating_add(damage.size.height.0)).clamp(0, h);
+    if x1 <= x0 || y1 <= y0 {
+        return [0, 0, w, h];
+    }
+    [x0, y0, x1 - x0, y1 - y0]
+}
+
 pub(super) unsafe fn copy(
-    device: &wgpu::Device,
+    state: &mut DmaBufState,
     queue: &wgpu::Queue,
     dest: &wgpu::Texture,
     tile: AtlasTile,
-    frame: DmaBufFrame,
+    mut frame: DmaBufFrame,
     initialize: bool,
 ) -> Result<()> {
+    let device = state.device.clone();
+    let device = device.as_ref();
     let width = u32::try_from(frame.extent.width.0)?;
     let height = u32::try_from(frame.extent.height.0)?;
     ensure!(width > 0 && height > 0 && frame.stride >= width * 4);
@@ -100,50 +231,92 @@ pub(super) unsafe fn copy(
         }
         _ => anyhow::bail!("Unsupported DMA-BUF pixel format"),
     };
-    let desc = wgpu::hal::TextureDescriptor {
-        label: Some("foreign scanout"),
-        size: wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format,
-        usage: wgpu::TextureUses::COPY_SRC,
-        memory_flags: wgpu::hal::MemoryFlags::empty(),
-        view_formats: Vec::new(),
-    };
     // The producer registers GPU writes on the DMA-BUF. POLLIN waits for writers
     // before the FOREIGN acquire, so a draw message alone never substitutes for a fence.
-    let fd = std::os::fd::AsFd::as_fd(&frame.fd);
-    wait_for_writer(fd)?;
+    wait_for_writer(std::os::fd::AsFd::as_fd(&frame.fd))?;
     let blit = !frame.top_down || format != dest.format();
-    let (raw, family, image) = unsafe {
+    let region = copy_region(&frame, initialize);
+    let key = import_key(&frame);
+    let hit = key.and_then(|key| state.cache.iter().position(|cached| cached.key == key));
+    let (raw, family) = unsafe {
         let native = device
             .as_hal::<Vulkan>()
             .context("DMA-BUF requires Vulkan")?;
-        check_layout(&native, vk_format, frame.modifier, dest.format(), blit)?;
-        let image = native
-            .texture_from_dmabuf_fd(
-                frame.fd,
-                &desc,
-                frame.modifier,
-                frame.stride.into(),
-                frame.offset.into(),
-            )
-            .context("Vulkan could not import the DMA-BUF")?;
-        (
-            native.raw_device().clone(),
-            native.queue_family_index(),
-            image,
-        )
+        (native.raw_device().clone(), native.queue_family_index())
     };
-    let src_handle = unsafe { image.raw_handle() };
-    let _source = Source {
-        device,
-        image: Some(image),
+    // A fresh import when this buffer is not cached; freed after its copy.
+    let mut temporary = None;
+    let src_handle = match hit {
+        Some(index) => {
+            // Most recently used last, so eviction takes the oldest.
+            let cached = state.cache.remove(index);
+            state.cache.push(cached);
+            let image = state.cache.last().and_then(|cached| cached.image.as_ref());
+            unsafe { image.context("Missing cached DMA-BUF image")?.raw_handle() }
+        }
+        None => {
+            let desc = wgpu::hal::TextureDescriptor {
+                label: Some("foreign scanout"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUses::COPY_SRC,
+                memory_flags: wgpu::hal::MemoryFlags::empty(),
+                view_formats: Vec::new(),
+            };
+            let fd = frame.fd.try_clone().context("Could not duplicate the DMA-BUF")?;
+            let image = unsafe {
+                let native = device
+                    .as_hal::<Vulkan>()
+                    .context("DMA-BUF requires Vulkan")?;
+                check_layout(&native, vk_format, frame.modifier, dest.format(), blit)?;
+                native
+                    .texture_from_dmabuf_fd(
+                        fd,
+                        &desc,
+                        frame.modifier,
+                        frame.stride.into(),
+                        frame.offset.into(),
+                    )
+                    .context("Vulkan could not import the DMA-BUF")?
+            };
+            let handle = unsafe { image.raw_handle() };
+            match key {
+                Some(key) => {
+                    if state.cache.len() >= CACHED_IMPORTS {
+                        let mut evicted = state.cache.remove(0);
+                        if let Some(image) = evicted.image.take() {
+                            match evicted.last_use.take() {
+                                Some(submission) => {
+                                    let job = Job {
+                                        submission,
+                                        release: Some(image),
+                                        done: None,
+                                    };
+                                    if let Some(job) = state.defer(job) {
+                                        finish(device, job);
+                                    }
+                                }
+                                None => destroy(device, image),
+                            }
+                        }
+                    }
+                    state.cache.push(Cached {
+                        key,
+                        image: Some(image),
+                        last_use: None,
+                    });
+                }
+                None => temporary = Some(image),
+            }
+            handle
+        }
     };
     let dst_handle = unsafe { dest.as_hal::<Vulkan>() }
         .map(|dest| unsafe { dest.raw_handle() })
@@ -181,7 +354,7 @@ pub(super) unsafe fn copy(
         }),
     );
     let dst_origin = [tile.bounds.origin.x.0, tile.bounds.origin.y.0];
-    unsafe {
+    let recorded = unsafe {
         encoder.as_hal_mut::<Vulkan, _, _>(|encoder| -> Result<()> {
             let commands = encoder
                 .context("The Vulkan upload encoder is unavailable")?
@@ -194,21 +367,53 @@ pub(super) unsafe fn copy(
                 family,
                 dst_origin,
                 [frame.extent.width.0, frame.extent.height.0],
+                region,
                 blit,
                 frame.top_down,
             );
             Ok(())
-        })?;
+        })
+    };
+    if let Err(error) = recorded {
+        if let Some(image) = temporary.take() {
+            destroy(device, image);
+        }
+        return Err(error);
     }
     let submission = queue.submit([encoder.finish()]);
-    // The source stays alive through the GPU copy and FOREIGN release. The calling
-    // transport acknowledges the frame only after this submission completes.
-    device
-        .poll(wgpu::PollType::Wait {
-            submission_index: Some(submission),
-            timeout: None,
-        })
-        .context("Vulkan DMA-BUF copy did not complete")?;
+    if let Some(key) = key
+        && let Some(cached) = state.cache.iter_mut().find(|cached| cached.key == key)
+    {
+        cached.last_use = Some(submission.clone());
+    }
+    let job = Job {
+        submission,
+        release: temporary,
+        done: frame.on_complete.take(),
+    };
+    // With a completion callback the caller is not held up: a waiter thread reports
+    // when the GPU finishes, as UTM acknowledges from Metal's completion handler.
+    // Without one, the producer is released only once this call returns.
+    let job = if job.done.is_some() {
+        state.defer(job)
+    } else {
+        Some(job)
+    };
+    if let Some(job) = job {
+        let completed = device
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(job.submission.clone()),
+                timeout: None,
+            })
+            .is_ok();
+        if let Some(image) = job.release {
+            destroy(device, image);
+        }
+        if let Some(done) = job.done {
+            done(completed);
+        }
+        ensure!(completed, "Vulkan DMA-BUF copy did not complete");
+    }
     Ok(())
 }
 
@@ -290,7 +495,8 @@ unsafe fn record_copy(
     dst: vk::Image,
     family: u32,
     [x, y]: [i32; 2],
-    [w, h]: [i32; 2],
+    [_, h]: [i32; 2],
+    [rx, ry, rw, rh]: [i32; 4],
     blit: bool,
     top_down: bool,
 ) {
@@ -328,7 +534,12 @@ unsafe fn record_copy(
             &[acquire],
         );
         if blit {
-            let (top, bottom) = if top_down { (0, h) } else { (h, 0) };
+            // Source rows run bottom-up when the producer stores them that way.
+            let (top, bottom) = if top_down {
+                (ry, ry + rh)
+            } else {
+                (h - ry, h - ry - rh)
+            };
             device.cmd_blit_image(
                 commands,
                 src,
@@ -339,18 +550,22 @@ unsafe fn record_copy(
                     .src_subresource(layers)
                     .dst_subresource(layers)
                     .src_offsets([
-                        vk::Offset3D { x: 0, y: top, z: 0 },
+                        vk::Offset3D { x: rx, y: top, z: 0 },
                         vk::Offset3D {
-                            x: w,
+                            x: rx + rw,
                             y: bottom,
                             z: 1,
                         },
                     ])
                     .dst_offsets([
-                        vk::Offset3D { x, y, z: 0 },
                         vk::Offset3D {
-                            x: x + w,
-                            y: y + h,
+                            x: x + rx,
+                            y: y + ry,
+                            z: 0,
+                        },
+                        vk::Offset3D {
+                            x: x + rx + rw,
+                            y: y + ry + rh,
                             z: 1,
                         },
                     ])],
@@ -366,10 +581,15 @@ unsafe fn record_copy(
                 &[vk::ImageCopy::default()
                     .src_subresource(layers)
                     .dst_subresource(layers)
-                    .dst_offset(vk::Offset3D { x, y, z: 0 })
+                    .src_offset(vk::Offset3D { x: rx, y: ry, z: 0 })
+                    .dst_offset(vk::Offset3D {
+                        x: x + rx,
+                        y: y + ry,
+                        z: 0,
+                    })
                     .extent(vk::Extent3D {
-                        width: w as u32,
-                        height: h as u32,
+                        width: rw as u32,
+                        height: rh as u32,
                         depth: 1,
                     })],
             );

@@ -1,0 +1,157 @@
+# Builds Arch, Debian and RPM packages on their own distributions (the bundled
+# Neptune QEMU links against each one's system libraries) and attaches them to
+# the GitHub release for the pushed tag.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  NFPM_VERSION: 2.41.0
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        name: Read the version and check it matches the tag
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          pkgver=$(sed -n 's/^pkgver=//p' packaging/arch/PKGBUILD)
+          if [[ "$version" != "$pkgver" ]]; then
+            echo "::error::Cargo.toml is $version but PKGBUILD is $pkgver"
+            exit 1
+          fi
+          if [[ "$GITHUB_REF" == refs/tags/* && "${GITHUB_REF_NAME#v}" != "$version" ]]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match Cargo.toml version $version"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  arch:
+    needs: version
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - name: Install git
+        run: pacman -Syu --noconfirm --needed git
+      - uses: actions/checkout@v4
+      - name: Prepare an unprivileged build user
+        run: |
+          useradd --create-home builder
+          echo 'builder ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/builder
+          chown -R builder: "$GITHUB_WORKSPACE"
+      - name: Build the package
+        working-directory: packaging/arch
+        run: sudo -u builder makepkg --syncdeps --noconfirm
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arch
+          path: packaging/arch/*.pkg.tar.zst
+          if-no-files-found: error
+
+  deb:
+    needs: version
+    runs-on: ubuntu-latest
+    container: debian:trixie
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates curl git build-essential pkg-config meson ninja-build \
+            python3 python3-venv python3-yaml glslang-tools xorriso unzip clang libclang-dev \
+            libglib2.0-dev libpixman-1-dev libfdt-dev libslirp-dev libspice-server-dev \
+            libspice-protocol-dev libusbredirparser-dev libusbredirhost-dev libusb-1.0-0-dev \
+            libudev-dev libcap-ng-dev libattr1-dev libasound2-dev libpulse-dev \
+            libpipewire-0.3-dev libseccomp-dev libpng-dev libgnutls28-dev libzstd-dev \
+            liblzo2-dev libaio-dev liburing-dev libnuma-dev libcurl4-gnutls-dev \
+            libepoxy-dev libdrm-dev libgbm-dev libegl-dev libvulkan-dev libx11-dev \
+            libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libfontconfig-dev libfreetype-dev libbz2-dev zlib1g-dev libssl-dev
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - uses: actions/checkout@v4
+      - name: Install nfpm
+        run: |
+          curl -sSfL "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz" \
+            | tar -xz -C /usr/local/bin nfpm
+      - name: Build and stage
+        run: packaging/build-release.sh "$PWD/target/stage"
+      - name: Package
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          mkdir -p dist
+          STAGE="$PWD/target/stage" nfpm package --config packaging/nfpm.yaml --packager deb --target dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb
+          path: dist/*.deb
+          if-no-files-found: error
+
+  rpm:
+    needs: version
+    runs-on: ubuntu-latest
+    container: fedora:latest
+    steps:
+      - name: Install build dependencies
+        run: |
+          dnf install -y \
+            curl git gcc gcc-c++ make pkgconf-pkg-config meson ninja-build python3 python3-pyyaml \
+            glslang xorriso unzip clang clang-devel \
+            glib2-devel pixman-devel libfdt-devel libslirp-devel spice-server-devel \
+            spice-protocol usbredir-devel libusb1-devel systemd-devel libcap-ng-devel \
+            libattr-devel alsa-lib-devel pulseaudio-libs-devel pipewire-devel libseccomp-devel \
+            libpng-devel gnutls-devel libzstd-devel lzo-devel libaio-devel liburing-devel \
+            numactl-devel libcurl-devel libepoxy-devel libdrm-devel mesa-libgbm-devel \
+            mesa-libEGL-devel vulkan-loader-devel vulkan-headers libX11-devel libxcb-devel \
+            libxkbcommon-devel libxkbcommon-x11-devel wayland-devel fontconfig-devel \
+            freetype-devel bzip2-devel zlib-devel openssl-devel
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - uses: actions/checkout@v4
+      - name: Install nfpm
+        run: |
+          curl -sSfL "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz" \
+            | tar -xz -C /usr/local/bin nfpm
+      - name: Build and stage
+        run: packaging/build-release.sh "$PWD/target/stage"
+      - name: Package
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          mkdir -p dist
+          STAGE="$PWD/target/stage" nfpm package --config packaging/nfpm.yaml --packager rpm --target dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rpm
+          path: dist/*.rpm
+          if-no-files-found: error
+
+  release:
+    needs: [version, arch, deb, rpm]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Attach the packages to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

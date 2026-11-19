@@ -73,18 +73,14 @@ fn parse_machine(id: &str, xml: &str, state: State) -> Result<Machine> {
         .and_then(|n| n.attribute("id"))
         .unwrap_or("")
         .to_owned();
+    let arch = super::qemu::domain_arch(root).unwrap_or("Unknown");
     Ok(Machine {
         id: id.to_owned(),
         name: text("name").to_owned(),
         state,
         cpus: text("vcpu").parse().unwrap_or(1),
         memory_mib,
-        arch: root
-            .descendants()
-            .find(|n| n.has_tag_name("type"))
-            .and_then(|n| n.attribute("arch"))
-            .unwrap_or("Unknown")
-            .to_owned(),
+        arch: arch.to_owned(),
         disk,
         network,
         display,
@@ -94,6 +90,7 @@ fn parse_machine(id: &str, xml: &str, state: State) -> Result<Machine> {
             "QEMU"
         }
         .to_owned(),
+        qemu_backend: super::qemu::domain_backend(root, arch),
         autostart: false,
         saved_state: false,
         notes: text("description").to_owned(),
@@ -109,9 +106,9 @@ pub fn action(connection: Connection, id: &str, action: Action, in_app: bool) ->
         Action::Display => bail!("Open the display from the machine library."),
         Action::Start => {
             // Best effort: a missing in-app display must never block starting the guest.
-            let saved = virsh(connection, &["dominfo", id]).ok().is_some_and(|info| {
-                info.lines().any(|line| line.starts_with("Managed save:") && line.contains("yes"))
-            });
+            let saved = virsh(connection, &["dominfo", id])?
+                .lines()
+                .any(|line| line.starts_with("Managed save:") && line.contains("yes"));
             if !saved {
                 let display_setup = if in_app {
                     ensure_display(connection, id)
@@ -199,6 +196,11 @@ pub fn demo_machines() -> Vec<Machine> {
         network: "Shared network".into(),
         display: "SPICE".into(),
         acceleration: "KVM".into(),
+        qemu_backend: if id == "ubuntu" {
+            super::QemuBackend::System
+        } else {
+            super::QemuBackend::Bundled
+        },
         autostart: false,
         saved_state: false,
         notes: String::new(),

@@ -86,7 +86,9 @@ pub(super) fn apply_platform(c: Connection, machine: &Machine, p: Platform) -> R
             .descendants()
             .find(|n| n.has_tag_name("type") && n.parent().is_some_and(|p| p.has_tag_name("os")))
             .and_then(|n| n.attribute("machine"));
-        let model = backend::tpm::emulator_model(c, &machine.arch, domain_type, machine_type)?;
+        let emulator = backend::qemu::domain_emulator(doc.root_element());
+        let model =
+            backend::tpm::emulator_model(c, &machine.arch, domain_type, machine_type, emulator)?;
         add += &format!("<tpm model='{model}'><backend type='emulator' version='2.0'/></tpm>");
     }
     remove(&mut edits, &|n| n.has_tag_name("input") && n.attribute("type") == Some("tablet"));
@@ -154,7 +156,11 @@ pub(super) fn apply_platform(c: Connection, machine: &Machine, p: Platform) -> R
         }
         None => {
             let end = before_close(&xml, &doc, "domain").context("Invalid domain.")?;
-            let timers = if p.hyperv { WINDOWS_TIMERS } else { "" };
+            let timers = if p.hyperv {
+                WINDOWS_TIMERS
+            } else {
+                ""
+            };
             edits.push((end, format!("<clock offset='{offset}'>{timers}</clock>")));
         }
     }

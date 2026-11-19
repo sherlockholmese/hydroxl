@@ -4,11 +4,13 @@ use super::{
     vnc::{Framebuffer, MAX_DESKTOP_SIZE},
 };
 use anyhow::{Context, Result, ensure};
-use gpui_kit::{DevicePixels, DmaBufFrame, size};
+use gpui_kit::{Bounds, DevicePixels, DmaBufFrame, point, size};
 use libloading::Library;
+use std::future::Future;
 use std::os::fd::BorrowedFd;
-use std::sync::{Mutex, mpsc};
-use std::time::Duration;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::task::{Context as TaskContext, Poll, Waker};
 use std::{
     cell::OnceCell,
     ffi::{CStr, c_char, c_void},
@@ -387,11 +389,80 @@ fn attributes(scanout: Scanout, modifiers: bool) -> Result<Vec<i32>> {
 
 pub(crate) struct GpuDraw {
     pub frame: DmaBufFrame,
-    pub done: mpsc::SyncSender<bool>,
+    pub reply: DrawReply,
 }
 
-/// QEMU must hold this scanout until the copy completes.
-pub(super) unsafe fn submit_scanout(shared: &Mutex<Framebuffer>, scanout: Scanout) -> bool {
+#[derive(Default)]
+struct ReplyState {
+    copied: Option<bool>,
+    waker: Option<Waker>,
+}
+
+/// The producer's side of a GPU draw, answered once the UI's copy completes. Dropping
+/// it unanswered reports a failed copy, so the producer is never left waiting.
+pub(crate) struct DrawReply {
+    state: Arc<Mutex<ReplyState>>,
+    /// Wakes the producer's thread so it acknowledges without polling.
+    wake: Option<Box<dyn Fn() + Send>>,
+    sent: bool,
+}
+
+impl DrawReply {
+    /// Reports whether the frame was copied; the producer then releases the buffer.
+    pub(crate) fn finish(mut self, copied: bool) {
+        self.send(copied);
+    }
+
+    fn send(&mut self, copied: bool) {
+        if std::mem::replace(&mut self.sent, true) {
+            return;
+        }
+        let waker = {
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            state.copied = Some(copied);
+            state.waker.take()
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+        if let Some(wake) = &self.wake {
+            wake();
+        }
+    }
+}
+
+impl Drop for DrawReply {
+    fn drop(&mut self) {
+        self.send(false);
+    }
+}
+
+/// The producer's view of a draw it offered: polled by the SPICE loop, awaited by D-Bus.
+pub(super) struct DrawOutcome(Arc<Mutex<ReplyState>>);
+
+impl DrawOutcome {
+    pub(super) fn try_take(&self) -> Option<bool> {
+        self.0.lock().unwrap_or_else(|error| error.into_inner()).copied
+    }
+}
+
+impl Future for DrawOutcome {
+    type Output = bool;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<bool> {
+        let mut state = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        match state.copied {
+            Some(copied) => Poll::Ready(copied),
+            None => {
+                state.waker = Some(cx.waker().clone());
+                Poll::Pending
+            }
+        }
+    }
+}
+
+/// The scanout as a frame the UI can copy on the GPU, when it has a usable layout.
+fn gpu_frame(scanout: Scanout, damage: Option<Damage>) -> Option<DmaBufFrame> {
     if scanout.planes != 1
         || scanout.fds[0] < 0
         || scanout.modifier == (1 << 56) - 1
@@ -399,45 +470,103 @@ pub(super) unsafe fn submit_scanout(shared: &Mutex<Framebuffer>, scanout: Scanou
         || !(1..=MAX_DESKTOP_SIZE as u32).contains(&scanout.width)
         || !(1..=MAX_DESKTOP_SIZE as u32).contains(&scanout.height)
     {
-        return false;
+        return None;
     }
-    // Grab our own reference while the producer awaits the draw acknowledgment.
-    let Ok(fd) = unsafe { BorrowedFd::borrow_raw(scanout.fds[0]) }.try_clone_to_owned() else {
-        return false;
+    // Our own reference, held while the producer awaits the draw acknowledgment.
+    let fd = unsafe { BorrowedFd::borrow_raw(scanout.fds[0]) }.try_clone_to_owned().ok()?;
+    Some(DmaBufFrame {
+        fd,
+        extent: size(DevicePixels(scanout.width as i32), DevicePixels(scanout.height as i32)),
+        fourcc: scanout.format,
+        modifier: scanout.modifier,
+        offset: scanout.offsets[0],
+        stride: scanout.strides[0],
+        top_down: scanout.rows_are_top_down(),
+        damage: damage.map(|rect| {
+            Bounds::new(
+                point(DevicePixels(rect.x as i32), DevicePixels(rect.y as i32)),
+                size(DevicePixels(rect.width as i32), DevicePixels(rect.height as i32)),
+            )
+        }),
+        on_complete: None,
+    })
+}
+
+/// Hands the scanout to the UI's next frame without waiting for it. `None` means the
+/// layout cannot be copied on the GPU. Only `damage` needs copying when the UI already
+/// shows the previous frame.
+pub(super) fn offer_scanout(
+    shared: &Mutex<Framebuffer>,
+    scanout: Scanout,
+    damage: Option<Damage>,
+    wake: Option<Box<dyn Fn() + Send>>,
+) -> Option<DrawOutcome> {
+    let frame = gpu_frame(scanout, damage)?;
+    let state = Arc::new(Mutex::new(ReplyState::default()));
+    let waker = {
+        let mut shared = shared.lock().unwrap_or_else(|error| error.into_inner());
+        shared.gpu_draw = Some(GpuDraw {
+            frame,
+            reply: DrawReply {
+                state: state.clone(),
+                wake,
+                sent: false,
+            },
+        });
+        shared.draw_waker.take()
     };
-    let (done, wait) = mpsc::sync_channel(1);
-    shared.lock().unwrap_or_else(|error| error.into_inner()).gpu_draw = Some(GpuDraw {
-        frame: DmaBufFrame {
-            fd,
-            extent: size(DevicePixels(scanout.width as i32), DevicePixels(scanout.height as i32)),
-            fourcc: scanout.format,
-            modifier: scanout.modifier,
-            offset: scanout.offsets[0],
-            stride: scanout.strides[0],
-            top_down: scanout.rows_are_top_down(),
-        },
-        done,
-    });
-    let copied = match wait.recv_timeout(Duration::from_millis(100)) {
-        Ok(copied) => copied,
-        Err(mpsc::RecvTimeoutError::Disconnected) => false,
-        Err(mpsc::RecvTimeoutError::Timeout) => {
-            // Cancel only before the UI takes the frame. Once a copy starts,
-            // let the GPU finish before acknowledging the producer.
-            let canceled =
-                shared.lock().unwrap_or_else(|error| error.into_inner()).gpu_draw.take().is_some();
-            !canceled && wait.recv().unwrap_or(false)
+    if let Some(waker) = waker {
+        waker.wake();
+    }
+    Some(DrawOutcome(state))
+}
+
+/// Resolves once a GPU draw is waiting for the UI. Like UTM, the UI copies a frame as
+/// soon as it arrives and presents at its own pace, so the guest is never held until
+/// the next vsync before it may render again.
+pub(crate) struct DrawOffered<'a>(pub &'a Mutex<Framebuffer>);
+
+impl Future for DrawOffered<'_> {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<()> {
+        let mut frame = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        if frame.gpu_draw.is_some() {
+            Poll::Ready(())
+        } else {
+            frame.draw_waker = Some(cx.waker().clone());
+            Poll::Pending
         }
-    };
-    if copied {
-        let mut frame = shared.lock().unwrap_or_else(|error| error.into_inner());
-        frame.width = scanout.width;
-        frame.height = scanout.height;
-        frame.pixels.clear();
-        frame.discard_damage();
-        frame.generation += 1;
     }
-    copied
+}
+
+/// Withdraws an offer the UI has not taken. False once the UI owns the copy.
+pub(super) fn withdraw_scanout(shared: &Mutex<Framebuffer>) -> bool {
+    let draw = shared.lock().unwrap_or_else(|error| error.into_inner()).gpu_draw.take();
+    draw.is_some()
+}
+
+/// Records a GPU-copied scanout as the current frame.
+pub(super) fn scanout_copied(shared: &Mutex<Framebuffer>, scanout: Scanout) {
+    let mut frame = shared.lock().unwrap_or_else(|error| error.into_inner());
+    frame.width = scanout.width;
+    frame.height = scanout.height;
+    frame.pixels.clear();
+    frame.discard_damage();
+    frame.generation += 1;
+}
+
+/// Whether the producer's pending GPU writes to the buffer have finished.
+pub(super) fn writes_finished(fd: i32) -> bool {
+    if fd < 0 {
+        return true;
+    }
+    let mut descriptor = PollFd {
+        fd,
+        events: 1, // POLLIN
+        revents: 0,
+    };
+    unsafe { poll(&mut descriptor, 1, 0) == 1 }
 }
 
 #[cfg(test)]

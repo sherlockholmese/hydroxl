@@ -1,12 +1,13 @@
 use super::primitives::{MENU_MIN_WIDTH, glyph};
 use crate::app::{Job, Workspace};
-use crate::backend::Machine;
+use crate::backend::{Action, Machine, State};
 use crate::theme::Palette;
 use crate::workflows;
+use gpui_kit::assets::IconName;
 use gpui_kit::component::button::Button;
 use gpui_kit::component::button::ButtonVariants as _;
-use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
-use gpui_kit::component::{ActiveTheme as _, WindowExt as _, h_flex};
+use gpui_kit::component::menu::{DropdownMenu, PopupMenu, PopupMenuItem};
+use gpui_kit::component::{ActiveTheme as _, Icon, WindowExt as _, h_flex};
 use gpui_kit::{prelude::*, *};
 
 impl Workspace {
@@ -56,15 +57,55 @@ impl Workspace {
         trigger: Button,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        trigger.dropdown_menu_with_anchor(
+            Anchor::TopRight,
+            self.machine_menu_builder(machine, false, cx),
+        )
+    }
+
+    /// The sidebar's right-click menu: power controls first, then the same actions as the
+    /// header's menu. Opening it selects the machine, so every entry acts on that row.
+    pub(crate) fn machine_context_menu(
+        &self,
+        machine: &Machine,
+        cx: &mut Context<Self>,
+    ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
+        self.machine_menu_builder(machine, true, cx)
+    }
+
+    fn machine_menu_builder(
+        &self,
+        machine: &Machine,
+        power: bool,
+        cx: &mut Context<Self>,
+    ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
         let weak = cx.entity().downgrade();
         let busy = self.busy();
         let machine = machine.clone();
-        trigger.dropdown_menu_with_anchor(Anchor::TopRight, move |mut menu, window, cx| {
+        move |mut menu, _, cx| {
             let danger = Palette::get(cx).danger;
-            let entries = workflows::machine_actions(&machine);
             menu = menu.min_w(px(MENU_MIN_WIDTH));
+            if power {
+                for (label, glyph, action) in power_actions(&machine) {
+                    let weak = weak.clone();
+                    let item = PopupMenuItem::new(label)
+                        .icon(Icon::new(glyph))
+                        .disabled(busy || machine.state == State::Other)
+                        .on_click(move |_, window, cx| {
+                            let _ = weak.update(cx, |this, cx| {
+                                if matches!(action, Action::Display) {
+                                    this.open_display(window, cx);
+                                } else {
+                                    this.machine_action(action, cx);
+                                }
+                            });
+                        });
+                    menu = menu.item(item);
+                }
+                menu = menu.separator();
+            }
             let mut group = None;
-            for entry in entries {
+            for entry in workflows::machine_actions(&machine) {
                 if group.is_some_and(|g| g != entry.group) {
                     menu = menu.separator();
                 }
@@ -93,10 +134,26 @@ impl Workspace {
                     });
                 menu = menu.item(item);
             }
-            let _ = (window, cx);
             menu
-        })
+        }
     }
+}
+
+/// The header's power buttons, in the same order, for menus that stand in for the header.
+fn power_actions(m: &Machine) -> Vec<(&'static str, IconName, Action)> {
+    let mut actions = vec![match m.state {
+        State::Stopped if m.saved_state => ("Resume", IconName::Play, Action::Start),
+        State::Stopped | State::Other => ("Start", IconName::Play, Action::Start),
+        State::Paused => ("Resume", IconName::Play, Action::Resume),
+        State::Running => ("Open display", IconName::MonitorPlay, Action::Display),
+    }];
+    if m.state == State::Running {
+        actions.push(("Pause", IconName::Pause, Action::Pause));
+    }
+    if matches!(m.state, State::Running | State::Paused) {
+        actions.push(("Shut down", IconName::Power, Action::Shutdown));
+    }
+    actions
 }
 
 impl Workspace {

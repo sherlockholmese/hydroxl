@@ -368,6 +368,7 @@ include!("capture.rs");
 
 pub(crate) struct WaylandClientState {
     captures: HashMap<ObjectId, WaylandCapture>,
+    guest_cursor: Option<GuestCursorSurface>,
     serial_tracker: SerialTracker,
     globals: Globals,
     pub gpu_context: GpuContext,
@@ -1085,6 +1086,7 @@ impl WaylandConnection {
             wl_seat: seat,
             wl_pointer: None,
             captures: HashMap::default(),
+            guest_cursor: None,
             wl_keyboard: None,
             pinch_gesture: None,
             pinch_scale: 1.0,
@@ -2443,7 +2445,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                     }
                     state.restore_cursor_after_hide();
                     if state.capture_hides_cursor() {
-                        wl_pointer.set_cursor(serial, None, 0, 0);
+                        state.hide_captured_cursor(serial);
                         state.cursor_hidden_window = Some(window.clone());
                     } else if let Some(style) = state.cursor_style {
                         if let Some(cursor_shape_device) = &state.cursor_shape_device {

@@ -35,7 +35,9 @@ pub(super) fn apply_reboot(c: Connection, machine: &Machine) -> Result<()> {
             std::thread::sleep(std::time::Duration::from_secs(2));
             match backend::virsh(c, &["domstate", &id]).as_deref().map(str::trim) {
                 Ok("shut off") => {
-                    if let Err(error) = backend::action(c, &id, crate::backend::Action::Start, in_app) {
+                    if let Err(error) =
+                        backend::action(c, &id, crate::backend::Action::Start, in_app)
+                    {
                         eprintln!("Could not start the machine after restart: {error:#}");
                     }
                     return;

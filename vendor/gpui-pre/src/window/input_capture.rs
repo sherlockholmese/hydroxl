@@ -1,7 +1,31 @@
 //! Optional platform input capture, without changing the shared event enums.
 use super::*;
 
+/// A cursor image for the platform to show in place of the hidden host cursor.
+#[derive(Clone, Debug)]
+pub struct CursorImage {
+    /// Width of `rgba` in pixels.
+    pub width: u32,
+    /// Height of `rgba` in pixels.
+    pub height: u32,
+    /// Hotspot in image pixels.
+    pub hot_x: u32,
+    /// Hotspot in image pixels.
+    pub hot_y: u32,
+    /// Straight-alpha BGRA rows, tightly packed, as GPUI images use.
+    pub bgra: std::sync::Arc<[u8]>,
+    /// Logical pixels per image pixel; the platform resamples for its output scale.
+    pub scale: f32,
+}
+
 impl Window {
+    /// Shows `image` as this window's cursor while `set_cursor_hidden(true)` is in
+    /// effect; `None` keeps the cursor hidden. The compositor moves it with the
+    /// pointer, so it never trails the way an in-window overlay does.
+    pub fn set_cursor_image(&mut self, image: Option<CursorImage>) -> Result<()> {
+        self.platform_window.set_cursor_image(image)
+    }
+
     /// Overrides the application's automatic cursor hiding policy for this window.
     /// Explicit capture through `set_cursor_hidden` is independent of this policy.
     pub fn set_cursor_hide_mode_override(&mut self, mode: Option<CursorHideMode>) {

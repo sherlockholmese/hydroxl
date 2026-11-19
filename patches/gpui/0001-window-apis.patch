@@ -37,7 +37,7 @@
          }
 --- a/src/platform.rs
 +++ b/src/platform.rs
-@@ -1244,6 +1244,39 @@
+@@ -1244,6 +1244,47 @@
  
  #[expect(missing_docs)]
  pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
@@ -45,6 +45,14 @@
 +    fn set_cursor_hidden(&mut self, hidden: bool) -> Result<()> {
 +        if hidden {
 +            anyhow::bail!("cursor hiding is unsupported")
++        } else {
++            Ok(())
++        }
++    }
++    /// Shows an image in place of the hidden cursor. Unsupported platforms return an error.
++    fn set_cursor_image(&mut self, image: Option<crate::CursorImage>) -> Result<()> {
++        if image.is_some() {
++            anyhow::bail!("cursor images are unsupported")
 +        } else {
 +            Ok(())
 +        }
@@ -77,7 +85,7 @@
      fn bounds(&self) -> Bounds<Pixels>;
      fn is_maximized(&self) -> bool;
      fn window_bounds(&self) -> WindowBounds;
-@@ -1795,6 +1828,22 @@
+@@ -1795,6 +1836,22 @@
  
  #[expect(missing_docs)]
  pub trait PlatformAtlas {
@@ -100,7 +108,7 @@
      /// The builder runs with the atlas locked and must not re-enter the same atlas.
      fn get_or_insert_with<'a>(
          &self,
-@@ -1802,6 +1851,17 @@
+@@ -1802,6 +1859,17 @@
          build: &mut dyn FnMut() -> Result<Option<(Size<DevicePixels>, Cow<'a, [u8]>)>>,
      ) -> Result<Option<AtlasTile>>;
      fn remove(&self, key: &AtlasKey);
@@ -118,7 +126,7 @@
  
      #[cfg(any(test, feature = "test-support", feature = "bench-support"))]
      fn contains(&self, _key: &AtlasKey) -> bool {
-@@ -1832,6 +1892,27 @@
+@@ -1832,6 +1900,27 @@
          Self {
              tiles_by_key: FxHashMap::default(),
              backend,
@@ -157,12 +165,13 @@
      text_system: Rc<WindowTextSystem>,
      text_rendering_mode: Rc<Cell<TextRenderingMode>>,
      rem_size: Pixels,
-@@ -1630,6 +1632,12 @@
+@@ -1630,6 +1632,13 @@
      };
      window_bounds_ctor(Bounds::new(final_origin, base_size))
  }
 +
 +mod input_capture;
++pub use input_capture::CursorImage;
 +mod texture;
 +#[cfg(target_os = "linux")]
 +pub use texture::DmaBufFrame;
@@ -170,7 +179,7 @@
  
  impl Window {
      pub(crate) fn new(
-@@ -2355,6 +2363,8 @@
+@@ -2355,6 +2364,8 @@
              is_resizable,
              is_minimizable,
              sprite_atlas,
@@ -179,7 +188,7 @@
              text_system,
              text_rendering_mode: cx.text_rendering_mode.clone(),
              rem_size: px(16.),
-@@ -5314,6 +5324,25 @@
+@@ -5314,6 +5325,25 @@
              })?
              .expect("Callback above only returns Some");
  
@@ -205,7 +214,7 @@
          let visible_bounds_snapped = self.snap_bounds(visible_bounds);
  
          let sub_tile = if visible_bounds == image_bounds {
-@@ -5364,7 +5393,7 @@
+@@ -5364,7 +5394,7 @@
  
          self.next_frame.scene.insert_primitive(PolychromeSprite {
              order: 0,
@@ -214,7 +223,7 @@
              grayscale: grayscale.into(),
              bounds: visible_bounds_snapped,
              content_mask,
-@@ -6310,7 +6339,8 @@
+@@ -6310,7 +6340,8 @@
              keystroke = Some(key_down_event.keystroke.clone());
              if key_down_event.keystroke.key_char.is_some()
                  && matches!(
@@ -224,7 +233,7 @@
                      CursorHideMode::OnTyping | CursorHideMode::OnTypingAndAction
                  )
              {
-@@ -6746,7 +6776,10 @@
+@@ -6746,7 +6777,10 @@
          self.dispatch_action_on_node_inner(node_id, action, cx);
  
          if !cx.propagate_event
@@ -238,11 +247,35 @@
              cx.platform.hide_cursor_until_mouse_moves();
 --- /dev/null
 +++ b/src/window/input_capture.rs
-@@ -0,0 +1,37 @@
+@@ -0,0 +1,61 @@
 +//! Optional platform input capture, without changing the shared event enums.
 +use super::*;
 +
++/// A cursor image for the platform to show in place of the hidden host cursor.
++#[derive(Clone, Debug)]
++pub struct CursorImage {
++    /// Width of `rgba` in pixels.
++    pub width: u32,
++    /// Height of `rgba` in pixels.
++    pub height: u32,
++    /// Hotspot in image pixels.
++    pub hot_x: u32,
++    /// Hotspot in image pixels.
++    pub hot_y: u32,
++    /// Straight-alpha BGRA rows, tightly packed, as GPUI images use.
++    pub bgra: std::sync::Arc<[u8]>,
++    /// Logical pixels per image pixel; the platform resamples for its output scale.
++    pub scale: f32,
++}
++
 +impl Window {
++    /// Shows `image` as this window's cursor while `set_cursor_hidden(true)` is in
++    /// effect; `None` keeps the cursor hidden. The compositor moves it with the
++    /// pointer, so it never trails the way an in-window overlay does.
++    pub fn set_cursor_image(&mut self, image: Option<CursorImage>) -> Result<()> {
++        self.platform_window.set_cursor_image(image)
++    }
++
 +    /// Overrides the application's automatic cursor hiding policy for this window.
 +    /// Explicit capture through `set_cursor_hidden` is independent of this policy.
 +    pub fn set_cursor_hide_mode_override(&mut self, mode: Option<CursorHideMode>) {
@@ -278,7 +311,7 @@
 +}
 --- /dev/null
 +++ b/src/window/texture.rs
-@@ -0,0 +1,379 @@
+@@ -0,0 +1,405 @@
 +//! Window-owned mutable textures with bounded damage and CPU recovery.
 +use super::*;
 +
@@ -297,7 +330,6 @@
 +
 +/// The layout of a producer-owned, single-plane RGB DMA-BUF scanout.
 +#[cfg(target_os = "linux")]
-+#[derive(Debug)]
 +pub struct DmaBufFrame {
 +    /// A duplicate of the scanout plane's file descriptor.
 +    pub fd: std::os::fd::OwnedFd,
@@ -313,6 +345,31 @@
 +    pub stride: u32,
 +    /// Whether row zero is at the top of the image.
 +    pub top_down: bool,
++    /// The region that changed since the previous frame, in top-down pixels. `None`
++    /// copies the whole frame. A new texture is always copied whole.
++    pub damage: Option<Bounds<DevicePixels>>,
++    /// Called once the GPU copy has completed, from another thread. When set,
++    /// `Window::copy_dma_buf` returns as soon as the copy is queued; the producer may
++    /// reuse its buffer only after this runs. Dropped without being called when the
++    /// copy is not queued.
++    pub on_complete: Option<Box<dyn FnOnce(bool) + Send>>,
++}
++
++#[cfg(target_os = "linux")]
++impl std::fmt::Debug for DmaBufFrame {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        f.debug_struct("DmaBufFrame")
++            .field("fd", &self.fd)
++            .field("extent", &self.extent)
++            .field("fourcc", &self.fourcc)
++            .field("modifier", &self.modifier)
++            .field("offset", &self.offset)
++            .field("stride", &self.stride)
++            .field("top_down", &self.top_down)
++            .field("damage", &self.damage)
++            .field("on_complete", &self.on_complete.is_some())
++            .finish()
++    }
 +}
 +
 +impl TextureId {
@@ -332,12 +389,14 @@
 +        self.sprite_atlas.supports_dma_buf()
 +    }
 +
-+    /// Copies a scanout to a texture. Returns after the producer can reuse its buffer.
++    /// Copies a scanout to a texture. Without `on_complete`, returns after the producer
++    /// can reuse its buffer; with it, returns once the copy is queued.
 +    ///
 +    /// # Safety
 +    /// The descriptor must exactly match a valid DMA-BUF in a foreign producer's
 +    /// GENERAL layout with write fences registered on its reservation object.
-+    /// The producer must not start a new write until this call returns.
++    /// The producer must not start a new write until this call returns, or until
++    /// `on_complete` runs when it is set.
 +    #[cfg(target_os = "linux")]
 +    pub unsafe fn copy_dma_buf(
 +        &mut self,

@@ -1,4 +1,5 @@
 use super::*;
+use crate::backend::QemuBuild;
 const EXECUTION: &[(&str, &str)] = &[("virtualize", "Virtualize"), ("emulate", "Emulate")];
 const FIRMWARE: &[(&str, &str)] = &[("default", "Automatic"), ("uefi", "UEFI")];
 const BOOT_FROM: &[(&str, &str)] = &[("media", "Installation media"), ("network", "Network (PXE)")];
@@ -17,6 +18,7 @@ const ARCH: usize = 10;
 const EXEC: usize = 11;
 const BOOT: usize = 12;
 const LOCATION: usize = 13;
+const QEMU_BUILD: usize = 14;
 const DISK_MODES: &[(&str, &str)] = &[("new", "New disk"), ("existing", "Existing disk")];
 
 /// Guided creation, VMware-style: media, machine, review. The system is chosen as a
@@ -47,6 +49,7 @@ pub fn create(location: PathBuf) -> FormSpec {
             F::choice("Execution", EXECUTION, "virtualize").step(1).advanced().row(3),
             F::choice("Firmware", FIRMWARE, "default").step(1).advanced().row(3),
             location_field,
+            F::choice("QEMU backend", QemuBuild::OPTIONS, "bundled").step(1),
         ],
         new_machine_job,
     )
@@ -121,6 +124,7 @@ fn new_machine(v: &[String]) -> Result<NewMachine> {
         name: name(&v[NAME])?,
         os_variant: v[OS].clone(),
         architecture: v[ARCH].clone(),
+        qemu_build: QemuBuild::from_choice(&v[QEMU_BUILD])?,
         emulate: v[EXEC] == "emulate",
         uefi: v[BOOT] == "uefi",
         cpus: number(v, CPUS, "CPU count")?,
@@ -179,13 +183,16 @@ pub fn import_xml() -> FormSpec {
     FormSpec::new(
         "Import libvirt XML",
         "Import",
-        vec![F::path("Libvirt configuration", Picker::Xml)],
+        vec![
+            F::path("Libvirt configuration", Picker::Xml),
+            F::choice("QEMU backend", QemuBuild::OPTIONS, "bundled"),
+        ],
         |v| {
             let path = PathBuf::from(&v[0]);
             if !path.is_file() {
                 bail!("Choose a machine XML file.");
             }
-            Ok(Job::Import(path))
+            Ok(Job::Import(path, QemuBuild::from_choice(&v[1])?))
         },
     )
 }
@@ -215,6 +222,7 @@ pub fn import(location: PathBuf) -> FormSpec {
             )
             .advanced(),
             location_field,
+            F::choice("QEMU backend", QemuBuild::OPTIONS, "bundled"),
         ],
         |v| {
             let path = PathBuf::from(&v[0]);
@@ -230,6 +238,7 @@ pub fn import(location: PathBuf) -> FormSpec {
                 location,
                 name: v[1].clone(),
                 architecture: v[2].clone(),
+                qemu_build: QemuBuild::from_choice(&v[6])?,
                 execution: v[3].clone(),
                 firmware: v[4].clone(),
             }))
@@ -260,4 +269,36 @@ pub fn import_path(path: PathBuf, location: PathBuf) -> FormSpec {
         field.value = path.to_string_lossy().into_owned();
     }
     spec
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn all_registration_forms_default_to_bundled_qemu_and_submit_system() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("machine.xml");
+        std::fs::write(&path, "<domain type='kvm'/>")?;
+        let location = temp.path().to_path_buf();
+        for form in [create(location.clone()), import(location), import_xml()] {
+            let index = form.fields.iter().position(|field| field.label == "QEMU backend").unwrap();
+            let mut values: Vec<_> = form.fields.iter().map(|field| field.value.clone()).collect();
+            assert_eq!(values[index], "bundled");
+            values[index] = "system".into();
+            if form.steps.len() == 2 {
+                values[NAME] = "Test guest".into();
+            } else {
+                values[0] = path.to_string_lossy().into_owned();
+            }
+            let build = match (form.submit)(&values)? {
+                Job::Create(spec) => spec.qemu_build,
+                Job::Import(_, build) => build,
+                Job::Appliance(spec) => spec.qemu_build,
+                _ => unreachable!(),
+            };
+            assert_eq!(build, QemuBuild::System);
+        }
+        Ok(())
+    }
 }

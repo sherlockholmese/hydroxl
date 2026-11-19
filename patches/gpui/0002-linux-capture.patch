@@ -8,9 +8,63 @@
      "cursor",
      "resource_manager",
      "sync",
+--- a/src/linux.rs
++++ b/src/linux.rs
+@@ -1,3 +1,5 @@
++#[cfg(any(feature = "wayland", feature = "x11"))]
++mod cursor_image;
+ mod dispatcher;
+ mod display_connection;
+ mod headless;
+--- /dev/null
++++ b/src/linux/cursor_image.rs
+@@ -0,0 +1,43 @@
++//! Guest cursor images for the Wayland and X11 backends.
++use gpui::CursorImage;
++
++/// A cursor resampled for one output scale.
++pub(crate) struct ScaledCursor {
++    pub width: u32,
++    pub height: u32,
++    pub hot_x: u32,
++    pub hot_y: u32,
++    /// Premultiplied ARGB32 in native byte order (B, G, R, A in memory).
++    pub bgra: Vec<u8>,
++}
++
++/// Resamples `image` to `pixels_per_logical` device pixels per logical pixel with
++/// nearest-neighbour sampling, which keeps pointer edges crisp.
++pub(crate) fn scale_cursor(image: &CursorImage, pixels_per_logical: f32) -> Option<ScaledCursor> {
++    let (w, h) = (image.width, image.height);
++    if w == 0 || h == 0 || image.bgra.len() != (w * h * 4) as usize {
++        return None;
++    }
++    let factor = (image.scale * pixels_per_logical).clamp(0.25, 8.);
++    let width = ((w as f32 * factor).round() as u32).clamp(1, 256);
++    let height = ((h as f32 * factor).round() as u32).clamp(1, 256);
++    let mut bgra = vec![0; (width * height * 4) as usize];
++    for y in 0..height {
++        let sy = ((y as f32 + 0.5) * h as f32 / height as f32) as u32;
++        for x in 0..width {
++            let sx = ((x as f32 + 0.5) * w as f32 / width as f32) as u32;
++            let s = ((sy.min(h - 1) * w + sx.min(w - 1)) * 4) as usize;
++            let [b, g, r, a] = [image.bgra[s], image.bgra[s + 1], image.bgra[s + 2], image.bgra[s + 3]];
++            let premultiply = |c: u8| ((c as u16 * a as u16 + 127) / 255) as u8;
++            let d = ((y * width + x) * 4) as usize;
++            bgra[d..d + 4].copy_from_slice(&[premultiply(b), premultiply(g), premultiply(r), a]);
++        }
++    }
++    Some(ScaledCursor {
++        width,
++        height,
++        hot_x: ((image.hot_x as f32 * width as f32 / w as f32) as u32).min(width - 1),
++        hot_y: ((image.hot_y as f32 * height as f32 / h as f32) as u32).min(height - 1),
++        bgra,
++    })
++}
 --- /dev/null
 +++ b/src/linux/wayland/capture.rs
-@@ -0,0 +1,242 @@
+@@ -0,0 +1,356 @@
 +// Guest-input extensions, kept separate to make upstream rebases reviewable.
 +use wayland_protocols::wp::{
 +    keyboard_shortcuts_inhibit::zv1::client::{
@@ -23,6 +77,8 @@
 +#[derive(Default)]
 +struct WaylandCapture {
 +    hidden: bool,
++    /// Shown instead of nothing while hidden, so the compositor moves the guest's cursor.
++    image: Option<gpui::CursorImage>,
 +    locked: bool,
 +    lock: Option<zwp_locked_pointer_v1::ZwpLockedPointerV1>,
 +    relative: Option<zwp_relative_pointer_v1::ZwpRelativePointerV1>,
@@ -46,7 +102,103 @@
 +        }
 +    }
 +}
++/// The surface that shows a guest cursor image as the pointer's cursor.
++struct GuestCursorSurface {
++    surface: wl_surface::WlSurface,
++    buffer: Option<wl_buffer::WlBuffer>,
++    /// What the buffer holds: image identity and scales, so it is redrawn only on change.
++    drawn: Option<(usize, usize, u32, i32)>,
++    hot: (i32, i32),
++}
++
++impl Drop for GuestCursorSurface {
++    fn drop(&mut self) {
++        if let Some(buffer) = self.buffer.take() {
++            buffer.destroy();
++        }
++        self.surface.destroy();
++    }
++}
++
 +impl WaylandClientState {
++    /// Applies a capture's hidden cursor: its guest image when one is set, else none.
++    fn hide_captured_cursor(&mut self, serial: u32) {
++        let Some(pointer) = self.wl_pointer.clone() else {
++            return;
++        };
++        let focused = self.mouse_focused_window.clone();
++        let image = focused
++            .as_ref()
++            .and_then(|window| self.captures.get(&window.surface_id()))
++            .and_then(|capture| capture.image.clone());
++        let shown = match (image, focused) {
++            (Some(image), Some(window)) => {
++                self.draw_guest_cursor(&image, window.primary_output_scale())
++            }
++            _ => None,
++        };
++        match shown {
++            Some((surface, hot_x, hot_y)) => pointer.set_cursor(serial, Some(&surface), hot_x, hot_y),
++            None => pointer.set_cursor(serial, None, 0, 0),
++        }
++    }
++
++    fn draw_guest_cursor(
++        &mut self,
++        image: &gpui::CursorImage,
++        scale: i32,
++    ) -> Option<(wl_surface::WlSurface, i32, i32)> {
++        use std::io::Write as _;
++        use std::os::fd::{AsFd as _, FromRawFd as _, OwnedFd};
++        let scale = scale.max(1);
++        let key = (image.bgra.as_ptr() as usize, image.bgra.len(), image.scale.to_bits(), scale);
++        let globals = &self.globals;
++        let cursor = self.guest_cursor.get_or_insert_with(|| GuestCursorSurface {
++            surface: globals.compositor.create_surface(&globals.qh, ()),
++            buffer: None,
++            drawn: None,
++            hot: (0, 0),
++        });
++        if cursor.drawn != Some(key) {
++            let scaled = crate::linux::cursor_image::scale_cursor(image, scale as f32)?;
++            // A buffer scale needs dimensions divisible by it; pad with transparency.
++            let pad = |value: u32| value.div_ceil(scale as u32) * scale as u32;
++            let (width, height) = (pad(scaled.width), pad(scaled.height));
++            let mut pixels = vec![0u8; (width * height * 4) as usize];
++            for (row, source) in scaled.bgra.chunks_exact(scaled.width as usize * 4).enumerate() {
++                let start = row * width as usize * 4;
++                pixels[start..start + source.len()].copy_from_slice(source);
++            }
++            let fd = unsafe { libc::memfd_create(c"gpui-guest-cursor".as_ptr(), libc::MFD_CLOEXEC) };
++            if fd < 0 {
++                return None;
++            }
++            let mut file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
++            file.write_all(&pixels).ok()?;
++            let pool = globals.shm.create_pool(file.as_fd(), pixels.len() as i32, &globals.qh, ());
++            let buffer = pool.create_buffer(
++                0,
++                width as i32,
++                height as i32,
++                width as i32 * 4,
++                wl_shm::Format::Argb8888,
++                &globals.qh,
++                (),
++            );
++            pool.destroy();
++            cursor.surface.set_buffer_scale(scale);
++            cursor.surface.attach(Some(&buffer), 0, 0);
++            cursor.surface.damage(0, 0, i32::MAX, i32::MAX);
++            cursor.surface.commit();
++            if let Some(previous) = cursor.buffer.replace(buffer) {
++                previous.destroy();
++            }
++            cursor.hot = (scaled.hot_x as i32 / scale, scaled.hot_y as i32 / scale);
++            cursor.drawn = Some(key);
++        }
++        Some((cursor.surface.clone(), cursor.hot.0, cursor.hot.1))
++    }
++
 +    fn restore_captured_cursor(&mut self, surface: &ObjectId) {
 +        if self.mouse_focused_window.as_ref().is_some_and(|window| window.surface_id() == *surface)
 +        {
@@ -94,21 +246,37 @@
 +                state.mouse_focused_window.as_ref().is_some_and(|w| w.surface_id() == surface.id()),
 +                "pointer is outside this window"
 +            );
-+            let pointer = state.wl_pointer.as_ref().context("seat has no pointer")?;
-+            pointer.set_cursor(
-+                state.serial_tracker.get(SerialKind::MouseEnter).as_raw(),
-+                None,
-+                0,
-+                0,
-+            );
++            state.wl_pointer.as_ref().context("seat has no pointer")?;
 +            state.cursor_style.get_or_insert(CursorStyle::Arrow);
 +            let focused = state.mouse_focused_window.clone();
 +            state.cursor_hidden_window = focused;
 +            state.captures.entry(surface.id()).or_default().hidden = true;
++            let serial = state.serial_tracker.get(SerialKind::MouseEnter).as_raw();
++            state.hide_captured_cursor(serial);
 +        } else if let Some(capture) = state.captures.get_mut(&surface.id())
 +            && std::mem::take(&mut capture.hidden)
 +        {
 +            state.restore_captured_cursor(&surface.id());
++        }
++        Ok(())
++    }
++    pub(super) fn capture_cursor_image(
++        &self,
++        surface: &wl_surface::WlSurface,
++        image: Option<gpui::CursorImage>,
++    ) -> anyhow::Result<()> {
++        let client = self.get_client();
++        let mut state = client.borrow_mut();
++        let capture = state.captures.entry(surface.id()).or_default();
++        capture.image = image;
++        let hidden = capture.hidden;
++        let focused = state
++            .mouse_focused_window
++            .as_ref()
++            .is_some_and(|window| window.surface_id() == surface.id());
++        if hidden && focused {
++            let serial = state.serial_tracker.get(SerialKind::MouseEnter).as_raw();
++            state.hide_captured_cursor(serial);
 +        }
 +        Ok(())
 +    }
@@ -276,7 +444,7 @@
              activation: globals.bind(&qh, 1..=1, ()).ok(),
              compositor: globals
                  .bind(
-@@ -357,7 +364,10 @@
+@@ -357,7 +364,11 @@
      pub refresh_interval: Option<Duration>,
  }
  
@@ -284,10 +452,11 @@
 +
  pub(crate) struct WaylandClientState {
 +    captures: HashMap<ObjectId, WaylandCapture>,
++    guest_cursor: Option<GuestCursorSurface>,
      serial_tracker: SerialTracker,
      globals: Globals,
      pub gpu_context: GpuContext,
-@@ -805,6 +815,7 @@
+@@ -805,6 +816,7 @@
      pub fn drop_window(&self, surface_id: &ObjectId) {
          let client = self.get_client();
          let mut state = client.borrow_mut();
@@ -295,7 +464,7 @@
          let closed_window = state.windows.remove(surface_id).unwrap();
          if let Some(window) = state.mouse_focused_window.take()
              && !window.ptr_eq(&closed_window)
-@@ -843,6 +854,9 @@
+@@ -843,6 +855,9 @@
      }
  
      fn restore_cursor_after_hide(&mut self) {
@@ -305,15 +474,16 @@
          if self.cursor_hidden_window.take().is_none() {
              return;
          }
-@@ -1070,6 +1084,7 @@
+@@ -1070,6 +1085,8 @@
              compositor_gpu,
              wl_seat: seat,
              wl_pointer: None,
 +            captures: HashMap::default(),
++            guest_cursor: None,
              wl_keyboard: None,
              pinch_gesture: None,
              pinch_scale: 1.0,
-@@ -1369,7 +1384,7 @@
+@@ -1369,7 +1386,7 @@
          state.cursor_style = Some(style);
  
          // Don't clobber the invisible cursor; restore reads back from `cursor_style`.
@@ -322,7 +492,7 @@
              return;
          }
  
-@@ -1613,6 +1628,7 @@
+@@ -1613,6 +1630,7 @@
                          log::error!("ignoring wl_seat below the required version");
                          return;
                      };
@@ -330,7 +500,7 @@
                      if let Some(wl_pointer) = state.wl_pointer.take() {
                          wl_pointer.release();
                      }
-@@ -1993,6 +2009,8 @@
+@@ -1993,6 +2011,8 @@
          {
              let client = state.get_client();
              let mut state = client.borrow_mut();
@@ -339,7 +509,7 @@
              if capabilities.contains(wl_seat::Capability::Keyboard) {
                  let keyboard = seat.get_keyboard(qh, ());
  
-@@ -2105,6 +2123,7 @@
+@@ -2105,6 +2125,7 @@
              }
              wl_keyboard::Event::Leave { surface, .. } => {
                  let keyboard_focused_window = get_window(&mut state, &surface.id());
@@ -347,13 +517,13 @@
                  state.keyboard_focused_window = None;
                  state.enter_token.take();
                  // Prevent keyboard events from repeating after opening e.g. a file chooser and closing it quickly
-@@ -2423,7 +2442,10 @@
+@@ -2423,7 +2444,10 @@
                          state.enter_token = None;
                      }
                      state.restore_cursor_after_hide();
 -                    if let Some(style) = state.cursor_style {
 +                    if state.capture_hides_cursor() {
-+                        wl_pointer.set_cursor(serial, None, 0, 0);
++                        state.hide_captured_cursor(serial);
 +                        state.cursor_hidden_window = Some(window.clone());
 +                    } else if let Some(style) = state.cursor_style {
                          if let Some(cursor_shape_device) = &state.cursor_shape_device {
@@ -383,13 +553,17 @@
      pub fn handle(&self) -> AnyWindowHandle {
          self.state.borrow().handle
      }
-@@ -1719,6 +1727,27 @@
+@@ -1719,6 +1727,31 @@
  }
  
  impl PlatformWindow for WaylandWindow {
 +    fn set_cursor_hidden(&mut self, hidden: bool) -> anyhow::Result<()> {
 +        let state = self.0.state.borrow();
 +        state.client.capture_cursor(&state.surface, hidden)
++    }
++    fn set_cursor_image(&mut self, image: Option<gpui::CursorImage>) -> anyhow::Result<()> {
++        let state = self.0.state.borrow();
++        state.client.capture_cursor_image(&state.surface, image)
 +    }
 +    fn lock_pointer(&mut self, lock: bool) -> anyhow::Result<()> {
 +        let state = self.0.state.borrow();
@@ -413,13 +587,19 @@
      }
 --- /dev/null
 +++ b/src/linux/x11/capture.rs
-@@ -0,0 +1,262 @@
+@@ -0,0 +1,401 @@
 +// Additive guest-input APIs. The normal XI2 dispatch path remains unchanged.
 +use x11rb::protocol::xfixes::ConnectionExt as _;
 +
 +#[derive(Default)]
 +struct X11Capture {
 +    hidden: bool,
++    /// Shown instead of nothing while hidden, so the server moves the guest's cursor.
++    image: Option<gpui::CursorImage>,
++    /// The X cursor made from `image`, while it is this window's cursor.
++    image_cursor: Option<xproto::Cursor>,
++    /// Whether this client's XFixes hide is in effect; hide and show must balance.
++    xfixes_hidden: bool,
 +    locked: bool,
 +    shortcuts: bool,
 +    delta: Point<f64>,
@@ -442,11 +622,123 @@
 +            if capture.shortcuts {
 +                let _ = self.xcb_connection.ungrab_keyboard(x11rb::CURRENT_TIME);
 +            }
-+            if capture.hidden {
++            if capture.xfixes_hidden {
 +                let _ = self.xcb_connection.xfixes_show_cursor(window);
++            }
++            if let Some(cursor) = capture.image_cursor {
++                self.restore_style_cursor(window);
++                let _ = self.xcb_connection.free_cursor(cursor);
 +            }
 +            self.xcb_connection.flush().log_err();
 +        }
++    }
++
++    /// Whether `window` currently shows a guest cursor image.
++    fn shows_cursor_image(&self, window: xproto::Window) -> bool {
++        self.captures.get(&window).is_some_and(|capture| capture.image_cursor.is_some())
++    }
++
++    fn restore_style_cursor(&mut self, window: xproto::Window) {
++        let style = self.cursor_styles.get(&window).copied().unwrap_or(CursorStyle::Arrow);
++        if let Some(cursor) = self.get_cursor_icon(style) {
++            let _ = self.xcb_connection.change_window_attributes(
++                window,
++                &ChangeWindowAttributesAux {
++                    cursor: Some(cursor),
++                    ..Default::default()
++                },
++            );
++        }
++    }
++
++    /// Applies a hidden capture's cursor: its guest image when one is set, else
++    /// XFixes hiding.
++    fn apply_hidden_cursor(&mut self, window: xproto::Window) -> anyhow::Result<()> {
++        let image = self.captures.get(&window).and_then(|capture| capture.image.clone());
++        let created = match image {
++            Some(image) => self.create_image_cursor(&image).log_err(),
++            None => None,
++        };
++        let capture = self.captures.entry(window).or_default();
++        let previous = capture.image_cursor.take();
++        let hide = created.is_none();
++        let toggle = capture.xfixes_hidden != hide;
++        capture.xfixes_hidden = hide;
++        capture.image_cursor = created;
++        if toggle {
++            if hide {
++                // XFixes requires version negotiation before HideCursor (v4).
++                let version = self.xcb_connection.xfixes_query_version(4, 0)?.reply()?;
++                anyhow::ensure!(version.major_version >= 4, "XFixes cursor hiding is unsupported");
++                self.xcb_connection.xfixes_hide_cursor(window)?.check()?;
++            } else {
++                self.xcb_connection.xfixes_show_cursor(window)?.check()?;
++            }
++        }
++        if let Some(cursor) = created {
++            self.xcb_connection.change_window_attributes(
++                window,
++                &ChangeWindowAttributesAux {
++                    cursor: Some(cursor),
++                    ..Default::default()
++                },
++            )?;
++        } else if previous.is_some() {
++            self.restore_style_cursor(window);
++        }
++        if let Some(previous) = previous {
++            self.xcb_connection.free_cursor(previous)?;
++        }
++        Ok(())
++    }
++
++    /// An ARGB cursor through XRender, sized for the screen's scale factor.
++    fn create_image_cursor(&self, image: &gpui::CursorImage) -> anyhow::Result<xproto::Cursor> {
++        use x11rb::protocol::render::{self, ConnectionExt as _};
++        let scaled = crate::linux::cursor_image::scale_cursor(image, self.scale_factor)
++            .context("invalid cursor image")?;
++        let connection = &self.xcb_connection;
++        let formats = connection.render_query_pict_formats()?.reply()?;
++        let format = formats
++            .formats
++            .iter()
++            .find(|format| {
++                format.type_ == render::PictType::DIRECT
++                    && format.depth == 32
++                    && format.direct.alpha_shift == 24
++                    && format.direct.alpha_mask == 0xff
++                    && format.direct.red_shift == 16
++                    && format.direct.green_shift == 8
++                    && format.direct.blue_shift == 0
++            })
++            .context("no ARGB32 picture format")?
++            .id;
++        let root = connection.setup().roots[self.x_root_index].root;
++        let (width, height) = (scaled.width as u16, scaled.height as u16);
++        let pixmap = connection.generate_id()?;
++        connection.create_pixmap(32, pixmap, root, width, height)?;
++        let gc = connection.generate_id()?;
++        connection.create_gc(gc, pixmap, &xproto::CreateGCAux::default())?;
++        connection.put_image(
++            xproto::ImageFormat::Z_PIXMAP,
++            pixmap,
++            gc,
++            width,
++            height,
++            0,
++            0,
++            0,
++            32,
++            &scaled.bgra,
++        )?;
++        let picture = connection.generate_id()?;
++        connection.render_create_picture(picture, pixmap, format, &render::CreatePictureAux::default())?;
++        let cursor = connection.generate_id()?;
++        connection.render_create_cursor(cursor, picture, scaled.hot_x as u16, scaled.hot_y as u16)?;
++        connection.render_free_picture(picture)?;
++        connection.free_gc(gc)?;
++        connection.free_pixmap(pixmap)?;
++        Ok(cursor)
 +    }
 +    fn capture_raw_motion(&mut self, event: &xinput::RawMotionEvent) {
 +        let Some(window) = self.keyboard_focused_window else {
@@ -536,16 +828,37 @@
 +            return Ok(());
 +        }
 +        if hidden {
-+            // XFixes requires version negotiation before HideCursor (v4).
-+            let version = state.xcb_connection.xfixes_query_version(4, 0)?.reply()?;
-+            anyhow::ensure!(version.major_version >= 4, "XFixes cursor hiding is unsupported");
-+            state.xcb_connection.xfixes_hide_cursor(window)?.check()?;
-+        } else {
-+            state.xcb_connection.xfixes_show_cursor(window)?.check()?;
++            state.captures.entry(window).or_default().hidden = true;
++            state.apply_hidden_cursor(window)?;
++        } else if let Some(capture) = state.captures.get_mut(&window) {
++            capture.hidden = false;
++            let shown = capture.xfixes_hidden;
++            capture.xfixes_hidden = false;
++            let image_cursor = capture.image_cursor.take();
++            if shown {
++                state.xcb_connection.xfixes_show_cursor(window)?.check()?;
++            }
++            if let Some(cursor) = image_cursor {
++                state.restore_style_cursor(window);
++                state.xcb_connection.free_cursor(cursor)?;
++            }
++            if state.cursor_hidden_window == Some(window) {
++                state.restore_cursor_after_hide();
++            }
 +        }
-+        state.captures.entry(window).or_default().hidden = hidden;
-+        if !hidden && state.cursor_hidden_window == Some(window) {
-+            state.restore_cursor_after_hide();
++        state.xcb_connection.flush()?;
++        Ok(())
++    }
++    pub(super) fn capture_cursor_image(
++        &self,
++        window: xproto::Window,
++        image: Option<gpui::CursorImage>,
++    ) -> anyhow::Result<()> {
++        let mut state = self.0.borrow_mut();
++        let capture = state.captures.entry(window).or_default();
++        capture.image = image;
++        if capture.hidden {
++            state.apply_hidden_cursor(window)?;
 +        }
 +        state.xcb_connection.flush()?;
 +        Ok(())
@@ -750,7 +1063,18 @@
              Event::XinputMotion(event) => {
                  let window = self.get_window(event.event)?;
                  let mut state = self.0.borrow_mut();
-@@ -1804,7 +1826,12 @@
+@@ -1777,7 +1799,9 @@
+         state.cursor_styles.insert(focused_window, style);
+ 
+         // Don't clobber the invisible cursor; restore reads back from `cursor_styles`.
+-        if state.cursor_hidden_window == Some(focused_window) {
++        if state.cursor_hidden_window == Some(focused_window)
++            || state.shows_cursor_image(focused_window)
++        {
+             return;
+         }
+ 
+@@ -1804,7 +1828,12 @@
      }
  
      pub(crate) fn is_cursor_visible(&self) -> bool {
@@ -764,6 +1088,27 @@
      }
  
      pub(crate) fn open_uri(&self, uri: &str) {
+@@ -2192,6 +2221,20 @@
+         let Some(hidden_window) = self.cursor_hidden_window.take() else {
+             return;
+         };
++        if self.shows_cursor_image(hidden_window) {
++            // A captured window's guest cursor stays until the capture ends.
++            if let Some(cursor) = self.captures.get(&hidden_window).and_then(|c| c.image_cursor) {
++                let _ = self.xcb_connection.change_window_attributes(
++                    hidden_window,
++                    &ChangeWindowAttributesAux {
++                        cursor: Some(cursor),
++                        ..Default::default()
++                    },
++                );
++                self.xcb_connection.flush().log_err();
++            }
++            return;
++        }
+         let style = self
+             .cursor_styles
+             .get(&hidden_window)
 --- a/src/linux/x11/window.rs
 +++ b/src/linux/x11/window.rs
 @@ -881,6 +881,9 @@
@@ -776,7 +1121,7 @@
          let mut state = self.0.state.borrow_mut();
  
          if let Some(parent) = state.parent.as_ref() {
-@@ -1385,6 +1388,51 @@
+@@ -1385,6 +1388,60 @@
  }
  
  impl PlatformWindow for X11Window {
@@ -788,6 +1133,15 @@
 +            .get_client()
 +            .ok_or_else(|| anyhow!("X11 connection closed"))?
 +            .capture_cursor(self.0.x_window, hidden)
++    }
++    fn set_cursor_image(&mut self, image: Option<gpui::CursorImage>) -> anyhow::Result<()> {
++        self.0
++            .state
++            .borrow()
++            .client
++            .get_client()
++            .ok_or_else(|| anyhow!("X11 connection closed"))?
++            .capture_cursor_image(self.0.x_window, image)
 +    }
 +    fn lock_pointer(&mut self, lock: bool) -> anyhow::Result<()> {
 +        self.0

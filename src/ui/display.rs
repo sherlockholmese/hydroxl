@@ -4,10 +4,11 @@ use super::primitives::{MENU_MIN_WIDTH, glyph};
 use crate::app::{Job, Workspace};
 use crate::backend::{Action, Connection, DisplayTarget, Machine, State};
 use crate::display::geometry::{GuestViewport, Scaling, guest_resize_target};
+use crate::display::scanout;
 use crate::display::session::{Resize, Session};
 use crate::display::vnc::{self, Endpoint};
 use crate::operations::Operation;
-use crate::theme::{CAPTION_SIZE, Palette};
+use crate::theme::{BODY_SIZE, CAPTION_SIZE, Palette};
 use gpui_kit::assets::IconName as Glyph;
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::spinner::Spinner;
@@ -84,6 +85,8 @@ pub(crate) struct DisplayView {
     session: Option<Arc<Session>>,
     image: Option<TextureId>,
     gpu_image: bool,
+    /// The GPU texture missed a frame, so the next copy must be whole, not just damage.
+    gpu_stale: bool,
     input: crate::display::input::InputCapture,
     generation: u64,
     size: (u32, u32),
@@ -118,6 +121,12 @@ pub(crate) struct DisplayView {
     /// Last host pointer position, where the guest cursor is drawn.
     pointer: Option<Point<Pixels>>,
     cursor: Option<(Arc<RenderImage>, vnc::Cursor)>,
+    /// The guest cursor as the system cursor: which shape and scale the platform shows,
+    /// and that shape's pixels. The compositor moves it with the pointer, so it never
+    /// trails the way an in-window overlay does.
+    system_cursor: Option<(u64, u32)>,
+    system_cursor_pixels: Option<(u64, Arc<[u8]>)>,
+    system_cursor_unsupported: bool,
     cursor_generation: u64,
     /// At most one SPICE upload callback is pending on the platform frame clock.
     frame_scheduled: bool,
@@ -210,6 +219,7 @@ impl DisplayView {
             toolbar_menu_open: false,
             image: None,
             gpu_image: false,
+            gpu_stale: false,
             input: Default::default(),
             generation: u64::MAX,
             size: (0, 0),
@@ -230,6 +240,9 @@ impl DisplayView {
             copy_requested: false,
             pointer: None,
             cursor: None,
+            system_cursor: None,
+            system_cursor_pixels: None,
+            system_cursor_unsupported: false,
             cursor_generation: 0,
             frame_scheduled: false,
             last_preview: None,
@@ -339,6 +352,29 @@ impl DisplayView {
         if frame_clock {
             self.schedule_spice_upload(window, cx);
         }
+        // GPU draws are copied the moment they arrive; the frame loop only presents.
+        {
+            let session = session.clone();
+            cx.spawn_in(window, async move |this, cx| {
+                loop {
+                    scanout::DrawOffered(session.frame()).await;
+                    let current = this.update_in(cx, |this, window, cx| {
+                        let current = this
+                            .session
+                            .as_ref()
+                            .is_some_and(|current| Arc::ptr_eq(current, &session));
+                        if current {
+                            this.copy_gpu_draw(&session, window, cx);
+                        }
+                        current
+                    });
+                    if !matches!(current, Ok(true)) {
+                        break;
+                    }
+                }
+            })
+            .detach();
+        }
         // SPICE uses platform frame opportunities while visible. A slow timer
         // handles hidden-window housekeeping and restarts the frame loop on show.
         // Other transports retain their existing low-latency polling.
@@ -402,23 +438,29 @@ impl DisplayView {
         });
     }
 
-    /// Uploads at most one new frame, freeing the texture it replaces.
-    fn upload(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let Some(session) = self.session.clone() else {
-            return false;
-        };
-        session.request_frame();
+    /// Queues the GPU copy of an offered scanout. The producer is released from the
+    /// copy's completion, not from this frame.
+    fn copy_gpu_draw(&mut self, session: &Session, window: &mut Window, cx: &mut Context<Self>) {
         let draw = session.frame().lock().unwrap_or_else(|e| e.into_inner()).gpu_draw.take();
-        if let Some(draw) = draw {
+        if let Some(scanout::GpuDraw {
+            mut frame,
+            reply,
+        }) = draw
+        {
             if !window.is_visible() {
-                let _ = draw.done.send(true);
-                return true;
+                // Nothing on screen to update; the next visible copy is taken whole.
+                self.gpu_stale = true;
+                reply.finish(true);
+                return;
             }
-            let (width, height) =
-                (draw.frame.extent.width.0 as u32, draw.frame.extent.height.0 as u32);
-            // The transport keeps the guest's buffer reserved until the reply.
-            let copied = unsafe { window.copy_dma_buf(self.image, draw.frame) };
-            match copied {
+            if std::mem::take(&mut self.gpu_stale) {
+                frame.damage = None;
+            }
+            let (width, height) = (frame.extent.width.0 as u32, frame.extent.height.0 as u32);
+            // The producer keeps its buffer reserved until the GPU finishes the copy;
+            // this frame is not held up waiting for it.
+            frame.on_complete = Some(Box::new(move |copied| reply.finish(copied)));
+            match unsafe { window.copy_dma_buf(self.image, frame) } {
                 Ok(Some(texture)) => {
                     if let Some(previous) = self.image.replace(texture)
                         && previous != texture
@@ -428,17 +470,27 @@ impl DisplayView {
                     self.gpu_image = true;
                     self.size = (width, height);
                     self.status = None;
-                    let _ = draw.done.send(true);
                     cx.notify();
                 }
+                // The callback, and with it the reply, was dropped: the producer
+                // hears that the copy failed and reads the frame back instead.
                 result => {
                     if let Err(error) = result {
                         eprintln!("Vulkan DMA-BUF fallback: {error:#}");
                     }
-                    let _ = draw.done.send(false);
+                    self.gpu_stale = true;
                 }
             }
         }
+    }
+
+    /// Uploads at most one new frame, freeing the texture it replaces.
+    fn upload(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(session) = self.session.clone() else {
+            return false;
+        };
+        session.request_frame();
+        self.copy_gpu_draw(&session, window, cx);
         if self.scaling == Scaling::GuestResize && window.is_visible() {
             self.update_guest_resolution(&session);
         }
@@ -723,10 +775,57 @@ impl DisplayView {
         self.pointer = Some(point(px(x), px(y)));
     }
 
+    /// Hands the guest cursor to the platform while input is captured with a free
+    /// pointer. A locked pointer stays put, so that case keeps the in-window overlay.
+    fn sync_system_cursor(&mut self, window: &mut Window) {
+        if self.system_cursor_unsupported {
+            return;
+        }
+        let wanted = if self.captured && !self.input.locked() {
+            self.cursor.as_ref().map(|(_, shape)| shape.clone()).zip(self.viewport())
+        } else {
+            None
+        };
+        let generation = self.cursor_generation;
+        let key = wanted.as_ref().map(|(_, viewport)| (generation, viewport.scale_x.to_bits()));
+        if key == self.system_cursor {
+            return;
+        }
+        let image = wanted.map(|(shape, viewport)| {
+            let bgra = match &self.system_cursor_pixels {
+                Some((cached, pixels)) if *cached == generation => pixels.clone(),
+                _ => {
+                    let pixels: Arc<[u8]> = shape.pixels.clone().into();
+                    self.system_cursor_pixels = Some((generation, pixels.clone()));
+                    pixels
+                }
+            };
+            gpui_kit::CursorImage {
+                width: shape.width,
+                height: shape.height,
+                hot_x: shape.hot_x,
+                hot_y: shape.hot_y,
+                bgra,
+                scale: viewport.scale_x,
+            }
+        });
+        let showing = image.is_some();
+        match window.set_cursor_image(image) {
+            Ok(()) => self.system_cursor = key,
+            Err(error) => {
+                if showing {
+                    eprintln!("Guest cursor as system cursor: {error}");
+                    self.system_cursor_unsupported = true;
+                }
+                self.system_cursor = None;
+            }
+        }
+    }
+
     /// The guest cursor at the host pointer, scaled like the framebuffer. Drawn locally,
     /// so it never trails the pointer.
     fn cursor_overlay(&self) -> Option<AnyElement> {
-        if !self.captured {
+        if !self.captured || self.system_cursor.is_some() {
             return None;
         }
         let (image, shape) = self.cursor.clone()?;
@@ -758,6 +857,9 @@ impl DisplayView {
 
     /// Hands keyboard and pointer back to the host, releasing anything held in the guest.
     fn release(&mut self, window: &mut Window) {
+        if self.system_cursor.take().is_some() {
+            let _ = window.set_cursor_image(None);
+        }
         self.input.release(window);
         if let Some(s) = &self.session {
             s.release_input();
@@ -1249,6 +1351,22 @@ impl DisplayView {
             .gap_1()
             .border_b_1()
             .border_color(p.border)
+            // The machine's name leads, set off from its controls like the other groups.
+            .when_some(self.machine(cx).map(|machine| machine.name), |toolbar, name| {
+                toolbar
+                    .child(
+                        div()
+                            .px_2()
+                            .max_w(px(240.))
+                            .min_w_0()
+                            .flex_shrink(1.)
+                            .truncate()
+                            .text_size(px(BODY_SIZE))
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(name),
+                    )
+                    .child(div().w(px(1.)).h(px(20.)).mx_1().flex_shrink_0().bg(p.border))
+            })
             .when(!on, |t| {
                 t.child(
                     icon(
@@ -1418,6 +1536,7 @@ impl Render for DisplayView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = Palette::get(cx);
         self.device_scale = window.scale_factor();
+        self.sync_system_cursor(window);
         let bounds = self.bounds.clone();
         let (dimensions, scaling) = (self.size, self.scaling);
         let surface = div()
@@ -1496,7 +1615,8 @@ impl Render for DisplayView {
                     }
                     this.send_pointer(e.position);
                 }
-                if this.captured && this.cursor.is_some() {
+                // Only the in-window overlay needs a redraw to follow the pointer.
+                if this.captured && this.cursor.is_some() && this.system_cursor.is_none() {
                     cx.notify();
                 }
             }))

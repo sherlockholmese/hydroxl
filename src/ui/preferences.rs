@@ -162,12 +162,27 @@ impl Workspace {
                         .child(row("VM folder", folder.into_any_element()).items_start()),
                 )
                 .footer(
-                    h_flex().w_full().justify_end().child(
-                        Button::new("close-preferences")
-                            .outline()
-                            .label("Done")
-                            .on_click(|_, window, cx| window.close_dialog(cx)),
-                    ),
+                    h_flex()
+                        .w_full()
+                        .gap_2()
+                        .child({
+                            let weak = weak.clone();
+                            Button::new("open-about").ghost().label("About Hydroxl").on_click(
+                                move |_, window, cx| {
+                                    window.close_dialog(cx);
+                                    let _ = weak.update(cx, |this, cx| {
+                                        this.about(&crate::AboutAction, window, cx)
+                                    });
+                                },
+                            )
+                        })
+                        .child(div().flex_1())
+                        .child(
+                            Button::new("close-preferences")
+                                .outline()
+                                .label("Done")
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        ),
                 )
         });
     }

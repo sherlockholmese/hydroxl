@@ -1,5 +1,6 @@
 use super::{Connection, NewMachine, run, virsh};
 use anyhow::{Context, Result, bail};
+use std::io::Write as _;
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -53,9 +54,17 @@ pub fn create(connection: Connection, spec: &NewMachine) -> Result<()> {
     if virt_type == "kvm" && !Path::new("/dev/kvm").exists() {
         bail!("KVM is unavailable. Enable virtualization or choose Emulate.");
     }
+    let emulator = spec.qemu_build.emulator(&spec.architecture)?;
+    let mut boot = super::qemu::installer_boot(&emulator)?;
     // Resolve host prerequisites before allocating a folder or a new disk.
     let tpm = if spec.os_variant == "win11" {
-        Some(super::tpm::emulator_model(connection, &spec.architecture, virt_type, None)?)
+        Some(super::tpm::emulator_model(
+            connection,
+            &spec.architecture,
+            virt_type,
+            None,
+            Some(emulator.to_str().context("Invalid QEMU path.")?),
+        )?)
     } else {
         None
     };
@@ -137,16 +146,17 @@ pub fn create(connection: Connection, spec: &NewMachine) -> Result<()> {
             None => {
                 args.extend(["--import", "--disk", "device=cdrom,bus=sata"]);
                 if !uefi {
-                    args.extend(["--boot", "cdrom,hd"]);
+                    boot.push_str(",cdrom,hd");
                 }
             }
         }
         // Host passthrough exposes nesting on its own. Windows 11 then turns on
         // virtualization-based security and runs itself nested, which makes it crawl.
-        let cpu_arg = (virt_type == "kvm" && matches!(spec.architecture.as_str(), "x86_64" | "i686"))
-            .then(super::nested_host_feature)
-            .flatten()
-            .map(|feature| format!("host-passthrough,disable={feature}"));
+        let cpu_arg = (virt_type == "kvm"
+            && matches!(spec.architecture.as_str(), "x86_64" | "i686"))
+        .then(super::nested_host_feature)
+        .flatten()
+        .map(|feature| format!("host-passthrough,disable={feature}"));
         if let Some(cpu_arg) = cpu_arg.as_deref() {
             args.extend(["--cpu", cpu_arg]);
         }
@@ -155,9 +165,11 @@ pub fn create(connection: Connection, spec: &NewMachine) -> Result<()> {
             args.extend(["--tpm", tpm_arg]);
         }
         if uefi {
-            args.extend(["--boot", "uefi"]);
+            boot.push_str(",uefi");
         }
+        args.extend(["--boot", &boot]);
         let xml = run("virt-install", &args)?;
+        let xml = spec.qemu_build.configure_xml(&xml)?.unwrap_or(xml);
         fs::write(&xml_path, xml)?;
         registration_attempted = true;
         virsh(connection, &["define", xml_path.to_str().context("Invalid configuration path.")?])?;
@@ -170,7 +182,7 @@ pub fn create(connection: Connection, spec: &NewMachine) -> Result<()> {
     result
 }
 
-pub fn import(connection: Connection, path: &Path) -> Result<()> {
+pub fn import(connection: Connection, path: &Path, qemu_build: super::QemuBuild) -> Result<()> {
     let xml = fs::read_to_string(path).context("Could not read the XML file.")?;
     let doc = roxmltree::Document::parse(&xml).context("Choose a valid libvirt XML file.")?;
     if !doc.root_element().has_tag_name("domain") {
@@ -193,6 +205,12 @@ pub fn import(connection: Connection, path: &Path) -> Result<()> {
             bail!("This machine is already in the library.");
         }
     }
-    virsh(connection, &["define", path.to_str().context("Invalid file path.")?])?;
+    if let Some(updated) = qemu_build.configure_xml(&xml)? {
+        let mut generated = tempfile::Builder::new().suffix(".xml").tempfile()?;
+        generated.write_all(updated.as_bytes())?;
+        virsh(connection, &["define", generated.path().to_str().context("Invalid file path.")?])?;
+    } else {
+        virsh(connection, &["define", path.to_str().context("Invalid file path.")?])?;
+    }
     Ok(())
 }

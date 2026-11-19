@@ -1799,7 +1799,9 @@ impl X11Client {
         state.cursor_styles.insert(focused_window, style);
 
         // Don't clobber the invisible cursor; restore reads back from `cursor_styles`.
-        if state.cursor_hidden_window == Some(focused_window) {
+        if state.cursor_hidden_window == Some(focused_window)
+            || state.shows_cursor_image(focused_window)
+        {
             return;
         }
 
@@ -2219,6 +2221,20 @@ impl X11ClientState {
         let Some(hidden_window) = self.cursor_hidden_window.take() else {
             return;
         };
+        if self.shows_cursor_image(hidden_window) {
+            // A captured window's guest cursor stays until the capture ends.
+            if let Some(cursor) = self.captures.get(&hidden_window).and_then(|c| c.image_cursor) {
+                let _ = self.xcb_connection.change_window_attributes(
+                    hidden_window,
+                    &ChangeWindowAttributesAux {
+                        cursor: Some(cursor),
+                        ..Default::default()
+                    },
+                );
+                self.xcb_connection.flush().log_err();
+            }
+            return;
+        }
         let style = self
             .cursor_styles
             .get(&hidden_window)

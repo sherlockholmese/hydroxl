@@ -328,9 +328,8 @@ fn keys(c: Connection, id: &str, chords: &[&[&str]]) -> Result<()> {
 pub(super) fn type_text(c: Connection, id: &str, text: &str) -> Result<()> {
     let mut chords: Vec<Vec<&'static str>> = Vec::new();
     for ch in text.chars() {
-        let (key, shift) = key_for(ch).with_context(|| {
-            format!("Hydroxl cannot type “{ch}”. Copy the command instead.")
-        })?;
+        let (key, shift) = key_for(ch)
+            .with_context(|| format!("Hydroxl cannot type “{ch}”. Copy the command instead."))?;
         let mut chord = Vec::with_capacity(2);
         if shift {
             chord.push("KEY_LEFTSHIFT");

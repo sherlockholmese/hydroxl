@@ -28,6 +28,7 @@ pub struct Details {
     pub disk_sizes: Vec<(String, u64, u64)>,
     /// Guest IP addresses, when the guest is running and reports them.
     pub addresses: Vec<String>,
+    pub neptune_ready: bool,
 }
 
 impl Drop for Details {
@@ -74,6 +75,8 @@ pub enum Operation {
         bus: String,
     },
     GuestTools(Option<String>),
+    TritonDriver,
+    SwitchToBundledQemu,
     System {
         cpu: Option<String>,
         machine_type: String,
@@ -261,6 +264,7 @@ impl Details {
             networks: vec!["default".into()],
             bridges: vec!["br0".into()],
             disk_sizes: vec![("vda".into(), 64 << 30, 18_700_000_000)],
+            neptune_ready: windows,
             addresses: if machine.state == crate::backend::State::Running {
                 vec!["192.168.122.47".into()]
             } else {
@@ -323,6 +327,8 @@ impl Operation {
                 ..
             } => "CD drive added".into(),
             Self::GuestTools(_) => "Guest tools inserted".into(),
+            Self::TritonDriver => "Triton driver disc mounted".into(),
+            Self::SwitchToBundledQemu => "Switched to bundled Neptune QEMU".into(),
             Self::System {
                 ..
             } => "System settings saved".into(),

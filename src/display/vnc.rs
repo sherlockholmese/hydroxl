@@ -98,6 +98,8 @@ pub struct Framebuffer {
     /// Incremented each time the guest announces new clipboard text.
     pub guest_clipboard: u64,
     pub(crate) gpu_draw: Option<super::scanout::GpuDraw>,
+    /// Wakes the UI the moment a GPU draw is offered, instead of at its next vsync.
+    pub(crate) draw_waker: Option<std::task::Waker>,
     pub(crate) preview_requested: bool,
     pub(crate) thumbnail: Option<image::RgbaImage>,
 }

@@ -43,6 +43,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::create))
             .on_action(cx.listener(Self::refresh))
             .on_action(cx.listener(Self::preferences))
+            .on_action(cx.listener(Self::about))
             .on_action(|_: &QuitAction, _, cx| cx.quit())
             .child(workspace)
     }

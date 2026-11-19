@@ -24,9 +24,7 @@ mod usb;
 use crate::backend::{Connection, Machine};
 use anyhow::Result;
 pub use architecture::available as available_architectures;
-pub use guest::{
-    GuestOs, GuestSetup, ShareDriver, WINDOWS_COMMAND, linux_command,
-};
+pub use guest::{GuestOs, GuestSetup, ShareDriver, WINDOWS_COMMAND, linux_command};
 pub use inspect::{details, has_agent_channel};
 pub use platform::{NicChange, Platform, log_path, open_path, random_mac, read_log};
 pub use types::{Details, Device, Operation, Snapshot};
@@ -73,6 +71,8 @@ pub fn execute(
             bus,
         } => media::apply_add_cdrom(c, machine, target, bus),
         Operation::GuestTools(target) => media::apply_guest_tools(c, machine, target),
+        Operation::TritonDriver => media::apply_triton_driver(c, machine),
+        Operation::SwitchToBundledQemu => crate::backend::qemu::switch_to_bundled(c, &machine.id),
         Operation::System {
             cpu,
             machine_type,

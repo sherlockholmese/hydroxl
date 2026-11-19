@@ -51,6 +51,12 @@ pub(super) fn apply(c: Connection, machine: &Machine, arch: String) -> Result<()
     editable(c, id)?;
     let xml = backend::virsh(c, &["dumpxml", id, "--inactive"])?;
     let updated = retarget(&xml, &arch, kvm_available(&arch))?;
+    let build = if machine.qemu_backend == backend::QemuBackend::System {
+        backend::QemuBuild::System
+    } else {
+        backend::QemuBuild::Bundled
+    };
+    let updated = build.configure_xml(&updated)?.unwrap_or(updated);
     temporary_xml(&updated, |path| backend::virsh(c, &["define", path]).map(|_| ())).context(
         "libvirt could not use this architecture. Check that its QEMU emulator is installed.",
     )

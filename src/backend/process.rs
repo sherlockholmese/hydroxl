@@ -113,7 +113,12 @@ fn run_inner(
     progress: Option<Meter>,
     input: Option<String>,
 ) -> Result<String> {
-    let mut child = Command::new(program)
+    let executable = if program == "qemu-img" {
+        super::qemu::image_tool()?
+    } else {
+        std::path::PathBuf::from(program)
+    };
+    let mut child = Command::new(executable)
         .args(args)
         .env("LC_ALL", "C")
         .stdin(if input.is_some() {

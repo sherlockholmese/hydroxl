@@ -1634,6 +1634,7 @@ fn default_bounds(display_id: Option<DisplayId>, cx: &mut App) -> WindowBounds {
 }
 
 mod input_capture;
+pub use input_capture::CursorImage;
 mod texture;
 #[cfg(target_os = "linux")]
 pub use texture::DmaBufFrame;

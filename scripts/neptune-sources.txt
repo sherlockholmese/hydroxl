@@ -1,0 +1,20 @@
+# Filename, SHA-256, and source URL
+qemu-release.tar.xz 5a8289c7940dc77d3873c81a6c29ba3afe1446fc9d36e77fa1658cdbecb84b22 https://download.qemu.org/qemu-11.1.3.tar.xz
+virgl-nov-src.tar.gz 9019a8461f12c0e2c6d33d83e16cc47da759ea66175bb1e01232e84044b42231 https://codeload.github.com/utmapp/virglrenderer/tar.gz/dd0652b13e589c4c124ea79123a3adcd85173f4f
+dxvk-src.tar.gz add7e3f2a603e6e315db314365ca78397bb3682fe979ef733d32a926071634d5 https://codeload.github.com/osy/dxvk/tar.gz/389d26b360b0080f4ffe816779960745434aef6a
+vkd3d-src.tar.gz aecc9f0322f6e33f685efa8df45f6bbe2cf3d794f4ebe5ad130eb550e904f151 https://codeload.github.com/osy/vkd3d-proton/tar.gz/a8b7cd423d85ff2759a395fd12aae9f0bf123dcc
+directx-native-src.tar.gz da4517d5c31465a5ec03d4c679371da178ef010cb38655dac5e1d7e71d201630 https://codeload.github.com/osy/directx-native/tar.gz/7258be1c56cdbf1e55c56b1bc4a866169c8ca0da
+directx-native-nov-src.tar.gz 628bc8bf1a3d6ccf50c629788ecc9c64ff1e77271f54e285f5fd3c47f81369e4 https://codeload.github.com/osy/directx-native/tar.gz/942bd55dc51c06ec6b905bbf64ebab8e913aed43
+dxvk-directx-src.tar.gz 9c1b8bbfd2d6c758fac4d93c2808a46bc1eee429fe656b4f21b29e02615aa8aa https://codeload.github.com/Joshua-Ashton/mingw-directx-headers/tar.gz/9df86f2341616ef1888ae59919feaa6d4fad693d
+dxvk-spirv-src.tar.gz 1b220e3eec1714f0451b0e3652979bd280edf10893f617837b88e6359a804ded https://codeload.github.com/KhronosGroup/SPIRV-Headers/tar.gz/04f10f650d514df88b76d25e83db360142c7b174
+dxvk-vulkan-src.tar.gz 76d4353587a983b2c77bbcfa86e32f8053e1c0dbc796c4469094f61322c1b669 https://codeload.github.com/KhronosGroup/Vulkan-Headers/tar.gz/5d94bb4dcc968cccce1f601324fcaf3eda92a52b
+dxbc-spirv-src.tar.gz 54daacc42e30fdeae52d491c32c6b67de2c547e324106ce1227533f512fb7e3f https://codeload.github.com/doitsujin/dxbc-spirv/tar.gz/0e79a703db8b23004c77dbabacf25ed2d41f0bd9
+display-info-src.tar.gz c83c3e600f90a3ac98932e9259de62ad8ad3a65dd5efb1d2abcb1e4d1c8f494a https://codeload.github.com/doitsujin/libdisplay-info/tar.gz/275e6459c7ab1ddd4b125f28d0440716e4888078
+vkd3d-spirv-src.tar.gz 028424e4934f2ed8567319939e79d0a87e529ac7c504501b8b406f98598bdadd https://codeload.github.com/KhronosGroup/SPIRV-Headers/tar.gz/f88a2d766840fc825af1fc065977953ba1fa4a91
+vkd3d-vulkan-src.tar.gz e397f61124206e5da06094facc7b004789f539e8bd8bdd61dfaa31ec33464ffc https://codeload.github.com/KhronosGroup/Vulkan-Headers/tar.gz/0e9de566b7d4051c5cc1b762e242c46565956bdf
+dxil-spirv-src.tar.gz 38777fed4d8e94544cb0a676d607a772c387b677a60e4fb00209bce482160cd4 https://codeload.github.com/HansKristian-Work/dxil-spirv/tar.gz/7ecda135de740f4db016c2bbdf8b021ce6b0bebd
+dxil-spirv-headers.tar.gz e62af3ae847d3dd4b4cf87ee70a3180bd527594c9f18c20f7434224a2ab20139 https://codeload.github.com/KhronosGroup/SPIRV-Headers/tar.gz/c63848ecf2200425511319fd8bf2c17b751e501e
+dxil-dxbc-src.tar.gz f2c816e9912ccb0f5d40874660b0a829f8091b046e336765b22fcd2de7f0b627 https://codeload.github.com/doitsujin/dxbc-spirv/tar.gz/d5b06435fd84843d4c9ee7b3b42d2f3b7b8e3f1a
+dxbc-spirv-headers.tar.gz 5b6f38b430f1c68c7395c570053403da14eb4cecc7fcb4040e7a5248c2f63874 https://codeload.github.com/KhronosGroup/SPIRV-Headers/tar.gz/c8ad050fcb29e42a2f57d9f59e97488f465c436d
+triton-v06-x64.zip 0e7aa5d17daeba5a8c2d0859c2651e8146fefe358680ca4686a747ae8afdb717 https://github.com/utmapp/viogpu-wddm/releases/download/v0.6/viogpu3d-x64-signed.zip
+triton-v06-arm64.zip 723131a1d0a8b7f01037b7efe3b6ac7b90f034734460885fba0edd7d8c75425f https://github.com/utmapp/viogpu-wddm/releases/download/v0.6/viogpu3d-arm64x-signed.zip
