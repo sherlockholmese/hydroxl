@@ -76,7 +76,7 @@ jobs:
             liblzo2-dev libaio-dev liburing-dev libnuma-dev libcurl4-gnutls-dev \
             libepoxy-dev libdrm-dev libgbm-dev libegl-dev libvulkan-dev libx11-dev \
             libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
-            libfontconfig-dev libfreetype-dev libbz2-dev zlib1g-dev libssl-dev
+            libfontconfig-dev libfreetype-dev libbz2-dev zlib1g-dev libssl-dev wine64-tools
       - name: Install Rust
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
@@ -108,7 +108,7 @@ jobs:
       - name: Install build dependencies
         run: |
           dnf install -y \
-            curl git gcc gcc-c++ make pkgconf-pkg-config meson ninja-build python3 python3-pyyaml \
+            curl git patch gcc gcc-c++ make pkgconf-pkg-config meson ninja-build python3 python3-pyyaml \
             glslang xorriso unzip clang clang-devel \
             glib2-devel pixman-devel libfdt-devel libslirp-devel spice-server-devel \
             spice-protocol usbredir-devel libusb1-devel systemd-devel libcap-ng-devel \
@@ -117,7 +117,7 @@ jobs:
             numactl-devel libcurl-devel libepoxy-devel libdrm-devel mesa-libgbm-devel \
             mesa-libEGL-devel vulkan-loader-devel vulkan-headers libX11-devel libxcb-devel \
             libxkbcommon-devel libxkbcommon-x11-devel wayland-devel fontconfig-devel \
-            freetype-devel bzip2-devel zlib-devel openssl-devel
+            freetype-devel bzip2-devel zlib-devel openssl-devel wine-devel
       - name: Install Rust
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
