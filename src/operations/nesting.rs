@@ -1,21 +1,15 @@
 //! Expose the host's virtualization extensions to an x86 KVM guest.
 use super::support::{append_child, editable, temporary_xml};
 use crate::backend::{self, Connection, Machine};
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 
 pub(super) fn host_feature(machine: &Machine) -> Result<&'static str> {
     ensure!(
         matches!(machine.arch.as_str(), "x86_64" | "i686") && machine.acceleration == "KVM",
         "Nested virtualization requires an x86 KVM guest."
     );
-    for (module, feature) in [("kvm_intel", "vmx"), ("kvm_amd", "svm")] {
-        let parameter = format!("/sys/module/{module}/parameters/nested");
-        if std::fs::read_to_string(parameter).is_ok_and(|value| matches!(value.trim(), "Y" | "1")) {
-            return Ok(feature);
-        }
-    }
-    bail!(
-        "Nested virtualization is disabled on the host. Enable nesting in the host KVM module and retry."
+    backend::nested_host_feature().context(
+        "Nested virtualization is disabled on the host. Enable nesting in the host KVM module and retry.",
     )
 }
 

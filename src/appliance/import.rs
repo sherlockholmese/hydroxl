@@ -32,6 +32,7 @@ pub fn import(
     let parent = spec.location.canonicalize().context("Choose an existing destination folder.")?;
     let folder = parent.join(format!("appliance-{stamp}"));
     fs::create_dir(&folder)?;
+    crate::backend::disable_cow(&folder);
     let staging = folder.join("source");
     fs::create_dir(&staging)?;
     let mut registration_attempted = false;

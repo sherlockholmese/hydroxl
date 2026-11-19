@@ -4,6 +4,17 @@ use std::{
     fs,
     time::{SystemTime, UNIX_EPOCH},
 };
+/// The virtualization extension a KVM guest can be given ("vmx" or "svm"), when the
+/// host module allows nesting.
+pub fn nested_host_feature() -> Option<&'static str> {
+    [("kvm_intel", "vmx"), ("kvm_amd", "svm")].into_iter().find_map(|(module, feature)| {
+        let parameter = format!("/sys/module/{module}/parameters/nested");
+        fs::read_to_string(parameter)
+            .is_ok_and(|value| matches!(value.trim(), "Y" | "1"))
+            .then_some(feature)
+    })
+}
+
 /// Guest CPU layout. The vCPU count is the product of the three.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Topology {

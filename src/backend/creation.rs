@@ -15,6 +15,15 @@ pub(crate) fn data_dir() -> Result<PathBuf> {
     Ok(path)
 }
 
+/// Turns off copy-on-write for files later created in `folder`. On btrfs, a CoW disk
+/// image fragments with every guest write and the guest stalls on I/O. Other file
+/// systems reject the flag, which is harmless.
+pub fn disable_cow(folder: &Path) {
+    if let Some(path) = folder.to_str() {
+        let _ = run("chattr", &["+C", path]);
+    }
+}
+
 /// Default parent folder for new machines; falls back to the home folder when the data
 /// folder cannot be created.
 pub fn machines_dir() -> PathBuf {
@@ -68,6 +77,7 @@ pub fn create(connection: Connection, spec: &NewMachine) -> Result<()> {
         folder = spec.location.join(format!("{slug}-{stamp}"));
     }
     fs::create_dir(&folder).context("Could not create the machine folder.")?;
+    disable_cow(&folder);
     let disk = spec.existing_disk.clone().unwrap_or_else(|| folder.join("disk.qcow2"));
     let xml_path = folder.join("machine.xml");
     let mut registration_attempted = false;
@@ -130,6 +140,15 @@ pub fn create(connection: Connection, spec: &NewMachine) -> Result<()> {
                     args.extend(["--boot", "cdrom,hd"]);
                 }
             }
+        }
+        // Host passthrough exposes nesting on its own. Windows 11 then turns on
+        // virtualization-based security and runs itself nested, which makes it crawl.
+        let cpu_arg = (virt_type == "kvm" && matches!(spec.architecture.as_str(), "x86_64" | "i686"))
+            .then(super::nested_host_feature)
+            .flatten()
+            .map(|feature| format!("host-passthrough,disable={feature}"));
+        if let Some(cpu_arg) = cpu_arg.as_deref() {
+            args.extend(["--cpu", cpu_arg]);
         }
         let tpm_arg = tpm.map(|model| format!("emulator,model={model},version=2.0"));
         if let Some(tpm_arg) = tpm_arg.as_deref() {

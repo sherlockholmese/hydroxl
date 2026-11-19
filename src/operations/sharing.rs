@@ -52,13 +52,23 @@ pub(super) fn apply_share(
 fn shared_memory(c: Connection, id: &str) -> Result<()> {
     editable(c, id)?;
     let xml = backend::virsh(c, &["dumpxml", id, "--inactive"])?;
-    let doc = roxmltree::Document::parse(&xml)?;
+    match with_shared_memory(&xml)? {
+        Some(updated) => {
+            temporary_xml(&updated, |path| backend::virsh(c, &["define", path]).map(|_| ()))
+        }
+        None => Ok(()),
+    }
+}
+
+/// The domain with shareable RAM, or `None` when it already has it.
+pub(super) fn with_shared_memory(xml: &str) -> Result<Option<String>> {
+    let doc = roxmltree::Document::parse(xml)?;
     let backing = doc.root_element().children().find(|n| n.has_tag_name("memoryBacking"));
     let shared = backing.is_some_and(|b| {
         b.children().any(|n| n.has_tag_name("access") && n.attribute("mode") == Some("shared"))
     });
     if shared {
-        return Ok(());
+        return Ok(None);
     }
     let updated = match backing {
         Some(node) => {
@@ -69,7 +79,7 @@ fn shared_memory(c: Connection, id: &str) -> Result<()> {
             }
             inner.push_str("<access mode='shared'/>");
             let text = &xml[node.range()];
-            let mut result = xml.clone();
+            let mut result = xml.to_owned();
             if text.ends_with("/>") {
                 result.replace_range(
                     node.range(),
@@ -82,10 +92,10 @@ fn shared_memory(c: Connection, id: &str) -> Result<()> {
             result
         }
         None => append_child(
-            &xml,
+            xml,
             "domain",
             "<memoryBacking><source type='memfd'/><access mode='shared'/></memoryBacking>",
         )?,
     };
-    temporary_xml(&updated, |path| backend::virsh(c, &["define", path]).map(|_| ()))
+    Ok(Some(updated))
 }

@@ -1,6 +1,81 @@
 use super::support::{append_child, editable, replace_child, temporary_xml};
+use super::{GuestOs, sharing::with_shared_memory};
 use crate::backend::{self, Connection, Machine};
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
+
+const QEMU_NS: &str = "http://libvirt.org/schemas/domain/qemu/1.0";
+/// libvirt's alias for the first video device, which carries the 3D renderer.
+const VIDEO_ALIAS: &str = "video0";
+
+/// Replaces the QEMU device properties Hydroxl sets on the primary video device.
+/// Other overrides and command-line arguments are left alone.
+pub(super) fn set_video_properties(xml: &str, properties: &[(&str, &str, String)]) -> Result<String> {
+    let doc = roxmltree::Document::parse(xml)?;
+    let root = doc.root_element();
+    let prefix = root.lookup_prefix(QEMU_NS).unwrap_or("qemu").to_owned();
+    let is = |n: &roxmltree::Node, name: &str| {
+        n.is_element() && n.tag_name().namespace() == Some(QEMU_NS) && n.tag_name().name() == name
+    };
+    let overrides = root.children().find(|n| is(n, "override"));
+    let ours = overrides.and_then(|o| {
+        o.children().find(|n| is(n, "device") && n.attribute("alias") == Some(VIDEO_ALIAS))
+    });
+    let device = (!properties.is_empty()).then(|| {
+        let props: String = properties
+            .iter()
+            .map(|(name, kind, value)| {
+                format!("<{prefix}:property name='{name}' type='{kind}' value='{value}'/>")
+            })
+            .collect();
+        format!(
+            "<{prefix}:device alias='{VIDEO_ALIAS}'><{prefix}:frontend>{props}</{prefix}:frontend></{prefix}:device>"
+        )
+    });
+    let mut result = xml.to_owned();
+    match (overrides, ours) {
+        (Some(o), Some(d)) => {
+            let alone = o.children().filter(|n| n.is_element()).count() == 1;
+            match (&device, alone) {
+                (Some(device), _) => result.replace_range(d.range(), device),
+                (None, true) => result.replace_range(o.range(), ""),
+                (None, false) => result.replace_range(d.range(), ""),
+            }
+        }
+        (Some(o), None) => {
+            if let Some(device) = &device {
+                let close = format!("</{prefix}:override>");
+                let at = if xml[o.range()].ends_with(&close) {
+                    o.range().end - close.len()
+                } else {
+                    // Self-closing override.
+                    result.replace_range(
+                        o.range(),
+                        &format!("<{prefix}:override>{device}</{prefix}:override>"),
+                    );
+                    return Ok(result);
+                };
+                result.insert_str(at, device);
+            }
+        }
+        (None, _) => {
+            let Some(device) = &device else {
+                return Ok(result);
+            };
+            let at = root.range().end - "</domain>".len();
+            ensure_ends_with_domain(xml, root.range())?;
+            result.insert_str(at, &format!("<{prefix}:override>{device}</{prefix}:override>"));
+            if root.lookup_namespace_uri(Some(&prefix)) != Some(QEMU_NS) {
+                let open = root.range().start + "<domain".len();
+                result.insert_str(open, &format!(" xmlns:{prefix}='{QEMU_NS}'"));
+            }
+        }
+    }
+    Ok(result)
+}
+
+fn ensure_ends_with_domain(xml: &str, range: std::ops::Range<usize>) -> Result<()> {
+    xml[range].ends_with("</domain>").then_some(()).context("Invalid domain.")
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn apply_display(
@@ -26,6 +101,13 @@ pub(super) fn apply_display(
     if accel3d && model != "virtio" {
         bail!("Choose VirtIO for 3D acceleration.");
     }
+    let gpu = backend::gpu_features(&machine.arch);
+    // Windows draws nothing over 3D VirtIO without viogpu3d, whose Direct3D path
+    // needs QEMU's Neptune renderer.
+    if accel3d && GuestOs::of(machine) == GuestOs::Windows && !gpu.neptune {
+        bail!("Windows 3D acceleration needs QEMU with Neptune support.");
+    }
+    let blob = accel3d && (gpu.venus || gpu.neptune);
     let mut xml = backend::virsh(c, &["dumpxml", id, "--inactive"])?;
     let doc = roxmltree::Document::parse(&xml)?;
     let dbus = doc
@@ -40,9 +122,14 @@ pub(super) fn apply_display(
         String::new()
     };
     let video = format!(
-        "<video><model type='{}' heads='{}'{vram} primary='yes'>{}</model></video>",
+        "<video><model type='{}' heads='{}'{vram}{} primary='yes'>{}</model></video>",
         model,
         heads,
+        if blob {
+            " blob='on'"
+        } else {
+            ""
+        },
         if accel3d {
             "<acceleration accel3d='yes'/>"
         } else {
@@ -50,6 +137,21 @@ pub(super) fn apply_display(
         }
     );
     xml = replace_child(&xml, "devices", "video", &video)?;
+    let mut properties = Vec::new();
+    if blob {
+        properties.push(("hostmem", "unsigned", backend::HOSTMEM_BYTES.to_string()));
+        if gpu.venus {
+            properties.push(("venus", "bool", "true".to_owned()));
+        }
+        if gpu.neptune {
+            properties.push(("neptune", "bool", "true".to_owned()));
+        }
+        // Blob resources live in guest RAM that the renderer maps.
+        if let Some(shared) = with_shared_memory(&xml)? {
+            xml = shared;
+        }
+    }
+    xml = set_video_properties(&xml, &properties)?;
     let graphics = format!(
         "<graphics type='spice' autoport='yes'><listen type='none'/><clipboard copypaste='{}'/>{}</graphics>",
         if clipboard {
@@ -106,4 +208,47 @@ pub(super) fn apply_display(
     }
     temporary_xml(&xml, |path| backend::virsh(c, &["define", path]).map(|_| ()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const DOMAIN: &str = "<domain type='kvm'><name>w</name><devices/></domain>";
+
+    fn props() -> Vec<(&'static str, &'static str, String)> {
+        vec![("venus", "bool", "true".into()), ("hostmem", "unsigned", "8589934592".into())]
+    }
+
+    #[test]
+    fn adds_namespace_and_override() {
+        let xml = set_video_properties(DOMAIN, &props()).unwrap();
+        let doc = roxmltree::Document::parse(&xml).unwrap();
+        assert_eq!(doc.root_element().lookup_namespace_uri(Some("qemu")), Some(QEMU_NS));
+        assert!(xml.contains(
+            "<qemu:override><qemu:device alias='video0'><qemu:frontend>\
+             <qemu:property name='venus' type='bool' value='true'/>"
+        ));
+        // Applying again replaces instead of duplicating.
+        let again = set_video_properties(&xml, &props()).unwrap();
+        assert_eq!(again.matches("alias='video0'").count(), 1);
+    }
+
+    #[test]
+    fn clearing_keeps_foreign_overrides() {
+        let xml = set_video_properties(DOMAIN, &props()).unwrap();
+        assert!(!set_video_properties(&xml, &[]).unwrap().contains("override"));
+        let foreign = xml.replace(
+            "</qemu:override>",
+            "<qemu:device alias='net0'><qemu:frontend/></qemu:device></qemu:override>",
+        );
+        let cleared = set_video_properties(&foreign, &[]).unwrap();
+        assert!(cleared.contains("alias='net0'") && !cleared.contains("alias='video0'"));
+        roxmltree::Document::parse(&cleared).unwrap();
+    }
+
+    #[test]
+    fn clearing_without_override_is_a_no_op() {
+        assert_eq!(set_video_properties(DOMAIN, &[]).unwrap(), DOMAIN);
+    }
 }

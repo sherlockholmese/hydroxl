@@ -29,6 +29,17 @@ pub struct NicChange {
     pub isolated: bool,
 }
 
+/// The enlightenments virt-install picks for current Windows. Without `synic`/`stimer`
+/// Windows falls back to emulated PIT/RTC ticks and stays busy while idle.
+pub(crate) const HYPERV: &str = "<hyperv mode='custom'><relaxed state='on'/><vapic state='on'/>\
+    <spinlocks state='on' retries='8191'/><vpindex state='on'/><runtime state='on'/>\
+    <synic state='on'/><stimer state='on'/><frequencies state='on'/><tlbflush state='on'/>\
+    <ipi state='on'/></hyperv>";
+
+const WINDOWS_TIMERS: &str = "<timer name='rtc' tickpolicy='catchup'/>\
+    <timer name='pit' tickpolicy='delay'/><timer name='hpet' present='no'/>\
+    <timer name='hypervclock' present='yes'/>";
+
 fn define(c: Connection, xml: &str) -> Result<()> {
     temporary_xml(xml, |path| backend::virsh(c, &["define", path]).map(|_| ()))
 }
@@ -103,10 +114,12 @@ pub(super) fn apply_platform(c: Connection, machine: &Machine, p: Platform) -> R
     }
     edits.push((devices, add));
 
-    remove(&mut edits, &|n| n.has_tag_name("hyperv"));
-    if p.hyperv {
-        let hyperv = "<hyperv mode='custom'><relaxed state='on'/><vapic state='on'/>\
-                      <spinlocks state='on' retries='8191'/></hyperv>";
+    // An existing block is kept as is so unrelated saves never strip enlightenments.
+    let has_hyperv = doc.descendants().any(|n| n.has_tag_name("hyperv"));
+    if !p.hyperv {
+        remove(&mut edits, &|n| n.has_tag_name("hyperv"));
+    } else if !has_hyperv {
+        let hyperv = HYPERV;
         match before_close(&xml, &doc, "features") {
             Some(at) => edits.push((at, hyperv.into())),
             None => match doc.descendants().find(|n| n.has_tag_name("features")) {
@@ -133,11 +146,16 @@ pub(super) fn apply_platform(c: Connection, machine: &Machine, p: Platform) -> R
             let inner: String =
                 clock.children().filter(|c| c.is_element()).map(|c| &xml[c.range()]).collect();
             let _ = self_closing;
+            let mut inner = inner;
+            if p.hyperv && !inner.contains("'hypervclock'") && !inner.contains("\"hypervclock\"") {
+                inner += "<timer name='hypervclock' present='yes'/>";
+            }
             edits.push((clock.range(), format!("<clock offset='{offset}'>{inner}</clock>")));
         }
         None => {
             let end = before_close(&xml, &doc, "domain").context("Invalid domain.")?;
-            edits.push((end, format!("<clock offset='{offset}'/>")));
+            let timers = if p.hyperv { WINDOWS_TIMERS } else { "" };
+            edits.push((end, format!("<clock offset='{offset}'>{timers}</clock>")));
         }
     }
     drop(doc);
