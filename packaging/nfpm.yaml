@@ -1,5 +1,5 @@
 # Debian and RPM packages from the tree packaging/build-release.sh stages.
-# nfpm expands ${VERSION} and ${STAGE} from the environment.
+# nfpm expands ${VERSION} from the environment; run it from the repository root.
 name: hydroxl
 arch: amd64
 platform: linux
@@ -17,19 +17,19 @@ license: MIT and Apache-2.0 and OFL-1.1 and GPL-2.0-only and LGPL-2.1-or-later
 
 # Listed by path so the package never claims system directories like /usr/bin.
 contents:
-  - src: ${STAGE}/usr/bin/hydroxl
+  - src: target/stage/usr/bin/hydroxl
     dst: /usr/bin/hydroxl
-  - src: ${STAGE}/usr/lib/hydroxl
+  - src: target/stage/usr/lib/hydroxl
     dst: /usr/lib/hydroxl
     type: tree
-  - src: ${STAGE}/usr/share/applications/dev.hydroxl.Hydroxl.desktop
+  - src: target/stage/usr/share/applications/dev.hydroxl.Hydroxl.desktop
     dst: /usr/share/applications/dev.hydroxl.Hydroxl.desktop
-  - src: ${STAGE}/usr/share/icons/hicolor/scalable/apps/dev.hydroxl.Hydroxl.svg
+  - src: target/stage/usr/share/icons/hicolor/scalable/apps/dev.hydroxl.Hydroxl.svg
     dst: /usr/share/icons/hicolor/scalable/apps/dev.hydroxl.Hydroxl.svg
-  - src: ${STAGE}/usr/share/licenses/hydroxl
+  - src: target/stage/usr/share/licenses/hydroxl
     dst: /usr/share/licenses/hydroxl
     type: tree
-  - src: ${STAGE}/usr/share/qemu/firmware/*-hydroxl-*.json
+  - src: target/stage/usr/share/qemu/firmware/*-hydroxl-*.json
     dst: /usr/share/qemu/firmware/
 
 overrides:

@@ -122,7 +122,9 @@ meson_build dxvk -Dnative_headless=true -Dnative_sdl2=disabled -Dnative_sdl3=dis
     -Dnative_glfw=disabled -Db_ndebug=true -Dcpp_args=-U_GLIBCXX_ASSERTIONS \
     -Dc_args=-U_GLIBCXX_ASSERTIONS "-Dcpp_link_args=$rpath"
 meson_build vkd3d "-Dc_link_args=$rpath" "-Dcpp_link_args=$rpath"
-meson_build virglrenderer -Dneptune=true -Dvenus=true -Dtests=false -Dvtest=false "-Dc_link_args=$rpath"
+# GCC 14 rejects a declaration after a label in vrend_renderer.c under -Werror=pedantic.
+meson_build virglrenderer -Dneptune=true -Dvenus=true -Dtests=false -Dvtest=false \
+    -Dc_args=-Wno-error=pedantic "-Dc_link_args=$rpath"
 ln -sfn libdxvk_d3d11.so "$lib/libd3d11.so"
 ln -sfn libdxvk_dxgi.so "$lib/libdxgi.so"
 

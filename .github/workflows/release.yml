@@ -94,7 +94,7 @@ jobs:
           VERSION: ${{ needs.version.outputs.version }}
         run: |
           mkdir -p dist
-          STAGE="$PWD/target/stage" nfpm package --config packaging/nfpm.yaml --packager deb --target dist/
+          nfpm package --config packaging/nfpm.yaml --packager deb --target dist/
       - uses: actions/upload-artifact@v4
         with:
           name: deb
@@ -136,7 +136,7 @@ jobs:
           VERSION: ${{ needs.version.outputs.version }}
         run: |
           mkdir -p dist
-          STAGE="$PWD/target/stage" nfpm package --config packaging/nfpm.yaml --packager rpm --target dist/
+          nfpm package --config packaging/nfpm.yaml --packager rpm --target dist/
       - uses: actions/upload-artifact@v4
         with:
           name: rpm
