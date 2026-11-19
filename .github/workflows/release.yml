@@ -69,6 +69,7 @@ jobs:
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             ca-certificates curl git build-essential pkg-config meson ninja-build \
             python3 python3-venv python3-yaml glslang-tools xorriso unzip clang libclang-dev \
+            python3-setuptools python3-wheel \
             libglib2.0-dev libpixman-1-dev libfdt-dev libslirp-dev libspice-server-dev \
             libspice-protocol-dev libusbredirparser-dev libusbredirhost-dev libusb-1.0-0-dev \
             libudev-dev libcap-ng-dev libattr1-dev libasound2-dev libpulse-dev \
@@ -109,6 +110,7 @@ jobs:
         run: |
           dnf install -y \
             curl git patch gcc gcc-c++ make pkgconf-pkg-config meson ninja-build python3 python3-pyyaml \
+            python3-setuptools python3-wheel \
             glslang xorriso unzip clang clang-devel \
             glib2-devel pixman-devel libfdt-devel libslirp-devel spice-server-devel \
             spice-protocol usbredir-devel libusb1-devel systemd-devel libcap-ng-devel \

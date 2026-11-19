@@ -16,7 +16,8 @@ depends=(
   'swtpm' 'systemd-libs' 'usbredir' 'virt-install' 'vulkan-driver' 'vulkan-icd-loader'
   'wayland' 'xdg-desktop-portal' 'zlib' 'zstd'
 )
-makedepends=('glib2-devel' 'glslang' 'libisoburn' 'meson' 'ninja' 'python-yaml'
+makedepends=('glib2-devel' 'glslang' 'libisoburn' 'meson' 'ninja' 'python-setuptools'
+  'python-wheel' 'python-yaml'
   'rust' 'spice-protocol' 'unzip' 'vulkan-headers' 'wine')
 optdepends=(
   'dnsmasq: libvirt virtual networks with DHCP'
