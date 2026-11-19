@@ -30,7 +30,7 @@ optdepends=(
   'xdg-desktop-portal-impl: desktop file picker backend'
   'xterm: serial consoles when TERMINAL is unset'
 )
-options=('!debug')
+options=('!debug' '!lto')
 
 source=()
 noextract=()
