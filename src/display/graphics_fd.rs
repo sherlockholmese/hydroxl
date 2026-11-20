@@ -1,8 +1,8 @@
 //! Local libvirt attachment for graphical transports, including socketless SPICE.
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result};
 use libloading::Library;
 use std::{
-    ffi::{CString, c_char, c_void},
+    ffi::{CStr, CString, c_char, c_void},
     os::fd::{FromRawFd, OwnedFd},
     sync::OnceLock,
 };
@@ -15,6 +15,19 @@ struct Libvirt {
     domain: unsafe extern "C" fn(Ptr, *const c_char) -> Ptr,
     free: unsafe extern "C" fn(Ptr) -> i32,
     graphics: unsafe extern "C" fn(Ptr, u32, u32) -> i32,
+    last_error_message: unsafe extern "C" fn() -> *const c_char,
+}
+
+impl Libvirt {
+    fn error(&self, operation: &'static str) -> anyhow::Error {
+        // The message belongs to the calling thread and is valid until the next libvirt call.
+        let message = unsafe { (self.last_error_message)() };
+        if message.is_null() {
+            return anyhow::anyhow!("{operation}");
+        }
+        let message = unsafe { CStr::from_ptr(message) }.to_string_lossy();
+        anyhow::anyhow!("{}", message.trim()).context(operation)
+    }
 }
 
 fn libvirt() -> Result<&'static Libvirt> {
@@ -33,6 +46,7 @@ fn libvirt() -> Result<&'static Libvirt> {
                 domain: load!(b"virDomainLookupByUUIDString"),
                 free: load!(b"virDomainFree"),
                 graphics: load!(b"virDomainOpenGraphicsFD"),
+                last_error_message: load!(b"virGetLastErrorMessage"),
                 _library: library,
             })
         })()
@@ -55,21 +69,27 @@ impl GraphicsFd {
         let id = CString::new(id)?;
         // The libvirt connection and domain stay on the calling thread.
         let connection = unsafe { (libvirt.connect)(uri.as_ptr()) };
-        ensure!(!connection.is_null(), "Could not open the libvirt connection.");
+        if connection.is_null() {
+            return Err(libvirt.error("Could not connect to libvirt"));
+        }
         let domain = unsafe { (libvirt.domain)(connection, id.as_ptr()) };
         let attachment = Self {
             libvirt,
             connection,
             domain,
         };
-        ensure!(!attachment.domain.is_null(), "The guest is unavailable.");
+        if domain.is_null() {
+            return Err(libvirt.error("Could not find the virtual machine"));
+        }
         Ok(attachment)
     }
 
     pub fn open(&self, index: u32) -> Result<OwnedFd> {
         // libvirt authorizes the local attachment and authenticates it for QEMU.
         let fd = unsafe { (self.libvirt.graphics)(self.domain, index, 1) };
-        ensure!(fd >= 0, "Could not attach to the guest display through libvirt.");
+        if fd < 0 {
+            return Err(self.libvirt.error("Could not attach to the guest display"));
+        }
         Ok(unsafe { OwnedFd::from_raw_fd(fd) })
     }
 }

@@ -55,20 +55,62 @@ pub fn guest_tools(m: &Machine, target: Option<String>) -> FormSpec {
     .note(format!("{drive} Open the disc inside Windows to install the drivers."))
 }
 
-pub fn disk_bus(m: &Machine, target: String) -> FormSpec {
+pub fn edit_drive(m: &Machine, device: &crate::operations::Device) -> FormSpec {
     let machine = m.clone();
+    let target = device.target.clone();
+    let bus = roxmltree::Document::parse(&device.xml)
+        .ok()
+        .and_then(|doc| {
+            doc.root_element()
+                .children()
+                .find(|n| n.has_tag_name("target"))
+                .and_then(|n| n.attribute("bus"))
+                .map(str::to_owned)
+        })
+        .unwrap_or_default();
+    let buses = if device.kind == "cdrom" {
+        &BUSES[1..]
+    } else {
+        BUSES
+    };
+    let old_target = target.clone();
+    let old_bus = bus.clone();
     FormSpec::new(
-        format!("Interface for {target}"),
-        "Change",
-        vec![F::choice("Interface", BUSES, "virtio")],
+        format!(
+            "Edit {} {target}",
+            if device.kind == "cdrom" {
+                "CD/DVD"
+            } else {
+                "disk"
+            }
+        ),
+        "Save",
+        vec![F::choice("Bus", buses, &bus).row(1), F::text("Target", &target).row(1)],
         move |v| {
+            let new_target = v[1].trim();
+            if v[0] != old_bus || new_target != old_target {
+                crate::operations::validate_disk_target(&v[0], new_target)?;
+            }
             Ok(operation(
                 machine.clone(),
-                Op::DiskBus {
-                    target: target.clone(),
+                Op::DiskInterface {
+                    target: old_target.clone(),
+                    new_target: new_target.into(),
                     bus: v[0].clone(),
                 },
             ))
         },
     )
+    .derive(move |v| {
+        if v[0] == bus {
+            return vec![(1, target.clone())];
+        }
+        let Some(prefix) = crate::operations::target_prefix(&v[0]) else {
+            return Vec::new();
+        };
+        let suffix = crate::operations::target_prefix(&bus)
+            .and_then(|old_prefix| target.strip_prefix(old_prefix))
+            .unwrap_or("a");
+        vec![(1, format!("{prefix}{suffix}"))]
+    })
 }

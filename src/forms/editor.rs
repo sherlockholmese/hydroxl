@@ -256,12 +256,11 @@ impl EditorForm {
             return;
         }
         let values = self.values(cx);
-        if let Ok(crate::app::Job::Icon(id, key)) = (self.submit)(&values) {
-            let _ = self.parent.update(cx, |parent, cx| parent.set_icon(id, key, cx));
-            window.close_dialog(cx);
-            return;
-        }
         match (self.submit)(&values) {
+            Ok(crate::app::Job::Icon(id, key)) => {
+                let _ = self.parent.update(cx, |parent, cx| parent.set_icon(id, key, cx));
+                window.close_dialog(cx);
+            }
             Ok(job) => {
                 self.error = None;
                 let form = cx.entity().downgrade();

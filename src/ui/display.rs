@@ -1,8 +1,9 @@
 //! The guest display window renders QEMU displays, captures keyboard and pointer on
 //! click (Ctrl+Alt releases), and carries power controls and special keys in a top bar.
 use super::primitives::{MENU_MIN_WIDTH, glyph};
-use crate::app::{Job, Workspace};
+use crate::app::{ActionSource, Job, Workspace};
 use crate::backend::{Action, Connection, DisplayTarget, Machine, State};
+use crate::display::frame_stats::{FrameRates, FrameStats};
 use crate::display::geometry::{GuestViewport, Scaling, guest_resize_target};
 use crate::display::scanout;
 use crate::display::session::{Resize, Session};
@@ -14,13 +15,14 @@ use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::{button::*, *};
 use gpui_kit::{prelude::*, *};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 const TOOLBAR_HEIGHT: f32 = 44.;
+const COMPACT_TOOLBAR_WIDTH: f32 = 480.;
 
 struct GuestResize {
     dimensions: (u16, u16),
@@ -136,6 +138,10 @@ pub(crate) struct DisplayView {
     /// Copied from the workspace when it changes; render never reads the workspace.
     state: Option<State>,
     busy: bool,
+    connecting: bool,
+    frame_revision: u64,
+    performance: Option<Rc<RefCell<FrameStats>>>,
+    performance_readout: FrameRates,
     _observe: Option<Subscription>,
     _focus_out: Subscription,
     _activation: Subscription,
@@ -154,6 +160,7 @@ impl DisplayView {
     pub(crate) fn connect(
         connection: Connection,
         id: String,
+        state: State,
         workspace: WeakEntity<Workspace>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -162,7 +169,6 @@ impl DisplayView {
         // A guest capture has its own explicit hide/show lifecycle. Typing must
         // not leave a second automatic hide active after the capture releases.
         window.set_cursor_hide_mode_override(Some(CursorHideMode::Never));
-        Self::connect_session(connection, id, false, window, cx);
         let observe = workspace.upgrade().map(|w| {
             cx.observe(&w, |this: &mut Self, workspace, cx| {
                 let w = workspace.read(cx);
@@ -211,7 +217,7 @@ impl DisplayView {
                 )
             })
             .unwrap_or((Scaling::default(), false, false));
-        Self {
+        let mut view = Self {
             session: None,
             connection,
             toolbar_pinned,
@@ -230,7 +236,7 @@ impl DisplayView {
             focus,
             buttons: 0,
             modifiers: Modifiers::default(),
-            status: Some("Connecting".into()),
+            status: Some(state.label().into()),
             captured: false,
             capture_on_click,
             hover_suppressed: false,
@@ -246,13 +252,32 @@ impl DisplayView {
             cursor_generation: 0,
             frame_scheduled: false,
             last_preview: None,
-            state: None,
+            state: Some(state),
             busy: false,
+            connecting: false,
+            frame_revision: 0,
+            performance: None,
+            performance_readout: FrameRates::default(),
             workspace,
             machine,
             _observe: observe,
             _focus_out: focus_out,
             _activation: activation,
+        };
+        if matches!(state, State::Running | State::Paused)
+            || std::env::var_os("HYDROXL_VNC_SOCKET").is_some()
+        {
+            view.ensure_session(window, cx);
+        }
+        view
+    }
+
+    pub(crate) fn ensure_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.session.is_none() && !self.connecting {
+            self.status = Some("Connecting".into());
+            self.connecting = true;
+            Self::connect_session(self.connection, self.machine.clone(), false, window, cx);
+            cx.notify();
         }
     }
 
@@ -311,12 +336,23 @@ impl DisplayView {
                     .update_in(cx, |this, window, cx| {
                         let wait = match result.take().expect("one display connection result") {
                             Ok(session) => {
+                                this.connecting = false;
                                 this.attach(session, window, cx);
                                 false
                             }
-                            Err(_) if retry => true,
                             Err(error) => {
-                                this.status = Some(error.to_string());
+                                if retry && this.state != Some(State::Stopped) {
+                                    this.status = Some(format!("{error:#}"));
+                                    cx.notify();
+                                    return true;
+                                }
+                                this.connecting = false;
+                                this.status =
+                                    Some(if retry && this.state == Some(State::Stopped) {
+                                        State::Stopped.label().into()
+                                    } else {
+                                        format!("{error:#}")
+                                    });
                                 false
                             }
                         };
@@ -338,6 +374,10 @@ impl DisplayView {
     fn attach(&mut self, session: Arc<Session>, window: &mut Window, cx: &mut Context<Self>) {
         let frame_clock = matches!(session.as_ref(), Session::Spice(_));
         self.session = Some(session.clone());
+        if let Some(stats) = &self.performance {
+            stats.borrow_mut().reset();
+            self.performance_readout = FrameRates::default();
+        }
         self.frame_scheduled = false;
         self.guest_resize = None;
         self.last_preview = None;
@@ -476,6 +516,7 @@ impl DisplayView {
                         window.drop_texture(previous);
                     }
                     self.gpu_image = true;
+                    self.frame_revision = self.frame_revision.wrapping_add(1);
                     self.size = (width, height);
                     self.status = None;
                     cx.notify();
@@ -562,11 +603,8 @@ impl DisplayView {
                 window.drop_texture(image);
             }
             self.gpu_image = false;
-            self.status = Some(if self.image.is_none() && self.size == (0, 0) {
-                error
-            } else {
-                "Waiting for guest display".into()
-            });
+            self.status = Some(error);
+            self.connecting = true;
             Self::connect_session(self.connection, self.machine.clone(), true, window, cx);
             cx.notify();
             return false;
@@ -595,6 +633,7 @@ impl DisplayView {
             );
         }
         let resized = !gpu_only && (self.image.is_none() || self.size != (w, h) || self.gpu_image);
+        let mut changed = resized;
         // Borrow rows while locked instead of allocating packed patches or a
         // full-frame clone. The texture API copies into its retained CPU image
         // before returning and defers GPU writes until paint.
@@ -613,6 +652,7 @@ impl DisplayView {
                 frame.discard_damage();
             } else if let Some(id) = self.image {
                 for rect in frame.take_damage_rects() {
+                    changed = true;
                     let start = ((rect.y as usize * w as usize) + rect.x as usize) * 4;
                     window.update_texture_with_stride(
                         id,
@@ -653,8 +693,91 @@ impl DisplayView {
         }
         self.size = (w, h);
         self.status = None;
+        if changed {
+            self.frame_revision = self.frame_revision.wrapping_add(1);
+        }
         cx.notify();
         true
+    }
+
+    fn toggle_performance(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.performance.take().is_some() {
+            self.performance_readout = FrameRates::default();
+            cx.notify();
+            return;
+        }
+        let stats = Rc::new(RefCell::new(FrameStats::default()));
+        self.performance = Some(stats.clone());
+        cx.notify();
+        cx.spawn_in(window, async move |view, cx| {
+            loop {
+                let updating = view.update_in(cx, |view, window, cx| {
+                    if view.performance.as_ref().is_none_or(|current| !Rc::ptr_eq(current, &stats))
+                    {
+                        return false;
+                    }
+                    let ready = window.is_visible()
+                        && view.state == Some(State::Running)
+                        && view.session.is_some()
+                        && view.image.is_some();
+                    let mut stats = stats.borrow_mut();
+                    let readout = if ready {
+                        stats.sample(Instant::now())
+                    } else {
+                        stats.reset();
+                        FrameRates::default()
+                    };
+                    if readout != view.performance_readout {
+                        view.performance_readout = readout;
+                        cx.notify();
+                    }
+                    true
+                });
+                if !matches!(updating, Ok(true)) {
+                    break;
+                }
+                cx.background_executor().timer(Duration::from_millis(250)).await;
+            }
+        })
+        .detach();
+    }
+
+    fn performance_overlay(&self, p: Palette) -> impl IntoElement {
+        let rate = |value: Option<f64>| value.map_or_else(|| "—".into(), |fps| format!("{fps:.1}"));
+        let samples = self.performance_readout;
+        v_flex()
+            .absolute()
+            .right_3()
+            .top_3()
+            .gap_1()
+            .bg(p.canvas)
+            .text_color(p.text)
+            .border_1()
+            .border_color(p.border)
+            .rounded_md()
+            .px_3()
+            .py_2()
+            .text_size(px(CAPTION_SIZE))
+            .children(
+                [
+                    ("Live FPS", samples.live),
+                    ("Average FPS", samples.average),
+                    ("1% low", samples.low),
+                ]
+                .map(|(label, fps)| {
+                    h_flex()
+                        .justify_between()
+                        .gap_3()
+                        .child(div().text_color(p.muted).child(label))
+                        .child(
+                            div()
+                                .w_12()
+                                .text_right()
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(rate(fps)),
+                        )
+                }),
+            )
     }
 
     fn update_overview_preview(
@@ -1070,6 +1193,11 @@ impl DisplayView {
         let _ = self.workspace.update(cx, |w, cx| w.begin(job, None, cx));
     }
 
+    fn power(&self, action: Action, window: &Window, cx: &mut Context<Self>) {
+        let source = ActionSource::Viewer(window.window_handle());
+        self.run(|machine| Job::Action(machine, action, source), cx);
+    }
+
     fn receive_session_result<T: Send + 'static>(
         result: anyhow::Result<mpsc::Receiver<anyhow::Result<T>>>,
         done: impl FnOnce(T, &mut Window, &mut App) + 'static,
@@ -1145,6 +1273,7 @@ impl DisplayView {
     fn capture_control(
         &self,
         p: Palette,
+        compact: bool,
         track_menu: impl Fn(&bool, &mut Window, &mut App) + 'static,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -1165,10 +1294,12 @@ impl DisplayView {
                     p.muted
                 }),
             )
-            .label(if self.captured {
-                "Captured"
-            } else {
-                "Released"
+            .when(!compact, |button| {
+                button.label(if self.captured {
+                    "Captured"
+                } else {
+                    "Released"
+                })
             })
             .dropdown_caret(true)
             .disabled(self.session.is_none())
@@ -1196,6 +1327,7 @@ impl DisplayView {
     }
 
     fn top_bar(&self, p: Palette, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let compact = window.viewport_size().width < px(COMPACT_TOOLBAR_WIDTH);
         let state = self.state;
         let running = state == Some(State::Running);
         let paused = state == Some(State::Paused);
@@ -1293,13 +1425,14 @@ impl DisplayView {
             .on_open_change(track_menu.clone());
         let scaling = {
             let current = self.scaling;
+            let performance_enabled = self.performance.is_some();
             let this = cx.entity().downgrade();
             Button::new("scaling")
                 .ghost()
                 .small()
                 .icon(glyph(scaling_icon(current)))
                 .label(current.label())
-                .accessibility_label(format!("Display scaling: {}", current.menu_label()))
+                .accessibility_label(format!("Display options: {}", current.menu_label()))
                 .tooltip(match current {
                     Scaling::Fit => "Fit the existing guest image inside the window",
                     Scaling::GuestResize => {
@@ -1332,7 +1465,15 @@ impl DisplayView {
                                 }),
                         );
                     }
-                    menu
+                    let this = this.clone();
+                    menu.separator().item(
+                        PopupMenuItem::new("Performance overlay")
+                            .checked(performance_enabled)
+                            .on_click(move |_, window, cx| {
+                                let _ =
+                                    this.update(cx, |view, cx| view.toggle_performance(window, cx));
+                            }),
+                    )
                 })
                 .on_open_change(track_menu.clone())
         };
@@ -1369,56 +1510,49 @@ impl DisplayView {
             .border_b_1()
             .border_color(p.border)
             // The machine's name leads, set off from its controls like the other groups.
-            .when_some(self.machine(cx).map(|machine| machine.name), |toolbar, name| {
-                toolbar
-                    .child(
-                        div()
-                            .px_2()
-                            .max_w(px(240.))
-                            .min_w_0()
-                            .flex_shrink(1.)
-                            .truncate()
-                            .text_size(px(BODY_SIZE))
-                            .font_weight(FontWeight::MEDIUM)
-                            .child(name),
-                    )
-                    .child(div().w(px(1.)).h(px(20.)).mx_1().flex_shrink_0().bg(p.border))
-            })
+            .when_some(
+                self.machine(cx).filter(|_| !compact).map(|machine| machine.name),
+                |toolbar, name| {
+                    toolbar
+                        .child(
+                            div()
+                                .px_2()
+                                .max_w(px(240.))
+                                .min_w_0()
+                                .flex_shrink(1.)
+                                .truncate()
+                                .text_size(px(BODY_SIZE))
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(name),
+                        )
+                        .child(div().w(px(1.)).h(px(20.)).mx_1().flex_shrink_0().bg(p.border))
+                },
+            )
             .when(!on, |t| {
                 t.child(
-                    icon(
-                        "start",
-                        Glyph::Play,
-                        if state == Some(State::Stopped) {
-                            "Start"
-                        } else {
-                            "Resume"
-                        },
-                    )
-                    .disabled(busy || state == Some(State::Other))
-                    .on_click(
-                        cx.listener(|this, _, _, cx| {
-                            this.run(|m| Job::Action(m, Action::Start), cx)
-                        }),
-                    ),
+                    icon("start", Glyph::Play, "Start")
+                        .disabled(busy || state != Some(State::Stopped))
+                        .on_click(
+                            cx.listener(|this, _, window, cx| {
+                                this.power(Action::Start, window, cx)
+                            }),
+                        ),
                 )
             })
             .when(paused, |t| {
                 t.child(icon("resume", Glyph::Play, "Resume").disabled(busy).on_click(
-                    cx.listener(|this, _, _, cx| this.run(|m| Job::Action(m, Action::Resume), cx)),
+                    cx.listener(|this, _, window, cx| this.power(Action::Resume, window, cx)),
                 ))
             })
             .when(running, |t| {
                 t.child(icon("pause", Glyph::Pause, "Pause").disabled(busy).on_click(
-                    cx.listener(|this, _, _, cx| this.run(|m| Job::Action(m, Action::Pause), cx)),
+                    cx.listener(|this, _, window, cx| this.power(Action::Pause, window, cx)),
                 ))
             })
             .when(on, |toolbar| {
                 toolbar
                     .child(icon("shutdown", Glyph::Power, "Shut down").disabled(busy).on_click(
-                        cx.listener(|view, _, _, cx| {
-                            view.run(|m| Job::Action(m, Action::Shutdown), cx)
-                        }),
+                        cx.listener(|view, _, window, cx| view.power(Action::Shutdown, window, cx)),
                     ))
                     .child(
                         Button::new("restart")
@@ -1502,7 +1636,7 @@ impl DisplayView {
                         .child(keycap("Alt", cx)),
                 )
             })
-            .child(self.capture_control(p, track_menu_capture, cx))
+            .child(self.capture_control(p, compact, track_menu_capture, cx))
             .when(window.is_fullscreen(), |toolbar| {
                 toolbar.child(
                     icon(
@@ -1556,6 +1690,8 @@ impl Render for DisplayView {
         self.sync_system_cursor(window);
         let bounds = self.bounds.clone();
         let (dimensions, scaling) = (self.size, self.scaling);
+        let performance = self.performance.clone().filter(|_| self.state == Some(State::Running));
+        let revision = self.frame_revision;
         let surface = div()
             .id("guest-display")
             .relative()
@@ -1576,16 +1712,28 @@ impl Render for DisplayView {
                                 bounds,
                                 scaling,
                                 window.scale_factor(),
-                            ) && let Err(error) =
-                                window.paint_texture_in(image, bounds, viewport.bounds())
-                            {
-                                eprintln!("Could not draw guest display: {error}");
+                            ) {
+                                match window.paint_texture_in(image, bounds, viewport.bounds()) {
+                                    Ok(()) => {
+                                        if let Some(stats) = &performance {
+                                            stats.borrow_mut().painted(
+                                                Instant::now(),
+                                                revision,
+                                                dimensions,
+                                            );
+                                        }
+                                    }
+                                    Err(error) => {
+                                        eprintln!("Could not draw guest display: {error}")
+                                    }
+                                }
                             }
                         },
                     )
                     .size_full(),
                 )
             })
+            .when(self.performance.is_some(), |surface| surface.child(self.performance_overlay(p)))
             .children(self.cursor_overlay())
             .when_some(self.status.clone(), |this, status| {
                 this.child(
@@ -1595,9 +1743,10 @@ impl Render for DisplayView {
                         .items_center()
                         .justify_center()
                         .gap_2()
+                        .px_6()
                         .text_color(p.muted)
                         .when(status == "Connecting", |t| t.child(Spinner::new().small()))
-                        .child(status),
+                        .child(div().min_w_0().max_w(px(480.)).child(status)),
                 )
             })
             .on_mouse_move(cx.listener(|this, e: &MouseMoveEvent, window, cx| {
@@ -1815,26 +1964,19 @@ impl Workspace {
             return;
         }
         let connection = self.preferences.connection;
-        self.display_windows.retain(|(_, handle, _)| handle.update(cx, |_, _, _| ()).is_ok());
+        self.display_windows.retain(|(_, _, view)| view.upgrade().is_some());
         if let Some((_, handle, view)) =
             self.display_windows.iter().find(|(id, _, _)| *id == machine.id)
         {
-            let id = machine.id.clone();
             let _ = handle.update(cx, |_, window, cx| {
                 window.activate_window();
-                let _ = view.update(cx, |view, cx| {
-                    if view.session.is_none()
-                        && !matches!(
-                            view.status.as_deref(),
-                            Some("Connecting" | "Waiting for guest display")
-                        )
-                    {
-                        view.status = Some("Connecting".into());
-                        DisplayView::connect_session(connection, id, false, window, cx);
-                        cx.notify();
-                    }
-                });
+                if matches!(machine.state, State::Running | State::Paused) {
+                    let _ = view.update(cx, |view, cx| view.ensure_session(window, cx));
+                }
             });
+            return;
+        }
+        if !self.opening_displays.insert(machine.id.clone()) {
             return;
         }
         let id = machine.id.clone();
@@ -1859,13 +2001,13 @@ impl Workspace {
             let opened = gpui_kit::open_window(options, cx, |window, cx| {
                 cx.new(|cx| {
                     let mut view =
-                        DisplayView::connect(connection, id, workspace.clone(), window, cx);
-                    view.state = Some(state);
+                        DisplayView::connect(connection, id, state, workspace.clone(), window, cx);
                     view.busy = busy;
                     view
                 })
             });
             let _ = workspace.update(cx, |this, cx| {
+                this.opening_displays.remove(&machine.id);
                 match opened {
                     Ok((handle, view)) => {
                         this.display_windows.push((machine.id, handle, view.downgrade()));

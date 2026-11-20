@@ -12,8 +12,11 @@ pub(crate) mod qemu;
 mod spice;
 pub(crate) mod tpm;
 pub use catalog::{family_of, infer_os, os_by_uri, os_catalog, os_families, os_name, os_versions};
-pub(crate) use creation::data_dir;
 pub use creation::machines_dir;
+pub(crate) use creation::{
+    ImportHardware, OwnedStorage, STORAGE_RECORD, add_hardware_review, data_dir, define_xml,
+    import_hardware, record_owned_storage,
+};
 pub use creation::{create, disable_cow, import};
 pub use gpu::{
     HOSTMEM_BYTES, NEPTUNE_HOST_MISSING, TRITON_ARCH_UNSUPPORTED, gpu_features, triton_arch,

@@ -1,15 +1,11 @@
 use super::{Connection, virsh};
 use anyhow::{Context, Result, bail};
-use std::{
-    fs,
-    time::{SystemTime, UNIX_EPOCH},
-};
 /// The virtualization extension a KVM guest can be given ("vmx" or "svm"), when the
 /// host module allows nesting.
 pub fn nested_host_feature() -> Option<&'static str> {
     [("kvm_intel", "vmx"), ("kvm_amd", "svm")].into_iter().find_map(|(module, feature)| {
         let parameter = format!("/sys/module/{module}/parameters/nested");
-        fs::read_to_string(parameter)
+        std::fs::read_to_string(parameter)
             .is_ok_and(|value| matches!(value.trim(), "Y" | "1"))
             .then_some(feature)
     })
@@ -52,15 +48,22 @@ pub fn configure(
     topology: Option<Topology>,
     memory_mib: u64,
 ) -> Result<()> {
+    super::ensure_stopped(connection, id, true)?;
+    let xml = virsh(connection, &["dumpxml", id, "--inactive"])?;
+    super::define_xml(connection, &configured_xml(xml, topology, Some(memory_mib))?)
+}
+
+pub(super) fn configured_xml(
+    mut xml: String,
+    topology: Option<Topology>,
+    memory_mib: Option<u64>,
+) -> Result<String> {
     if topology.is_some_and(|topology| !(1..=256).contains(&topology.vcpus())) {
         bail!("Use 1 to 256 virtual CPUs.");
     }
-    if !(64..=1024 * 1024).contains(&memory_mib) {
+    if memory_mib.is_some_and(|memory| !(64..=1024 * 1024).contains(&memory)) {
         bail!("Use between 64 MB and 1 TB of memory.");
     }
-    super::ensure_stopped(connection, id, true)?;
-    // Define the complete updated XML once, so CPU and memory are changed together.
-    let xml = virsh(connection, &["dumpxml", id, "--inactive"])?;
     let doc = roxmltree::Document::parse(&xml)?;
     let topology_xml = topology.map(|topology| {
         format!(
@@ -73,10 +76,10 @@ pub fn configure(
     for node in doc.root_element().children().filter(|n| n.is_element()) {
         let replacement = match node.tag_name().name() {
             "vcpu" => topology.map(|topology| format!("<vcpu>{}</vcpu>", topology.vcpus())),
-            "memory" => Some(format!("<memory unit='MiB'>{memory_mib}</memory>")),
-            "currentMemory" => {
-                Some(format!("<currentMemory unit='MiB'>{memory_mib}</currentMemory>"))
-            }
+            "memory" | "currentMemory" => memory_mib.map(|memory| {
+                let tag = node.tag_name().name();
+                format!("<{tag} unit='MiB'>{memory}</{tag}>")
+            }),
             "cpu" => {
                 let Some(topology_xml) = &topology_xml else {
                     continue;
@@ -103,23 +106,29 @@ pub fn configure(
             edits.push((node.range(), value));
         }
     }
+    let root = doc.root_element();
+    let mut additions = String::new();
     if !has_cpu && let Some(topology_xml) = topology_xml {
-        let end = doc.root_element().range().end - "</domain>".len();
-        edits.push((end..end, format!("<cpu>{topology_xml}</cpu>")));
+        additions.push_str(&format!("<cpu>{topology_xml}</cpu>"));
     }
-    let mut updated = xml;
+    if let Some(topology) = topology
+        && !root.children().any(|n| n.has_tag_name("vcpu"))
+    {
+        additions.push_str(&format!("<vcpu>{}</vcpu>", topology.vcpus()));
+    }
+    if let Some(memory) = memory_mib
+        && !root.children().any(|n| n.has_tag_name("memory"))
+    {
+        additions.push_str(&format!("<memory unit='MiB'>{memory}</memory>"));
+    }
+    if !additions.is_empty() {
+        let closing = xml[root.range()].rfind("</domain").context("Invalid domain element.")?;
+        let end = root.range().start + closing;
+        edits.push((end..end, additions));
+    }
     edits.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
     for (range, value) in edits {
-        updated.replace_range(range, &value);
+        xml.replace_range(range, &value);
     }
-    let path = std::env::temp_dir().join(format!(
-        "hydroxl-config-{}-{}.xml",
-        std::process::id(),
-        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
-    ));
-    fs::write(&path, updated)?;
-    let result =
-        virsh(connection, &["define", path.to_str().context("Invalid configuration path.")?]);
-    let _ = fs::remove_file(path);
-    result.map(|_| ())
+    Ok(xml)
 }

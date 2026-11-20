@@ -180,11 +180,9 @@ pub fn import(
         let insert =
             xml.rfind("</devices>").context("Could not generate the machine configuration.")?;
         xml.insert_str(insert, &disks);
-        let path = folder.join("machine.xml");
-        fs::write(&path, xml)?;
+        backend::record_owned_storage(&folder, &xml)?;
         registration_attempted = true;
-        backend::virsh(c, &["define", text(&path)?])?;
-        Ok(())
+        backend::define_xml(c, &xml)
     })();
     if result.is_err() && !registration_attempted {
         let _ = fs::remove_dir_all(&folder);

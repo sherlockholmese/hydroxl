@@ -36,7 +36,7 @@ pub use hardware::{
     machine_type_family, machine_types, xml,
 };
 pub use information::{architecture, confirm, operating_system};
-pub use media::{compact, disk_bus, guest_tools, mount, resize};
+pub use media::{compact, edit_drive, guest_tools, mount, resize};
 pub use networks::{host_bridge, virtual_network};
 pub use snapshots::{SnapshotAction, snapshot, snapshot_action};
 

@@ -19,13 +19,14 @@ this matrix as a release claim.
 | BIOS / UEFI | Creation, import, and inline toggle in Hardware | Firmware change may need guest bootloader repair |
 | OVA / OVF import | Single-system appliance parser, multi-disk VMDK conversion | See README for supported appliance subset |
 | OVA export | OVF, stream-optimized VMDKs, SHA-256 manifest | Current disks and portable hardware; no RAM or snapshots |
-| XML import | Existing native libvirt machine definitions | Existing name/UUID overwrite refused |
-| Start / shutdown / force stop | libvirt actions | Shutdown is a request; live state remains authoritative |
+| XML import | Native libvirt machine definitions with optional CPU and memory review on import | Existing name/UUID overwrite refused |
+| Start / shutdown / force stop | libvirt actions. Start in the viewer uses the existing window. | Shutdown is a request; live state remains authoritative |
 | Pause / resume | libvirt suspend/resume | Host support required |
 | Save / discard state | libvirt managed save | Restore through Start / Resume |
 | Disposable mode | Transient guest with fresh disk overlays and MAC addresses | Restricted to guests without externally writable state |
 | Graphical display | Per machine, choose VNC or SPICE in the GPUI viewer. Includes keyboard and pointer forwarding and special keys. | SPICE provides audio and USB redirection. SPICE GL uses EGL readback. 2D SPICE displays can tear at high resolutions; see [SPICE tearing](spice-2d-tearing.md). |
 | Display screenshot | Actual intermittent guest capture, PNG save | Captured frame is labeled; never presented as live video |
+| Display performance | Viewer overlay with live FPS, average FPS, and 1% low | Measures changing guest textures drawn by the viewer. [Repeatable 60 FPS check](display-performance.md) |
 | Fullscreen / resolution / keyboard capture | In-app fullscreen, guest input capture, Ctrl+Alt release | Host shortcuts depend on compositor support |
 | Clipboard sharing | Automatic both ways over SPICE and VNC: guest copies reach the host as they happen; host text is offered when the display window regains focus or captures input. "Copy guest clipboard" copies on demand. "Type clipboard text" types into any guest. With VNC the guest agent channel is connected to QEMU's `qemu-vdagent` | spice-vdagent required in the guest for sync; typing uses a US layout. VNC clipboard is text only |
 | Shared folders | virtio-fs (default, needs host virtiofsd, required for Windows) or 9p. Edit or stop sharing per folder. Setup in the guest through the guest agent, keyboard automation on Windows, or copy / type commands. Linux entries are added to fstab with automount | Windows needs guest tools and WinFsp (installed automatically when the guest has network) |
@@ -52,7 +53,7 @@ this matrix as a release claim.
 | Full clone | virt-clone copies disks and regenerates identities | Powered-off machine; installed virt-clone required |
 | Configuration-only clone | New identities and blank disks of matching capacities | Powered off; custom TPM paths excluded |
 | Move machine files | Independent storage copies activated at the destination | Snapshots must be removed; originals retained for recovery |
-| Folder export | Native XML and independent current disks | Not a full snapshot/TPM/removable-media backup |
+| Folder export | One importable `machine.xml` with hardware review enabled and independent current disks | Covers current file-backed disk contents and copied UEFI variables |
 | Remove from library | Confirmation with optional deletion of Hydroxl-owned disks | Keeps disks by default and preserves NVRAM |
 | Per-machine notes | Domain description editor | Shown only when notes are present |
 | Custom QEMU configuration | Native advanced XML editor | Expert path; dedicated forms do not cover every QEMU flag |
@@ -60,7 +61,7 @@ this matrix as a release claim.
 | Input / USB | USB 3.0 / 2.0 / none controller, USB tablet | |
 | QEMU devices | Memory balloon, entropy device, Hyper-V enlightenments, local-time clock | Further QEMU flags through XML |
 | Video memory | Inline for QXL, VGA and Bochs | |
-| Disk interface | Change bus of an existing disk or drive | Guest drivers must support the new bus |
+| Disk interface | Edit the bus and libvirt target of an existing disk or CD/DVD drive | Powered off; targets must be unique and the guest must support the new bus |
 | Serial ports | Add pseudo-terminal or localhost TCP server ports | |
 | Custom icon | Per-machine icon from the OS mark set | |
 | Show files / log | Opens the machine folder or QEMU log in the desktop | System logs may need permission |

@@ -6,7 +6,7 @@ mod workspace;
 use crate::{backend::Machine, operations::Details};
 use gpui_kit::component::input::InputState;
 use gpui_kit::{AnyWindowHandle, Entity, FocusHandle, WeakEntity};
-pub(crate) use jobs::{Job, JobEvent, Pending, Response};
+pub(crate) use jobs::{ActionSource, Job, JobEvent, Pending, Response};
 pub(crate) use preferences::Preferences;
 pub struct Workspace {
     pub(crate) machines: Vec<Machine>,
@@ -28,6 +28,7 @@ pub struct Workspace {
     /// The guest display shown in the machine pane, when open.
     pub(crate) display_windows:
         Vec<(String, AnyWindowHandle, WeakEntity<crate::ui::display::DisplayView>)>,
+    pub(crate) opening_displays: std::collections::HashSet<String>,
     pub(crate) live_preview: Option<(String, std::sync::Arc<gpui_kit::RenderImage>)>,
     /// Hardware tab edits displayed until a successful save is read back.
     pub(crate) hardware_draft: Option<crate::workflows::HardwareDraft>,

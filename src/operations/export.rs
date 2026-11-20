@@ -26,13 +26,25 @@ pub(super) fn apply_export_ova(
 }
 
 pub(super) fn export(c: Connection, machine: &Machine, destination: &Path) -> Result<()> {
+    copy_storage(c, machine, destination, |xml| {
+        fs::write(destination.join("machine.xml"), backend::add_hardware_review(xml)?)?;
+        Ok(())
+    })
+}
+
+fn copy_storage<T>(
+    c: Connection,
+    machine: &Machine,
+    destination: &Path,
+    finish: impl FnOnce(&str) -> Result<T>,
+) -> Result<T> {
     stopped(c, &machine.id)?;
     if destination.exists() {
         bail!("Choose a new folder for the export.");
     }
     fs::create_dir_all(destination).context("Could not create the export folder.")?;
     // Export is self-contained for file-backed disks. Never silently omit block storage.
-    let result = (|| -> Result<()> {
+    let result = (|| -> Result<T> {
         let mut xml = backend::virsh(c, &["dumpxml", &machine.id, "--inactive"])?;
         let doc = roxmltree::Document::parse(&xml)?;
         let mut edits = Vec::new();
@@ -54,7 +66,6 @@ pub(super) fn export(c: Connection, machine: &Machine, destination: &Path) -> Re
                 edits.push((driver.range(), "<driver name='qemu' type='qcow2'/>".into()));
             }
         }
-        // Export includes a separate original XML for advanced recovery.
         if let Some(nvram) = doc.descendants().find(|n| n.has_tag_name("nvram")) {
             if let Some(source) = nvram.text().filter(|s| !s.trim().is_empty()) {
                 let target = destination.join("nvram.fd");
@@ -65,13 +76,11 @@ pub(super) fn export(c: Connection, machine: &Machine, destination: &Path) -> Re
                 }
             }
         }
-        fs::write(destination.join("original.xml"), &xml)?;
         edits.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
         for (range, replacement) in edits {
             xml.replace_range(range, &replacement);
         }
-        fs::write(destination.join("machine.xml"), xml)?;
-        Ok(())
+        finish(&xml)
     })();
     if result.is_err() {
         let _ = fs::remove_dir_all(destination);
@@ -85,12 +94,12 @@ pub(super) fn move_storage(c: Connection, machine: &Machine, destination: &Path)
         bail!("Remove snapshots before moving storage.");
     }
     // Folder export flattens backing chains into independent QCOW2 files.
-    export(c, machine, destination)?;
-    let path = destination.join("machine.xml");
-    if let Err(error) = backend::virsh(c, &["define", path_text(&path)?]) {
-        // Registration can outlive a failed connection. Keep both copies for recovery.
-        return Err(error);
-    }
+    let xml = copy_storage(c, machine, destination, |xml| {
+        backend::record_owned_storage(destination, xml)?;
+        Ok(xml.to_owned())
+    })?;
+    // Registration can outlive a failed connection. Keep both copies for recovery.
+    backend::define_xml(c, &xml)?;
     // Keep original files as a recovery copy. They may also be used by other VMs.
     // The VM now uses only the destination disks and NVRAM.
     Ok(())

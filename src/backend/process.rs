@@ -180,14 +180,19 @@ fn run_inner(
         if start.elapsed() > timeout {
             let _ = child.kill();
             let _ = child.wait();
-            bail!("The connection timed out. Check libvirt and retry.");
+            let operation = match args {
+                ["--connect", _, command, ..] if program == "virsh" => {
+                    format!("Libvirt {command}")
+                }
+                _ => program.to_owned(),
+            };
+            bail!("{operation} timed out after {} seconds.", timeout.as_secs());
         }
         thread::sleep(Duration::from_millis(40));
     };
     let output = out.join().unwrap_or_default();
     let error = err.join().unwrap_or_default();
     if !status.success() {
-        // Detailed diagnostics stay in the process log, not the product interface.
         eprintln!("{program}: {}", error.trim());
         return Err(command_failure(program, args, &error));
     }
@@ -229,18 +234,31 @@ fn command_failure(program: &str, args: &[&str], error: &str) -> anyhow::Error {
             || lower.contains("swtpm")
             || lower.contains("unsupported"))
     {
-        return anyhow!(super::tpm::UNAVAILABLE);
+        return diagnostic(program, error).context(super::tpm::UNAVAILABLE);
     }
     if error.contains("already active") {
-        return anyhow!("The machine is already running. Refresh its state.");
+        return diagnostic(program, error)
+            .context("The machine is already running. Refresh its state.");
     }
-    if error.contains("permission denied")
-        || error.contains("authentication")
-        || error.contains("not authorized")
-    {
-        return anyhow!("Access denied. Check your libvirt permissions and retry.");
+    diagnostic(program, error)
+}
+
+fn diagnostic(program: &str, stderr: &str) -> anyhow::Error {
+    let message = stderr
+        .lines()
+        .map(str::trim)
+        .map(|line| line.strip_prefix("error: ").unwrap_or(line))
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if !message.is_empty() {
+        return anyhow!("{message}");
     }
-    anyhow!("The operation failed. Check the libvirt connection and retry.")
+    if program == "virsh" {
+        anyhow!("Libvirt did not provide an error message.")
+    } else {
+        anyhow!("{program} failed without an error message.")
+    }
 }
 
 #[cfg(test)]
@@ -258,7 +276,7 @@ mod tests {
         );
         assert_eq!(
             command_failure("virsh", &["--connect", connection, "managedsave"], error).to_string(),
-            "The operation failed. Check the libvirt connection and retry."
+            "Requested operation is not valid: cannot migrate domain: virgl is not yet migratable"
         );
     }
 
@@ -269,6 +287,16 @@ mod tests {
             "error: Domain snapshot not found: no domain snapshot with matching name 'backup'";
         assert!(command_failure("virsh", &args, missing).is::<SnapshotNotFound>());
         assert!(!command_failure("virsh", &args, "permission denied").is::<SnapshotNotFound>());
+    }
+
+    #[test]
+    fn keeps_the_libvirt_diagnostic_after_the_command_summary() {
+        let stderr = "error: failed to connect to the hypervisor\nerror: Failed to connect socket to '/run/libvirt/virtqemud-sock': Permission denied\n";
+        let args = ["--connect", "qemu:///system", "list"];
+        assert_eq!(
+            command_failure("virsh", &args, stderr).to_string(),
+            "failed to connect to the hypervisor\nFailed to connect socket to '/run/libvirt/virtqemud-sock': Permission denied"
+        );
     }
 
     #[test]

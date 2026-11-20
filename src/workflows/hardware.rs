@@ -76,7 +76,6 @@ pub fn xml(m: &Machine, xml: String) -> FormSpec {
             .map_err(|_| anyhow::anyhow!("Fix the XML before saving."))?;
         Ok(operation(machine.clone(), Op::SaveXml(v[0].clone())))
     })
-    .note("Save updates the configuration in libvirt. The machine.xml beside the disks records the original setup.")
 }
 
 /// One device in the boot order list.
@@ -335,6 +334,16 @@ fn nics(doc: &roxmltree::Document) -> Vec<Nic> {
         .collect()
 }
 impl HardwareDraft {
+    pub(crate) fn rename_boot_drive(&mut self, old: &str, new: &str) {
+        let key = format!("disk:{old}");
+        if let Some(entry) = self.boot.iter_mut().find(|entry| entry.key == key) {
+            entry.key = format!("disk:{new}");
+            if let Some((kind, _)) = entry.label.rsplit_once(' ') {
+                entry.label = format!("{kind} {new}");
+            }
+        }
+    }
+
     pub fn read(machine: &Machine, xml: &str) -> Option<Self> {
         let c = Config::parse(xml)?;
         let doc = roxmltree::Document::parse(xml).ok()?;

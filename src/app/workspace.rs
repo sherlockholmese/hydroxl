@@ -48,6 +48,7 @@ impl Workspace {
             hardware_draft: None,
             saved_hardware_for: None,
             display_windows: Vec::new(),
+            opening_displays: Default::default(),
             live_preview: None,
             share_os: None,
             wide: false,

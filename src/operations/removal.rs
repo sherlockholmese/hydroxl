@@ -113,12 +113,23 @@ fn owned_disks(xml: &str, root: &Path) -> Result<Vec<PathBuf>> {
     Ok(disks.into_iter().collect())
 }
 
-// Custom creation locations have a machine.xml manifest alongside their disks.
-// A matching UUID and disk source distinguish those from attached external images.
 fn owns_machine_folder(path: &Path, uuid: &str) -> bool {
     let Some(parent) = path.parent() else {
         return false;
     };
+    match fs::read(parent.join(backend::STORAGE_RECORD)) {
+        Ok(record) => {
+            return serde_json::from_slice::<backend::OwnedStorage>(&record).is_ok_and(|record| {
+                record.uuid == uuid
+                    && path
+                        .file_name()
+                        .is_some_and(|name| record.disks.iter().any(|disk| name == disk.as_str()))
+            });
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return false,
+    }
+    // Older machine folders stored ownership in a copy of the original XML.
     let Ok(xml) = fs::read_to_string(parent.join("machine.xml")) else {
         return false;
     };
@@ -223,5 +234,25 @@ mod tests {
                 .is_err()
         );
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn ownership_record_covers_only_recorded_disks_for_the_same_uuid() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let folder = temp.path();
+        let disk = folder.join("disk.qcow2");
+        let unrelated = folder.join("attached-later.qcow2");
+        fs::write(&disk, b"test")?;
+        fs::write(&unrelated, b"test")?;
+        let xml = format!(
+            "<domain><uuid>owner</uuid><devices><disk device='disk'><source file='{}'/></disk></devices></domain>",
+            disk.display()
+        );
+        backend::record_owned_storage(folder, &xml)?;
+        assert!(!folder.join("machine.xml").exists());
+        assert!(owns_machine_folder(&disk, "owner"));
+        assert!(!owns_machine_folder(&unrelated, "owner"));
+        assert!(!owns_machine_folder(&disk, "different"));
+        Ok(())
     }
 }

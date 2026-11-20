@@ -1,4 +1,4 @@
-use crate::app::{Job, Workspace};
+use crate::app::{ActionSource, Job, Workspace};
 use crate::backend::Action;
 use crate::forms;
 use crate::forms::FormSpec;
@@ -31,7 +31,7 @@ impl Workspace {
 
     pub(crate) fn machine_action(&mut self, action: Action, cx: &mut Context<Self>) {
         if let Some(m) = self.selected_machine().cloned() {
-            self.begin(Job::Action(m, action), None, cx);
+            self.begin(Job::Action(m, action, ActionSource::Library), None, cx);
         }
     }
 }

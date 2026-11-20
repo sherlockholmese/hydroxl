@@ -4,14 +4,14 @@ use crate::{
     forms::EditorForm,
     operations::{Details, Operation},
 };
-use gpui_kit::WeakEntity;
+use gpui_kit::{AnyWindowHandle, WeakEntity};
 use std::{path::PathBuf, sync::mpsc::Receiver};
 #[derive(Clone)]
 pub enum Job {
     Refresh,
-    Action(Machine, Action),
+    Action(Machine, Action, ActionSource),
     Create(backend::NewMachine),
-    Import(PathBuf, backend::QemuBuild),
+    Import(PathBuf, backend::QemuBuild, Option<backend::ImportHardware>),
     ConvertDisk {
         source: PathBuf,
         destination: PathBuf,
@@ -23,6 +23,13 @@ pub enum Job {
     Icon(String, String),
     Network(crate::backend::network::HostNetwork),
 }
+
+#[derive(Clone, Copy)]
+pub enum ActionSource {
+    Library,
+    Viewer(AnyWindowHandle),
+}
+
 impl Job {
     /// The notice shown when the job succeeds: what changed, not that something saved.
     pub(crate) fn done(&self) -> String {
@@ -40,7 +47,7 @@ impl Job {
                 },
             ) => format!("Network {name} created"),
             Self::Create(spec) => format!("{} created", spec.name.trim()),
-            Self::Import(path, _)
+            Self::Import(path, ..)
             | Self::ConvertDisk {
                 destination: path,
                 ..
@@ -53,7 +60,7 @@ impl Job {
             }
             Self::Appliance(_) => "Appliance imported".into(),
             Self::Operation(_, op) => op.done(),
-            Self::Action(machine, action) => match action {
+            Self::Action(machine, action, _) => match action {
                 Action::Start => format!("{} starting", machine.name),
                 Action::Shutdown => format!("Shutdown requested for {}", machine.name),
                 Action::Pause => format!("{} paused", machine.name),
@@ -87,7 +94,7 @@ impl Job {
                 },
             ) => "Saving memory dump",
             Self::Operation(..) => "Applying changes",
-            Self::Action(_, action) => match action {
+            Self::Action(_, action, _) => match action {
                 Action::Start => "Starting machine",
                 Action::Shutdown => "Requesting shutdown",
                 Action::Pause => "Pausing machine",
@@ -106,15 +113,17 @@ pub(crate) struct Response {
     pub(crate) architectures: Option<Vec<String>>,
 }
 pub(crate) enum JobEvent {
-    DisplayReady(Machine),
+    DisplayReady(Box<Machine>, ActionSource),
     Complete(Box<Response>),
 }
 
 pub(crate) struct Pending {
     pub(crate) refresh: bool,
     pub(crate) hardware_save: Option<String>,
+    pub(crate) disk_rename: Option<(String, String, String)>,
     pub(crate) receiver: Receiver<JobEvent>,
     pub(crate) form: Option<WeakEntity<EditorForm>>,
+    pub(crate) action_source: Option<ActionSource>,
     pub(crate) label: &'static str,
     /// Notice for success, from `Job::done`.
     pub(crate) done: String,

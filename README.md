@@ -79,7 +79,7 @@ in [the release workflow](.github/workflows/release.yml), Rust, and
 
 ```sh
 packaging/build-release.sh target/stage
-VERSION=0.2.1 STAGE="$PWD/target/stage" nfpm package --config packaging/nfpm.yaml --packager deb
+VERSION=0.2.2 STAGE="$PWD/target/stage" nfpm package --config packaging/nfpm.yaml --packager deb
 ```
 
 Use `--packager rpm` for Fedora. Pushing a `v*` tag that matches the version in
@@ -182,18 +182,26 @@ restarts. Click the guest display to capture input and press `Ctrl Alt` to
 release it. **Scale image to fit** keeps the current guest resolution.
 **Resize guest to fit** asks the guest to match the viewer's size and requires
 compatible guest display drivers or a SPICE agent. In fullscreen, move to the top edge
-to reveal the toolbar or pin it to keep it visible.
+to reveal the toolbar or pin it to keep it visible. Start or Resume inside the
+viewer continues in that window. The viewer's scaling menu includes a
+**Performance overlay** with live FPS, average FPS, and 1% low.
+[How to measure display smoothness](docs/display-performance.md)
 
 Use **Convert disk** in the machine library's + menu to convert between VMDK,
 QCOW2, and VDI. The tool verifies the new image and keeps the source. Select the
 activity indicator in the sidebar to see progress while an operation runs.
 
 Hardware, device changes, exports, cloning, and snapshot restoration require a
-powered-off guest where indicated. Shared clipboard needs SPICE guest tools;
-shared folders use a 9p mount tag. USB devices are listed from sysfs and use the
-permissions granted by libvirt. **Hardware → Advanced → Edit XML** updates the
-machine's registered libvirt configuration and preserves the VM UUID. The
-`machine.xml` beside the disks records how the machine was created or imported.
+powered-off guest where indicated. In **Hardware → Storage**, open the drive's
+actions menu and choose **Edit drive…** to set its bus and target, such as
+`vda`, `vdb`, or `vdc`. Each target must be unique on the machine.
+
+**Hardware → Advanced → Edit XML** edits the registered libvirt configuration
+and preserves the VM UUID. New machine folders use that configuration directly.
+**Export folder…** writes one importable `machine.xml` with a tag that asks
+for CPU and memory settings before registration. Libvirt failures show the
+underlying diagnostic in the relevant form, viewer, or library.
+[Machine XML and hardware review](docs/machine-configuration.md)
 
 Snapshots use libvirt's internal snapshot support. QCOW2 stores the snapshot
 data inside the disk images, including guest memory for a running full-system

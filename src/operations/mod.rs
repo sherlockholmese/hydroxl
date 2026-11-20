@@ -4,6 +4,7 @@ mod capture;
 mod cloning;
 mod devices;
 mod disks;
+pub(crate) use disks::{target_prefix, validate_disk_target};
 mod display;
 mod export;
 mod guest;
@@ -51,10 +52,11 @@ pub fn execute(
         Operation::BootOrder(order) => boot::apply_boot_order(c, machine, order),
         Operation::Platform(p) => platform::apply_platform(c, machine, p),
         Operation::Nic(nic) => platform::apply_nic(c, machine, nic),
-        Operation::DiskBus {
+        Operation::DiskInterface {
             target,
+            new_target,
             bus,
-        } => platform::apply_disk_bus(c, machine, target, bus),
+        } => disks::apply_disk_interface(c, machine, &target, &new_target, &bus),
         Operation::AddSerial {
             kind,
             port,

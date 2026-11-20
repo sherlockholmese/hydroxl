@@ -28,18 +28,10 @@ fn row_actions(device: &Device) -> Vec<(&'static str, RowAction, bool)> {
                 false,
             ),
             ("Eject", RowAction::Direct(|d| Operation::EjectIso(d.target.clone())), false),
-            (
-                "Change interface",
-                RowAction::Form(|m, d| workflows::disk_bus(m, d.target.clone())),
-                true,
-            ),
+            ("Edit drive…", RowAction::Form(workflows::edit_drive), true),
         ],
         "disk" => vec![
-            (
-                "Change interface",
-                RowAction::Form(|m, d| workflows::disk_bus(m, d.target.clone())),
-                true,
-            ),
+            ("Edit drive…", RowAction::Form(workflows::edit_drive), true),
             ("Resize", RowAction::Form(|m, d| workflows::resize(m, d.target.clone())), true),
             ("Compact", RowAction::Form(|m, d| workflows::compact(m, d.target.clone())), true),
             (

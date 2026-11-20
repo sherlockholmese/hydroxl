@@ -63,8 +63,9 @@ pub enum Operation {
     BootOrder(Vec<String>),
     Platform(super::platform::Platform),
     Nic(super::platform::NicChange),
-    DiskBus {
+    DiskInterface {
         target: String,
+        new_target: String,
         bus: String,
     },
     AddSerial {
@@ -306,10 +307,10 @@ impl Operation {
             Self::BootOrder(_) => "Boot order saved".into(),
             Self::Platform(_) => "Platform settings saved".into(),
             Self::Nic(_) => "Network adapter saved".into(),
-            Self::DiskBus {
-                target,
+            Self::DiskInterface {
+                new_target,
                 ..
-            } => format!("Bus changed for {target}"),
+            } => format!("Drive saved as {new_target}"),
             Self::AddSerial {
                 ..
             } => "Serial port added".into(),

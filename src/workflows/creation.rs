@@ -180,21 +180,54 @@ fn suggested_name(stem: &str, os: &str) -> String {
 }
 
 pub fn import_xml() -> FormSpec {
+    use crate::backend::{ImportHardware, import_hardware};
+    use std::{cell::RefCell, path::Path, rc::Rc};
+    let selection = Rc::new(RefCell::new((String::new(), None::<ImportHardware>)));
+    let derived = selection.clone();
     FormSpec::new(
         "Import libvirt XML",
         "Import",
         vec![
             F::path("Libvirt configuration", Picker::Xml),
             F::choice("QEMU backend", QemuBuild::OPTIONS, "bundled"),
+            F::text("Virtual CPUs", "").row(1),
+            F::text("Memory", "").suffix("MB").row(1),
         ],
         |v| {
             let path = PathBuf::from(&v[0]);
             if !path.is_file() {
                 bail!("Choose a machine XML file.");
             }
-            Ok(Job::Import(path, QemuBuild::from_choice(&v[1])?))
+            let hardware = if import_hardware(&path)?.is_some() {
+                let vcpus = number(v, 2, "virtual CPU count")?;
+                let memory_mib = number(v, 3, "memory size")?;
+                if !(1..=256).contains(&vcpus) {
+                    bail!("Use 1 to 256 virtual CPUs.");
+                }
+                if !(64..=1024 * 1024).contains(&memory_mib) {
+                    bail!("Use between 64 MB and 1 TB of memory.");
+                }
+                Some(ImportHardware {
+                    vcpus,
+                    memory_mib,
+                })
+            } else {
+                None
+            };
+            Ok(Job::Import(path, QemuBuild::from_choice(&v[1])?, hardware))
         },
     )
+    .derive(move |v| {
+        let mut selection = derived.borrow_mut();
+        let path = v[0].trim();
+        if selection.0 != path {
+            *selection = (path.into(), import_hardware(Path::new(path)).ok().flatten());
+        }
+        selection.1.map_or_else(Vec::new, |hardware| {
+            vec![(2, hardware.vcpus.to_string()), (3, hardware.memory_mib.to_string())]
+        })
+    })
+    .visible(move |index, _| index < 2 || selection.borrow().1.is_some())
 }
 
 pub fn import(location: PathBuf) -> FormSpec {
@@ -293,12 +326,48 @@ mod tests {
             }
             let build = match (form.submit)(&values)? {
                 Job::Create(spec) => spec.qemu_build,
-                Job::Import(_, build) => build,
+                Job::Import(_, build, _) => build,
                 Job::Appliance(spec) => spec.qemu_build,
                 _ => unreachable!(),
             };
             assert_eq!(build, QemuBuild::System);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn tagged_xml_reveals_hardware_and_requires_values_before_import() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("machine.xml");
+        let xml =
+            "<domain><name>Fixture</name><memory unit='GiB'>6</memory><vcpu>8</vcpu></domain>";
+        let form = import_path(path.clone(), temp.path().into());
+        let mut values: Vec<_> = form.fields.iter().map(|field| field.value.clone()).collect();
+        let derive = form.derive.as_ref().unwrap();
+        let visible = form.visible.as_ref().unwrap();
+        std::fs::write(&path, crate::backend::add_hardware_review(xml)?)?;
+        assert!(!visible(2, &values));
+        for (index, value) in derive(&values) {
+            values[index] = value;
+        }
+        assert!(visible(2, &values) && visible(3, &values));
+        assert_eq!(&values[2..], ["8", "6144"]);
+        values[2] = "4".into();
+        assert!(matches!(
+            (form.submit)(&values)?,
+            Job::Import(
+                _,
+                _,
+                Some(crate::backend::ImportHardware {
+                    vcpus: 4,
+                    memory_mib: 6144
+                })
+            )
+        ));
+        values[2] = "0".into();
+        assert!((form.submit)(&values).is_err());
+        std::fs::write(&path, xml)?;
+        assert!(matches!((form.submit)(&values)?, Job::Import(_, _, None)));
         Ok(())
     }
 }

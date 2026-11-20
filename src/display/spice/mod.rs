@@ -1123,7 +1123,7 @@ unsafe extern "C" fn on_open_fd(channel: Object, tls: c_int, data: Object) {
     let fd = match client.attachment.open(client.options.graphics) {
         Ok(fd) => fd,
         Err(error) => {
-            client.disconnect(&error.to_string());
+            client.disconnect(&format!("{error:#}"));
             return;
         }
     };

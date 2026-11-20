@@ -188,8 +188,12 @@ impl Workspace {
                                             h_flex()
                                                 .gap_2()
                                                 .text_color(p.danger)
-                                                .child(Icon::new(Glyph::CircleAlert).size_4())
-                                                .child(error),
+                                                .child(
+                                                    Icon::new(Glyph::CircleAlert)
+                                                        .size_4()
+                                                        .flex_shrink_0(),
+                                                )
+                                                .child(div().min_w_0().flex_1().child(error)),
                                         )
                                     },
                                 )
@@ -277,14 +281,22 @@ impl Workspace {
                 )
                 .into_any_element();
         }
-        if self.library_error.is_some() && self.machines.is_empty() {
+        if let Some(error) = self.library_error.as_ref().filter(|_| self.machines.is_empty()) {
             return center
                 .child(Icon::new(Glyph::ServerOff).size(px(32.)).text_color(p.muted))
                 .child(
                     div()
                         .text_size(px(BODY_SIZE + 2.))
                         .font_weight(FontWeight::SEMIBOLD)
-                        .child("No connection"),
+                        .child("Could not load machines"),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .max_w(px(480.))
+                        .text_size(px(BODY_SIZE))
+                        .text_color(p.muted)
+                        .child(error.clone()),
                 )
                 .child(Button::new("retry-connection").outline().label("Retry").on_click(
                     cx.listener(|this, _, _, cx| {

@@ -237,58 +237,6 @@ pub(super) fn apply_nic(c: Connection, machine: &Machine, nic: NicChange) -> Res
     define(c, &xml)
 }
 
-/// Moves a disk to another interface. The target name follows the bus convention
-/// (vd* VirtIO, sd* SATA/SCSI/USB, hd* IDE); the guest-visible address is reassigned.
-pub(super) fn apply_disk_bus(
-    c: Connection,
-    machine: &Machine,
-    target: String,
-    bus: String,
-) -> Result<()> {
-    let prefix = match bus.as_str() {
-        "virtio" => "vd",
-        "sata" | "scsi" | "usb" => "sd",
-        "ide" => "hd",
-        _ => bail!("Choose a disk interface."),
-    };
-    let id = machine.id.as_str();
-    editable(c, id)?;
-    let mut xml = backend::virsh(c, &["dumpxml", id, "--inactive"])?;
-    let doc = roxmltree::Document::parse(&xml)?;
-    let used: Vec<&str> = doc
-        .descendants()
-        .filter(|n| n.has_tag_name("target") && n.parent().is_some_and(|p| p.has_tag_name("disk")))
-        .filter_map(|n| n.attribute("dev"))
-        .collect();
-    let disk = doc
-        .descendants()
-        .find(|n| {
-            n.has_tag_name("disk")
-                && n.children()
-                    .any(|c| c.has_tag_name("target") && c.attribute("dev") == Some(&target))
-        })
-        .context("The disk no longer exists.")?;
-    let new_target = if target.starts_with(prefix) {
-        target.clone()
-    } else {
-        ('a'..='z')
-            .map(|l| format!("{prefix}{l}"))
-            .find(|t| !used.contains(&t.as_str()))
-            .context("No free disk name is available.")?
-    };
-    let mut edits = Vec::new();
-    for child in disk.children().filter(|c| c.is_element()) {
-        if child.has_tag_name("target") {
-            edits.push((child.range(), format!("<target dev='{new_target}' bus='{bus}'/>")));
-        } else if child.has_tag_name("address") {
-            edits.push((child.range(), String::new()));
-        }
-    }
-    drop(doc);
-    apply(&mut xml, edits);
-    define(c, &xml)
-}
-
 /// Adds a serial port: a pseudo-terminal, or a TCP server bound to localhost.
 pub(super) fn apply_add_serial(
     c: Connection,

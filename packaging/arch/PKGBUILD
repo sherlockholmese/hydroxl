@@ -1,6 +1,6 @@
 pkgname=hydroxl
 # Keep pkgver in sync with Cargo.toml.
-pkgver=0.2.1
+pkgver=0.2.2
 pkgrel=1
 pkgdesc='A quiet, native QEMU/KVM workspace for Linux'
 arch=('x86_64')

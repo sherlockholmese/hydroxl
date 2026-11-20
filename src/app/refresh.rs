@@ -1,4 +1,4 @@
-use crate::app::{Job, JobEvent, Pending, Response, Workspace};
+use crate::app::{ActionSource, Job, JobEvent, Pending, Response, Workspace};
 use crate::appliance;
 use crate::backend;
 use crate::backend::{Action, State};
@@ -22,7 +22,7 @@ impl Workspace {
             return false;
         }
         if self.demo {
-            if let Job::Action(machine, action) = job {
+            if let Job::Action(machine, action, _) = job {
                 if let Some(m) = self.machines.iter_mut().find(|m| m.id == machine.id) {
                     match action {
                         Action::Start | Action::Resume => m.state = State::Running,
@@ -42,9 +42,26 @@ impl Workspace {
         }
         let label = job.label();
         let done = job.done();
+        let action_source = match &job {
+            Job::Action(_, _, source) => Some(*source),
+            _ => None,
+        };
         let c = self.preferences.connection;
         let hardware_save = match &job {
             Job::Operation(machine, Operation::Sequence(_)) => Some(machine.id.clone()),
+            _ => None,
+        };
+        let disk_rename = match &job {
+            Job::Operation(
+                machine,
+                Operation::DiskInterface {
+                    target,
+                    new_target,
+                    ..
+                },
+            ) if target != new_target => {
+                Some((machine.id.clone(), target.clone(), new_target.clone()))
+            }
             _ => None,
         };
         let selected = self.selected.clone();
@@ -71,10 +88,10 @@ impl Workspace {
                 _ => None,
             };
             let open_display = match &job {
-                Job::Action(machine, Action::Start | Action::Resume) => {
+                Job::Action(machine, Action::Start | Action::Resume, source) => {
                     let mut machine = machine.clone();
                     machine.state = State::Running;
-                    Some(machine)
+                    Some((machine, *source))
                 }
                 _ => None,
             };
@@ -82,9 +99,11 @@ impl Workspace {
             let outcome = match job {
                 Job::Refresh | Job::Icon(..) => Ok(()),
                 Job::Network(net) => backend::network::create(c, &net),
-                Job::Action(m, action) => backend::action(c, &m.id, action, m.spice_viewer),
+                Job::Action(m, action, _) => backend::action(c, &m.id, action, m.spice_viewer),
                 Job::Create(spec) => backend::create(c, &spec),
-                Job::Import(path, qemu_build) => backend::import(c, &path, qemu_build),
+                Job::Import(path, qemu_build, hardware) => {
+                    backend::import(c, &path, qemu_build, hardware)
+                }
                 Job::ConvertDisk {
                     source,
                     destination,
@@ -93,18 +112,18 @@ impl Workspace {
                 Job::Appliance(spec) => appliance::import(c, &spec, &progress),
                 Job::Operation(m, op) => operations::execute(c, &m, op, &progress),
             }
-            .map_err(|e| e.to_string());
+            .map_err(|e| format!("{e:#}"));
             if outcome.is_ok()
-                && let Some(machine) = open_display
+                && let Some((machine, source)) = open_display
             {
-                let _ = tx.send(JobEvent::DisplayReady(machine));
+                let _ = tx.send(JobEvent::DisplayReady(Box::new(machine), source));
             }
             if outcome.is_ok() && cached_machines.is_none() && !refresh {
                 progress.update("Refreshing library", None);
             }
             let machines = match cached_machines {
                 Some(machines) => Ok(machines),
-                None => backend::machines(c).map_err(|e| e.to_string()),
+                None => backend::machines(c).map_err(|e| format!("{e:#}")),
             };
             if importing && outcome.is_ok() {
                 select_name = machines
@@ -129,7 +148,7 @@ impl Workspace {
                     .map(|machine| {
                         (
                             machine.id.clone(),
-                            operations::details(c, &machine.id).map_err(|e| e.to_string()),
+                            operations::details(c, &machine.id).map_err(|e| format!("{e:#}")),
                         )
                     })
             });
@@ -144,8 +163,10 @@ impl Workspace {
         self.pending = Some(Pending {
             refresh,
             hardware_save,
+            disk_rename,
             receiver: rx,
             form,
+            action_source,
             label,
             done,
             reporter,
@@ -185,8 +206,19 @@ impl Workspace {
         }
         let response = match self.pending.as_ref().map(|p| p.receiver.try_recv()) {
             Some(Ok(JobEvent::Complete(response))) => response,
-            Some(Ok(JobEvent::DisplayReady(machine))) => {
-                self.open_machine_display(machine, cx);
+            Some(Ok(JobEvent::DisplayReady(machine, source))) => {
+                match source {
+                    ActionSource::Library => self.open_machine_display(*machine, cx),
+                    ActionSource::Viewer(handle) => {
+                        if let Some((_, _, view)) =
+                            self.display_windows.iter().find(|(_, window, _)| *window == handle)
+                        {
+                            let _ = handle.update(cx, |_, window, cx| {
+                                let _ = view.update(cx, |view, cx| view.ensure_session(window, cx));
+                            });
+                        }
+                    }
+                }
                 return;
             }
             Some(Err(mpsc::TryRecvError::Disconnected)) => {
@@ -200,13 +232,14 @@ impl Workspace {
                         });
                     }
                     if pending.refresh {
-                        if self.library_error.as_ref() != Some(&error) {
+                        if !self.machines.is_empty() && self.library_error.as_ref() != Some(&error)
+                        {
                             window.push_notification(Notification::error(error.clone()), cx);
                         }
                         self.library_error = Some(error);
                         self.loaded = true;
                     } else {
-                        window.push_notification(Notification::error(error), cx);
+                        show_job_error(error, pending.action_source, window, cx);
                     }
                     cx.notify();
                 }
@@ -224,6 +257,12 @@ impl Workspace {
                     if pending.hardware_save.is_some() && pending.hardware_save == self.selected {
                         self.saved_hardware_for = pending.hardware_save;
                     }
+                    if let Some((id, old, new)) = pending.disk_rename
+                        && let Some(draft) =
+                            self.hardware_draft.as_mut().filter(|draft| draft.id == id)
+                    {
+                        draft.rename_boot_drive(&old, &new);
+                    }
                     self.notice = Some(pending.done.clone());
                     if let Some(form) = pending.form {
                         let open = form
@@ -239,14 +278,18 @@ impl Workspace {
                     }
                 }
                 Err(error) => {
-                    if let Some(form) = pending.form {
-                        let _ = form.update(cx, |form, cx| {
+                    let displayed_in_form = pending.form.is_some_and(|form| {
+                        form.update(cx, |form, cx| {
                             form.pending = false;
                             form.error = Some(error.clone());
                             cx.notify();
-                        });
+                            form.open
+                        })
+                        .unwrap_or(false)
+                    });
+                    if !displayed_in_form {
+                        show_job_error(error, pending.action_source, window, cx);
                     }
-                    window.push_notification(Notification::error(error), cx);
                 }
             }
         }
@@ -274,7 +317,7 @@ impl Workspace {
                 }
             }
             Err(error) => {
-                if self.library_error.as_ref() != Some(&error) {
+                if !self.machines.is_empty() && self.library_error.as_ref() != Some(&error) {
                     window.push_notification(Notification::error(error.clone()), cx);
                 }
                 self.library_error = Some(error);
@@ -310,4 +353,17 @@ impl Workspace {
         }
         cx.notify();
     }
+}
+
+fn show_job_error(error: String, source: Option<ActionSource>, window: &mut Window, cx: &mut App) {
+    if let Some(ActionSource::Viewer(handle)) = source
+        && handle
+            .update(cx, |_, window, cx| {
+                window.push_notification(Notification::error(error.clone()), cx)
+            })
+            .is_ok()
+    {
+        return;
+    }
+    window.push_notification(Notification::error(error), cx);
 }
