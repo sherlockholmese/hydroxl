@@ -2,6 +2,7 @@ extern crate gpui_kit as gpui;
 mod app;
 mod appliance;
 mod backend;
+mod crash_report;
 mod display;
 mod forms;
 mod operations;
@@ -10,17 +11,25 @@ mod ui;
 mod workflows;
 use app::{Preferences, Workspace};
 use gpui_kit::*;
-use std::path::PathBuf;
+use std::{path::PathBuf, process::ExitCode};
 gpui_kit::actions!(
     hydroxl,
     [NewMachineAction, RefreshAction, PreferencesAction, AboutAction, QuitAction]
 );
 
-fn main() {
-    let args: Vec<_> = std::env::args_os().skip(1).collect();
+fn main() -> ExitCode {
+    let mut args = std::env::args_os().skip(1).peekable();
+    let supervised = args.next_if(|arg| arg == crash_report::UI_ARG).is_some();
+    let args: Vec<_> = args.collect();
     if args.iter().any(|a| a == "--help" || a == "-h") {
         println!("Hydroxl\n\nUsage: hydroxl [--demo] [--import] [FILE.ova | FILE.ovf | FILE.xml]");
-        return;
+        return ExitCode::SUCCESS;
+    }
+    if !supervised {
+        match crash_report::run(&args) {
+            Ok(code) => return code,
+            Err(error) => eprintln!("Could not supervise Hydroxl: {error:#}"),
+        }
     }
     let demo = args.iter().any(|a| a == "--demo");
     let initial = args.iter().find(|a| !a.to_string_lossy().starts_with('-')).map(PathBuf::from);
@@ -67,4 +76,5 @@ fn main() {
         })
         .detach();
     });
+    ExitCode::SUCCESS
 }

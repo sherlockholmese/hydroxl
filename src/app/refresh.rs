@@ -82,7 +82,7 @@ impl Workspace {
             let outcome = match job {
                 Job::Refresh | Job::Icon(..) => Ok(()),
                 Job::Network(net) => backend::network::create(c, &net),
-                Job::Action(m, action) => backend::action(c, &m.id, action, !m.spice_viewer),
+                Job::Action(m, action) => backend::action(c, &m.id, action, m.spice_viewer),
                 Job::Create(spec) => backend::create(c, &spec),
                 Job::Import(path, qemu_build) => backend::import(c, &path, qemu_build),
                 Job::ConvertDisk {

@@ -97,12 +97,12 @@ fn parse_machine(id: &str, xml: &str, state: State) -> Result<Machine> {
         notes: text("description").to_owned(),
         os,
         icon: String::new(),
-        spice_viewer: false,
+        spice_viewer: true,
     })
 }
 
-/// `in_app` adds Hydroxl's local VNC display at start; otherwise graphics are left as configured.
-pub fn action(connection: Connection, id: &str, action: Action, in_app: bool) -> Result<()> {
+/// Prepare the selected viewer's local display when starting a guest.
+pub fn action(connection: Connection, id: &str, action: Action, prefer_spice: bool) -> Result<()> {
     match action {
         Action::Display => bail!("Open the display from the machine library."),
         Action::Start => {
@@ -111,10 +111,10 @@ pub fn action(connection: Connection, id: &str, action: Action, in_app: bool) ->
                 .lines()
                 .any(|line| line.starts_with("Managed save:") && line.contains("yes"));
             if !saved {
-                let display_setup = if in_app {
-                    ensure_display(connection, id)
-                } else {
+                let display_setup = if prefer_spice {
                     super::spice::prepare(connection, id)
+                } else {
+                    ensure_display(connection, id)
                 };
                 if let Err(error) = display_setup {
                     eprintln!("Could not prepare the guest display: {error:#}");
@@ -207,7 +207,7 @@ pub fn demo_machines() -> Vec<Machine> {
         notes: String::new(),
         os: os.into(),
         icon: String::new(),
-        spice_viewer: false,
+        spice_viewer: true,
     })
     .collect()
 }

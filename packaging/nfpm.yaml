@@ -73,6 +73,7 @@ overrides:
       - libwayland-client0
       - libfontconfig1
       - xdg-desktop-portal
+      - zenity
     recommends:
       - dnsmasq-base
       - passt
@@ -118,6 +119,7 @@ overrides:
       - libwayland-client
       - fontconfig
       - xdg-desktop-portal
+      - zenity
     recommends:
       - dnsmasq
       - passt

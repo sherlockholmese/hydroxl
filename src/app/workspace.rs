@@ -103,7 +103,7 @@ impl Workspace {
         self.selected.as_ref().and_then(|id| self.machines.iter().find(|m| &m.id == id))
     }
 
-    /// Copies icon overrides from preferences onto the loaded machines.
+    /// Applies per-machine preferences to loaded machines.
     pub(crate) fn apply_icons(&mut self) {
         for machine in &mut self.machines {
             machine.icon = self
@@ -113,14 +113,15 @@ impl Workspace {
                 .find(|(id, _)| *id == machine.id)
                 .map(|(_, key)| key.clone())
                 .unwrap_or_default();
-            machine.spice_viewer = self.preferences.spice.contains(&machine.id);
+            machine.spice_viewer = !self.preferences.vnc.contains(&machine.id);
         }
     }
 
     pub(crate) fn set_spice_viewer(&mut self, id: String, spice: bool, cx: &mut Context<Self>) {
-        self.preferences.spice.retain(|existing| *existing != id);
         if spice {
-            self.preferences.spice.push(id);
+            self.preferences.vnc.remove(&id);
+        } else {
+            self.preferences.vnc.insert(id);
         }
         self.preferences.save();
         self.apply_icons();

@@ -274,8 +274,8 @@ impl DisplayView {
                 }
                 let id = id.clone();
                 let prefer_spice = this
-                    .update(cx, |view, cx| view.machine(cx).is_some_and(|m| m.spice_viewer))
-                    .unwrap_or(false);
+                    .update(cx, |view, cx| view.machine(cx).is_none_or(|m| m.spice_viewer))
+                    .unwrap_or(true);
                 let result = cx
                     .background_executor()
                     .spawn(async move {

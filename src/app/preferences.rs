@@ -1,14 +1,17 @@
 use crate::backend::Connection;
 use crate::display::geometry::Scaling;
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+};
 pub(crate) struct Preferences {
     pub(crate) dark: bool,
     pub(crate) connection: Connection,
     pub(crate) selected: Option<String>,
     /// Per-machine icon overrides: machine id and mark key.
     pub(crate) icons: Vec<(String, String)>,
-    /// Machines configured to prefer SPICE.
-    pub(crate) spice: Vec<String>,
+    /// Machines explicitly configured to prefer VNC over the default SPICE viewer.
+    pub(crate) vnc: BTreeSet<String>,
     pub(crate) display_scaling: Scaling,
     pub(crate) vm_scaling: BTreeMap<String, Scaling>,
     pub(crate) toolbar_pinned: bool,
@@ -33,6 +36,10 @@ impl Preferences {
 
     pub(crate) fn load() -> Self {
         let text = Self::path().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
+        Self::parse(&text)
+    }
+
+    fn parse(text: &str) -> Self {
         Self {
             dark: !text.lines().any(|l| l == "light"),
             connection: if text.lines().any(|l| l == "system") {
@@ -65,9 +72,9 @@ impl Preferences {
                 .filter_map(|l| l.strip_prefix("icon=")?.split_once(' '))
                 .map(|(id, key)| (id.to_owned(), key.to_owned()))
                 .collect(),
-            spice: text
+            vnc: text
                 .lines()
-                .filter_map(|l| l.strip_prefix("viewer=spice "))
+                .filter_map(|l| l.strip_prefix("viewer=vnc "))
                 .map(String::from)
                 .collect(),
         }
@@ -106,7 +113,7 @@ impl Preferences {
                 .iter()
                 .map(|(id, key)| format!("icon={id} {key}\n"))
                 .collect::<String>()
-                + &self.spice.iter().map(|id| format!("viewer=spice {id}\n")).collect::<String>()
+                + &self.vnc.iter().map(|id| format!("viewer=vnc {id}\n")).collect::<String>()
                 + &self
                     .vm_scaling
                     .iter()
@@ -122,5 +129,18 @@ impl Preferences {
                 eprintln!("Could not save preferences: {error}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Preferences;
+
+    #[test]
+    fn only_explicit_vnc_overrides_the_spice_default() {
+        let preferences = Preferences::parse("viewer=spice legacy\nviewer=vnc opted-out\n");
+        assert!(!preferences.vnc.contains("legacy"));
+        assert!(!preferences.vnc.contains("new-machine"));
+        assert!(preferences.vnc.contains("opted-out"));
     }
 }

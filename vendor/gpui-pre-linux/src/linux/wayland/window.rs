@@ -776,10 +776,8 @@ impl Drop for WaylandWindow {
     fn drop(&mut self) {
         self.0.frame_loop.set(FrameLoop::Parked);
 
-        {
-            let state = self.0.state.borrow();
-            state.client.release_guest_capture(&state.surface.id());
-        }
+        let capture_client = self.borrow().client.clone();
+        capture_client.release_guest_capture(&self.0.surface_id());
         let mut state = self.0.state.borrow_mut();
         let surface_id = state.surface.id();
 
@@ -1728,12 +1726,13 @@ impl rwh::HasDisplayHandle for WaylandWindow {
 
 impl PlatformWindow for WaylandWindow {
     fn set_cursor_hidden(&mut self, hidden: bool) -> anyhow::Result<()> {
-        let state = self.0.state.borrow();
-        state.client.capture_cursor(&state.surface, hidden)
+        // The client can query this window's output scale to draw or restore the cursor.
+        let client = self.borrow().client.clone();
+        client.capture_cursor(&self.0.surface(), hidden)
     }
     fn set_cursor_image(&mut self, image: Option<gpui::CursorImage>) -> anyhow::Result<()> {
-        let state = self.0.state.borrow();
-        state.client.capture_cursor_image(&state.surface, image)
+        let client = self.borrow().client.clone();
+        client.capture_cursor_image(&self.0.surface(), image)
     }
     fn lock_pointer(&mut self, lock: bool) -> anyhow::Result<()> {
         let state = self.0.state.borrow();

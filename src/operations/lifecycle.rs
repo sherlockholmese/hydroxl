@@ -28,7 +28,7 @@ pub(super) fn apply_reboot(c: Connection, machine: &Machine) -> Result<()> {
     // Some guests (Windows by default) treat the request as the power button and switch
     // off instead of restarting. Watch in the background and start them again, so the
     // action still returns at once and the app never waits on the guest.
-    let (id, in_app) = (id.to_owned(), !machine.spice_viewer);
+    let (id, prefer_spice) = (id.to_owned(), machine.spice_viewer);
     std::thread::spawn(move || {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
         while std::time::Instant::now() < deadline {
@@ -36,7 +36,7 @@ pub(super) fn apply_reboot(c: Connection, machine: &Machine) -> Result<()> {
             match backend::virsh(c, &["domstate", &id]).as_deref().map(str::trim) {
                 Ok("shut off") => {
                     if let Err(error) =
-                        backend::action(c, &id, crate::backend::Action::Start, in_app)
+                        backend::action(c, &id, crate::backend::Action::Start, prefer_spice)
                     {
                         eprintln!("Could not start the machine after restart: {error:#}");
                     }

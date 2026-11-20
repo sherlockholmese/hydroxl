@@ -79,7 +79,7 @@ in [the release workflow](.github/workflows/release.yml), Rust, and
 
 ```sh
 packaging/build-release.sh target/stage
-VERSION=0.2.0 STAGE="$PWD/target/stage" nfpm package --config packaging/nfpm.yaml --packager deb
+VERSION=0.2.1 STAGE="$PWD/target/stage" nfpm package --config packaging/nfpm.yaml --packager deb
 ```
 
 Use `--packager rpm` for Fedora. Pushing a `v*` tag that matches the version in
@@ -96,8 +96,8 @@ the release.
 - libvirt's QEMU driver, a working user session or system connection, and `virsh`.
 - `virt-install` for machine creation and OVA/OVF import.
 - `virt-clone` for full clones.
-- Hydroxl displays guests through local VNC or SPICE. SPICE needs the system
-  SPICE Client GLib runtime. Accelerated SPICE also needs an EGL driver with
+- Hydroxl uses SPICE by default. Select VNC per machine under **Hardware → Display and sound**.
+  SPICE needs the system SPICE Client GLib runtime. Accelerated SPICE also needs an EGL driver with
   DMA-BUF import support.
 - Local peer-to-peer QEMU D-Bus displays are supported. See the
   [GPUI patch plan](docs/gpui-patch-plan.md) for the experimental Vulkan path.
@@ -105,6 +105,8 @@ the release.
 - `passt` for shared-network port forwarding.
 - `curl` for the explicit Windows guest-tools download action.
 - A working desktop file-picker portal for native file and folder selection.
+- Zenity for the crash dialog. On hosts with systemd-coredump, saved crash archives
+  include the core dump when it is available to your user.
 - UEFI firmware when selecting UEFI. The Arch package requires `swtpm` and
   `libtpms` for TPM 2.0 emulation. Hydroxl checks
   libvirt’s advertised capabilities before creating a disk. For an x86-64 KVM

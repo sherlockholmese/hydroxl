@@ -1,6 +1,6 @@
 pkgname=hydroxl
 # Keep pkgver in sync with Cargo.toml.
-pkgver=0.2.0
+pkgver=0.2.1
 pkgrel=1
 pkgdesc='A quiet, native QEMU/KVM workspace for Linux'
 arch=('x86_64')
@@ -14,7 +14,7 @@ depends=(
   'libtpms' 'liburing' 'libusb' 'libvirt' 'libx11' 'libxcb' 'libxkbcommon' 'libxkbcommon-x11'
   'lzo' 'mesa' 'numactl' 'pixman' 'qemu-system-x86' 'spice' 'spice-gtk'
   'swtpm' 'systemd-libs' 'usbredir' 'virt-install' 'vulkan-driver' 'vulkan-icd-loader'
-  'wayland' 'xdg-desktop-portal' 'zlib' 'zstd'
+  'wayland' 'xdg-desktop-portal' 'zenity' 'zlib' 'zstd'
 )
 makedepends=('glib2-devel' 'glslang' 'libisoburn' 'meson' 'ninja' 'python-setuptools'
   'python-wheel' 'python-yaml'
