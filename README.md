@@ -79,7 +79,7 @@ in [the release workflow](.github/workflows/release.yml), Rust, and
 
 ```sh
 packaging/build-release.sh target/stage
-VERSION=0.2.3 STAGE="$PWD/target/stage" nfpm package --config packaging/nfpm.yaml --packager deb
+VERSION=0.3.0 STAGE="$PWD/target/stage" nfpm package --config packaging/nfpm.yaml --packager deb
 ```
 
 Use `--packager rpm` for Fedora. Pushing a `v*` tag that matches the version in
