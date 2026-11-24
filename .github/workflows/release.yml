@@ -16,11 +16,11 @@ env:
 
 jobs:
   version:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2604
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: useblacksmith/checkout@v1
       - id: version
         name: Read the version and check it matches the tag
         run: |
@@ -38,12 +38,12 @@ jobs:
 
   arch:
     needs: version
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-16vcpu-ubuntu-2604
     container: archlinux:base-devel
     steps:
       - name: Install git
         run: pacman -Syu --noconfirm --needed git
-      - uses: actions/checkout@v4
+      - uses: useblacksmith/checkout@v1
       - name: Prepare an unprivileged build user
         run: |
           useradd --create-home builder
@@ -60,7 +60,7 @@ jobs:
 
   deb:
     needs: version
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-16vcpu-ubuntu-2604
     container: debian:trixie
     steps:
       - name: Install build dependencies
@@ -82,7 +82,7 @@ jobs:
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-      - uses: actions/checkout@v4
+      - uses: useblacksmith/checkout@v1
       - name: Install nfpm
         run: |
           curl -sSfL "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz" \
@@ -103,7 +103,7 @@ jobs:
 
   rpm:
     needs: version
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-16vcpu-ubuntu-2604
     container: fedora:latest
     steps:
       - name: Install build dependencies
@@ -124,7 +124,7 @@ jobs:
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-      - uses: actions/checkout@v4
+      - uses: useblacksmith/checkout@v1
       - name: Install nfpm
         run: |
           curl -sSfL "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz" \
@@ -146,7 +146,7 @@ jobs:
   release:
     needs: [version, arch, deb, rpm]
     if: startsWith(github.ref, 'refs/tags/')
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-16vcpu-ubuntu-2604
     steps:
       - uses: actions/download-artifact@v4
         with:
