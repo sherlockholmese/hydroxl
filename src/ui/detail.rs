@@ -1,11 +1,10 @@
-use super::primitives::{logo_tile, status_color};
+use super::primitives::{logo_tile, plain_error, segmented, status_color};
 use crate::NewMachineAction;
 use crate::app::Workspace;
 use crate::backend::{Action, State};
 use crate::theme::{BODY_SIZE, CONTENT_WIDTH, Palette, TITLE_SIZE, WIDE_CONTENT_WIDTH, motion};
 use gpui_kit::assets::IconName as Glyph;
 use gpui_kit::component::spinner::Spinner;
-use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::{button::*, *};
 use gpui_kit::{prelude::*, *};
 
@@ -64,6 +63,8 @@ impl Workspace {
                     ),
             );
         }
+        // One primary per screen: while Hardware holds unsaved edits, Save leads.
+        let draft_open = self.tab == 1 && self.hardware_dirty();
         let (label, action, glyph) = match machine.state {
             State::Stopped if machine.saved_state => ("Resume", Action::Start, Glyph::Play),
             State::Stopped | State::Other => ("Start", Action::Start, Glyph::Play),
@@ -72,7 +73,13 @@ impl Workspace {
         };
         controls = controls.child(
             Button::new("primary-machine-action")
-                .primary()
+                .map(|b| {
+                    if draft_open {
+                        b.outline()
+                    } else {
+                        b.primary()
+                    }
+                })
                 .label(label)
                 .icon(Icon::new(glyph))
                 .disabled(busy || machine.state == State::Other)
@@ -98,7 +105,7 @@ impl Workspace {
                     )
                     .child(
                         div()
-                            .text_size(px(BODY_SIZE - 1.))
+                            .text_size(px(BODY_SIZE))
                             .text_color(status_color(machine, p))
                             .child(machine.status()),
                     ),
@@ -117,12 +124,12 @@ impl Workspace {
             .child(
                 v_flex()
                     .flex_shrink_0()
-                    .gap_5()
+                    .gap_6()
                     .px(gutter)
                     .pt(if narrow {
                         px(12.)
                     } else {
-                        px(28.)
+                        px(24.)
                     })
                     .pb_4()
                     .when(narrow, |this| {
@@ -135,6 +142,7 @@ impl Workspace {
                                     .icon(Icon::new(Glyph::ChevronLeft))
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.library_open = true;
+                                        this.pane_swapped = Some(std::time::Instant::now());
                                         cx.notify();
                                     })),
                             ),
@@ -150,22 +158,27 @@ impl Workspace {
                             .child(controls)
                             .into_any_element()
                     }))
-                    .when(true, |this| {
-                        this.child(
-                            div().w_full().max_w(px(content_width)).mx_auto().child(
-                                TabBar::new("machine-tabs")
-                                    .segmented()
-                                    .selected_index(self.tab)
-                                    .children(TABS.into_iter().map(|title| Tab::new().label(title)))
-                                    .on_click(cx.listener(|this, index: &usize, _, cx| {
-                                        this.tab = *index;
-                                        cx.notify();
-                                    })),
-                            ),
+                    .child(div().w_full().max_w(px(content_width)).mx_auto().child({
+                        let weak = cx.entity().downgrade();
+                        segmented(
+                            "machine-tabs",
+                            &TABS,
+                            Some(self.tab),
+                            true,
+                            move |index, _, cx| {
+                                let _ = weak.update(cx, |this, cx| {
+                                    this.tab = index;
+                                    // The tab's own fade carries the change; the
+                                    // category highlight arrives already in place.
+                                    this.hardware_section.settle();
+                                    cx.notify();
+                                });
+                            },
+                            cx,
                         )
-                    }),
+                    })),
             )
-            .when(true, |this| {
+            .map(|this| {
                 this.child(
                     div()
                         .id("machine-content")
@@ -193,7 +206,12 @@ impl Workspace {
                                                         .size_4()
                                                         .flex_shrink_0(),
                                                 )
-                                                .child(div().min_w_0().flex_1().child(error)),
+                                                .child(
+                                                    div()
+                                                        .min_w_0()
+                                                        .flex_1()
+                                                        .child(plain_error(&error)),
+                                                ),
                                         )
                                     },
                                 )
@@ -205,14 +223,19 @@ impl Workspace {
                                             "content-{}-{}",
                                             machine.id, self.tab
                                         )),
-                                        Animation::new(motion::SWAP).with_easing(motion::ease_out),
+                                        Animation::new(motion::SWAP)
+                                            .with_easing(motion::emphasized),
                                         |el, t| el.opacity(t).top(px(motion::TRAVEL * (1. - t))),
                                     ),
                                 ),
                         ),
                 )
             })
-            .when(self.tab == 1 && self.hardware_dirty(), |this| {
+            // The bar stays mounted while it leaves, and takes no input once it is leaving.
+            // Its presence is retargeted in the workspace render; here it only draws.
+            .when(self.save_bar.mounted(std::time::Instant::now()), |this| {
+                let bar = self.save_bar;
+                let leaving = !bar.shown();
                 this.child(
                     h_flex()
                         .relative()
@@ -232,7 +255,7 @@ impl Workspace {
                                     Button::new("discard-hardware")
                                         .outline()
                                         .label("Discard")
-                                        .disabled(busy)
+                                        .disabled(busy || leaving)
                                         .on_click(
                                             cx.listener(|this, _, _, cx| this.discard_hardware(cx)),
                                         ),
@@ -240,28 +263,30 @@ impl Workspace {
                                 .child(
                                     Button::new("save-hardware")
                                         .primary()
-                                        .label(
-                                            if self
-                                                .pending
+                                        .label("Save changes")
+                                        .loading(
+                                            self.pending
                                                 .as_ref()
-                                                .is_some_and(|job| job.hardware_save.is_some())
-                                            {
-                                                "Saving…"
-                                            } else {
-                                                "Save changes"
-                                            },
+                                                .is_some_and(|job| job.hardware_save.is_some()),
                                         )
-                                        .disabled(busy)
+                                        .disabled(busy || leaving)
                                         .on_click(
                                             cx.listener(|this, _, _, cx| this.save_hardware(cx)),
                                         ),
                                 ),
                         )
-                        .with_animation(
-                            "save-bar",
-                            Animation::new(motion::REVEAL).with_easing(motion::ease_out),
-                            |el, t| el.opacity(t).top(px(8. * (1. - t))),
-                        ),
+                        .map(|el| {
+                            let at = |el: gpui_kit::Stateful<Div>, v: f32| {
+                                el.opacity(v).top(px(motion::TRAVEL * (1. - v)))
+                            };
+                            let now = std::time::Instant::now();
+                            let el = at(el.id("save-bar-plane"), bar.value(now));
+                            el.with_animation(
+                                SharedString::from(format!("save-bar-{}", bar.generation())),
+                                Animation::new(bar.remaining(now).max(motion::EXIT)),
+                                move |el, _| at(el, bar.value(std::time::Instant::now())),
+                            )
+                        }),
                 )
             })
             .into_any_element()
@@ -283,10 +308,9 @@ impl Workspace {
         }
         if let Some(error) = self.library_error.as_ref().filter(|_| self.machines.is_empty()) {
             return center
-                .child(Icon::new(Glyph::ServerOff).size(px(32.)).text_color(p.muted))
                 .child(
                     div()
-                        .text_size(px(BODY_SIZE + 2.))
+                        .text_size(px(TITLE_SIZE))
                         .font_weight(FontWeight::SEMIBOLD)
                         .child("Could not load machines"),
                 )
@@ -294,9 +318,10 @@ impl Workspace {
                     div()
                         .w_full()
                         .max_w(px(480.))
+                        .text_center()
                         .text_size(px(BODY_SIZE))
                         .text_color(p.muted)
-                        .child(error.clone()),
+                        .child(plain_error(error)),
                 )
                 .child(Button::new("retry-connection").outline().label("Retry").on_click(
                     cx.listener(|this, _, _, cx| {
@@ -308,17 +333,7 @@ impl Workspace {
         center
             .child(
                 div()
-                    .size(px(48.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded_lg()
-                    .bg(p.well)
-                    .child(Icon::new(Glyph::Monitor).size_6().text_color(p.muted)),
-            )
-            .child(
-                div()
-                    .text_size(px(BODY_SIZE + 2.))
+                    .text_size(px(TITLE_SIZE))
                     .font_weight(FontWeight::SEMIBOLD)
                     .child("No machines"),
             )

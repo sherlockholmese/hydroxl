@@ -1,7 +1,7 @@
-use super::primitives::caption;
+use super::primitives::{caption, item_list, notice, plain_error, section};
 use crate::app::Workspace;
 use crate::backend::{Machine, State};
-use crate::theme::{BODY_SIZE, Palette};
+use crate::theme::{BODY_SIZE, Palette, ROW_HEIGHT};
 use crate::workflows::{self, SnapshotAction};
 use gpui_kit::assets::IconName as Glyph;
 use gpui_kit::component::menu::{DropdownMenu, PopupMenuItem};
@@ -15,7 +15,7 @@ impl Workspace {
         let restorable = machine.state == State::Stopped && !machine.saved_state;
         let weak = cx.entity().downgrade();
         let m = machine.clone();
-        let mut rows = v_flex();
+        let mut rows = Vec::new();
         for (i, snapshot) in self.details.snapshots.iter().enumerate() {
             let s = snapshot.clone();
             let weak = weak.clone();
@@ -26,6 +26,7 @@ impl Workspace {
                 .icon(Icon::new(Glyph::Ellipsis))
                 .accessibility_label(format!("{} actions", s.label))
                 .dropdown_menu_with_anchor(Anchor::TopRight, move |mut menu, _, _| {
+                    menu = menu.min_w(px(super::primitives::MENU_MIN_WIDTH));
                     for action in SnapshotAction::ALL {
                         let weak = weak.clone();
                         let m = m.clone();
@@ -34,7 +35,7 @@ impl Workspace {
                             menu = menu.separator();
                         }
                         menu = menu.item(
-                            PopupMenuItem::new(action.label())
+                            PopupMenuItem::new(format!("{}…", action.label()))
                                 .disabled(
                                     busy || (action == SnapshotAction::Restore && !restorable),
                                 )
@@ -55,13 +56,11 @@ impl Workspace {
                 Some(parent) => format!("{}, from {parent}", snapshot.state),
                 None => snapshot.state.clone(),
             };
-            rows = rows.child(
+            rows.push(
                 h_flex()
                     .gap_3()
-                    .py_3()
-                    .border_b_1()
-                    .border_color(p.border)
-                    .child(Icon::new(Glyph::Camera).size_4().flex_shrink_0().text_color(p.muted))
+                    .min_h(px(ROW_HEIGHT))
+                    .py_2()
                     .child(
                         v_flex()
                             .flex_1()
@@ -75,41 +74,51 @@ impl Workspace {
                             )
                             .child(caption(detail, p)),
                     )
-                    .child(menu),
+                    .child(menu)
+                    .into_any_element(),
             );
         }
+        let loading = self.details_for != self.selected;
+        let take = Button::new("new-snapshot")
+            .ghost()
+            .small()
+            .label("Take snapshot…")
+            .icon(Icon::new(Glyph::Plus))
+            .disabled(busy || self.demo)
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.open_form(workflows::snapshot(&m), window, cx)
+            }))
+            .into_any_element();
+        let has_snapshots = !rows.is_empty();
         v_flex()
-            .gap_2()
+            .gap_6()
+            // Restore needs a powered-off machine; say so once, with the way to get there.
+            .when(has_snapshots && !restorable, |this| {
+                this.child(self.locked_notice(machine, "restore", p, cx))
+            })
             .child(
-                h_flex().justify_end().child(
-                    Button::new("new-snapshot")
-                        .outline()
-                        .small()
-                        .label("Take snapshot")
-                        .icon(Icon::new(Glyph::Camera))
-                        .disabled(busy || self.demo)
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.open_form(workflows::snapshot(&m), window, cx)
-                        })),
-                ),
+                section("Snapshots", Some(take))
+                    .when_some(self.details.snapshot_error.clone(), |this, error| {
+                        this.child(
+                            h_flex()
+                                .gap_2()
+                                .text_color(p.danger)
+                                .child(Icon::new(Glyph::CircleAlert).size_4().flex_shrink_0())
+                                .child(div().flex_1().min_w_0().child(plain_error(&error))),
+                        )
+                    })
+                    .when(!has_snapshots, |this| {
+                        this.child(notice(
+                            if loading {
+                                "Loading"
+                            } else {
+                                "No snapshots"
+                            },
+                            p,
+                        ))
+                    })
+                    .when(has_snapshots, |this| this.child(item_list(rows, p))),
             )
-            .when_some(self.details.snapshot_error.clone(), |this, error| {
-                this.child(
-                    h_flex()
-                        .gap_2()
-                        .text_color(p.danger)
-                        .child(Icon::new(Glyph::CircleAlert).size_4())
-                        .child(error),
-                )
-            })
-            .when(self.details.snapshots.is_empty(), |this| {
-                this.child(div().py_6().text_color(p.muted).child(if busy {
-                    "Loading"
-                } else {
-                    "No snapshots"
-                }))
-            })
-            .child(rows)
             .into_any_element()
     }
 }

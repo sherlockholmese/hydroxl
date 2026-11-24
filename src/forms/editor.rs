@@ -26,6 +26,8 @@ pub struct EditorForm {
     pub(super) action: &'static str,
     pub pending: bool,
     pub error: Option<String>,
+    /// The field the error belongs to, when validation could name one.
+    pub(super) error_field: Option<usize>,
     pub open: bool,
     pub(super) parent: WeakEntity<Workspace>,
     pub(super) destructive: bool,
@@ -108,6 +110,7 @@ impl EditorForm {
             action: spec.action,
             pending: false,
             error: None,
+            error_field: None,
             open: true,
             parent,
             destructive: spec.destructive,
@@ -228,6 +231,25 @@ impl EditorForm {
         self.visible.as_ref().is_none_or(|v| v(index, values))
     }
 
+    /// Records a validation failure. One that names its field opens Advanced when the
+    /// field is there, and moves a wizard back to the field's step.
+    fn fail(&mut self, error: anyhow::Error) {
+        self.error = Some(error.to_string());
+        self.error_field = error
+            .downcast_ref::<super::FieldError>()
+            .map(|e| e.field)
+            .filter(|&i| i < self.fields.len());
+        if let Some(i) = self.error_field {
+            let spec = &self.fields[i].spec;
+            if spec.advanced {
+                self.advanced_open = true;
+            }
+            if !self.steps.is_empty() {
+                self.step = spec.step;
+            }
+        }
+    }
+
     pub(super) fn is_review(&self) -> bool {
         !self.steps.is_empty() && self.step == self.steps.len()
     }
@@ -237,10 +259,11 @@ impl EditorForm {
         match self.check.as_ref().map_or(Ok(()), |check| check(self.step, &values)) {
             Ok(()) => {
                 self.error = None;
+                self.error_field = None;
                 self.step += 1;
                 self.advanced_open = false;
             }
-            Err(error) => self.error = Some(error.to_string()),
+            Err(error) => self.fail(error),
         }
         cx.notify();
     }
@@ -248,6 +271,7 @@ impl EditorForm {
     pub(super) fn back(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.step = self.step.saturating_sub(1);
         self.error = None;
+        self.error_field = None;
         cx.notify();
     }
 
@@ -263,6 +287,7 @@ impl EditorForm {
             }
             Ok(job) => {
                 self.error = None;
+                self.error_field = None;
                 let form = cx.entity().downgrade();
                 let started = self
                     .parent
@@ -273,7 +298,7 @@ impl EditorForm {
                     self.error = Some("Wait for the current operation to finish.".into());
                 }
             }
-            Err(error) => self.error = Some(error.to_string()),
+            Err(error) => self.fail(error),
         }
         cx.notify();
     }

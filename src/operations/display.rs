@@ -199,7 +199,7 @@ fn display_settings(
     }
     let vram = if vram > 0 && ["qxl", "vga", "bochs"].contains(&model.as_str()) {
         if !(8..=512).contains(&vram) {
-            bail!("Use 8 to 512 MB of video memory.");
+            bail!("Use 8 to 512 MiB of video memory.");
         }
         format!(" vram='{}'", vram * 1024)
     } else {

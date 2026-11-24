@@ -1,8 +1,8 @@
-use super::primitives::{caption, ledger, section};
+use super::primitives::{caption, ledger, notice, section, setting as setting_row, tabular};
 use crate::app::{Job, Workspace};
 use crate::backend::{Action, Machine, State};
 use crate::operations::Operation;
-use crate::theme::{BODY_SIZE, CAPTION_SIZE, LABEL_WIDTH, Palette};
+use crate::theme::{BODY_SIZE, CAPTION_SIZE, Palette, ROW_HEIGHT};
 use crate::workflows::{self, DeviceAction, HardwareDraft, label};
 use gpui_kit::assets::IconName as Glyph;
 use gpui_kit::component::clipboard::Clipboard;
@@ -91,19 +91,17 @@ impl Workspace {
         let values = self.hardware_values();
         let mut page = v_flex().gap_6();
         if !machine.can_edit() {
-            page = page.child(self.locked_notice(machine, p, cx));
+            page = page.child(self.locked_notice(machine, "edit", p, cx));
         }
         let Some((original, d)) = values else {
             return page
                 .child(
-                    section("System", None, p)
-                        .border_t_0()
-                        .pt_0()
+                    section("System", None)
                         .child(ledger("Architecture", machine.architecture().to_owned(), p))
                         .child(ledger("CPU", vcpus(machine.cpus), p))
                         .child(ledger("Memory", machine.memory(), p)),
                 )
-                .child(caption(
+                .child(notice(
                     if self.details_for != self.selected && self.library_error.is_none() {
                         "Loading"
                     } else {
@@ -116,38 +114,23 @@ impl Workspace {
         let one_socket = crate::backend::Topology::one_socket(d.topology.vcpus());
         let machine_types = workflows::machine_types(&machine.arch);
         let current_type = workflows::machine_type_family(&d.machine_type);
-        let setting = |label: &'static str, control: AnyElement| {
-            h_flex()
-                .gap_4()
-                .w_full()
-                .min_h(px(40.))
-                .text_size(px(BODY_SIZE))
-                .child(div().w(px(LABEL_WIDTH)).flex_shrink_0().text_color(p.muted).child(label))
-                .child(div().flex_1().min_w_0().child(control))
-        };
+        let setting = |label: &'static str, control: AnyElement| setting_row(label, control, p);
 
-        let advanced_row = |label: &'static str, control: AnyElement| {
-            h_flex()
-                .justify_between()
-                .items_center()
-                .gap_4()
-                .min_h(px(40.))
-                .child(div().flex_1().min_w_0().text_size(px(BODY_SIZE)).child(label))
-                .child(control)
-        };
-
-        let system = section("System", None, p)
-            .when(machine.can_edit(), |s| s.border_t_0().pt_0())
+        // Settings here collect in the draft behind Save. The few that apply on their own
+        // (operating system, architecture) read as a value plus a Change… action, so a
+        // control never looks like part of the draft when it is not.
+        let system = section("System", None)
             .child(setting("Operating system", {
                 let m = machine.clone();
                 let os = crate::backend::os_name(&machine.os).unwrap_or("Not set").to_owned();
                 h_flex()
+                    .gap_3()
+                    .child(div().min_w_0().child(os))
                     .child(
                         Button::new("change-os")
-                            .outline()
+                            .ghost()
                             .small()
-                            .label(os)
-                            .dropdown_caret(true)
+                            .label("Change…")
                             .disabled(self.busy())
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.open_form(workflows::operating_system(&m), window, cx)
@@ -156,53 +139,40 @@ impl Workspace {
                     .into_any_element()
             }))
             .child(setting("Architecture", self.architecture_control(machine, cx)))
-            .child(
+            .child(setting(
+                "CPU",
                 h_flex()
-                    .gap_4()
-                    .w_full()
-                    .min_h(px(48.))
-                    .child(
-                        div().w(px(LABEL_WIDTH)).flex_shrink_0().text_color(p.muted).child("CPU"),
-                    )
-                    .child(
-                        h_flex()
-                            .gap_3()
-                            .child(self.stepper(
-                                "Sockets",
-                                d.topology.sockets,
-                                1..=8,
-                                editable,
-                                |d, v| d.topology.sockets = v,
-                                cx,
-                            ))
-                            .child(self.stepper(
-                                "Cores",
-                                d.topology.cores,
-                                1..=128,
-                                editable,
-                                |d, v| d.topology.cores = v,
-                                cx,
-                            ))
-                            .child(self.stepper(
-                                "Threads",
-                                d.topology.threads,
-                                1..=4,
-                                editable,
-                                |d, v| d.topology.threads = v,
-                                cx,
-                            ))
-                            .child(
-                                v_flex().gap_1().child(caption("Total", p)).child(
-                                    div()
-                                        .h(px(32.))
-                                        .flex()
-                                        .items_center()
-                                        .child(vcpus(d.topology.vcpus())),
-                                ),
-                            )
-                            .into_any_element(),
-                    ),
-            )
+                    .py_2()
+                    .gap_3()
+                    .child(self.stepper(
+                        "Sockets",
+                        d.topology.sockets,
+                        1..=8,
+                        editable,
+                        |d, v| d.topology.sockets = v,
+                        cx,
+                    ))
+                    .child(self.stepper(
+                        "Cores",
+                        d.topology.cores,
+                        1..=128,
+                        editable,
+                        |d, v| d.topology.cores = v,
+                        cx,
+                    ))
+                    .child(self.stepper(
+                        "Threads",
+                        d.topology.threads,
+                        1..=4,
+                        editable,
+                        |d, v| d.topology.threads = v,
+                        cx,
+                    ))
+                    .child(v_flex().gap_1().child(caption("Total", p)).child(
+                        div().h(px(32.)).flex().items_center().child(vcpus(d.topology.vcpus())),
+                    ))
+                    .into_any_element(),
+            ))
             .when(original.implicit_topology && original.topology.sockets > 1, |system| {
                 system.child(setting(
                     "",
@@ -210,7 +180,6 @@ impl Workspace {
                         .outline()
                         .small()
                         .label("Use 1 socket")
-                        .tooltip("Keep the total vCPU count")
                         .disabled(!editable || d.topology == one_socket || one_socket.cores > 256)
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.edit_hardware(
@@ -304,7 +273,7 @@ impl Workspace {
         } else {
             "3D acceleration"
         };
-        let display = section("Display and sound", None, p)
+        let display = section("Display and sound", None)
             .child(setting(
                 "Graphics",
                 self.choice_menu(
@@ -334,6 +303,10 @@ impl Workspace {
                     ),
                 ))
             })
+            // One choice of how the machine is viewed. VNC and SPICE pick the viewer on this
+            // computer and apply at once, even while it runs; D-Bus changes the machine's
+            // configuration, so choosing it (or leaving it) goes into the draft and brings up
+            // the Save bar, which is what tells the two apart.
             .child(setting("Viewer", {
                 let id = machine.id.clone();
                 let selected = if d.local_dbus {
@@ -411,13 +384,6 @@ impl Workspace {
                             row.child(caption(hint, p))
                         },
                     )
-                    .when(
-                        windows
-                            && triton_arch
-                            && self.details.neptune_ready
-                            && (d.accel3d || d.graphics == "virtio"),
-                        |row| row.child(caption("Requires the Triton driver from Guest tools.", p)),
-                    )
                     .into_any_element(),
             ))
             .child(setting(
@@ -435,7 +401,7 @@ impl Workspace {
                 "Clipboard",
                 self.switch(
                     "clipboard",
-                    "clipboard",
+                    "Clipboard",
                     d.clipboard,
                     editable,
                     |d, on| d.clipboard = on,
@@ -461,7 +427,6 @@ impl Workspace {
                         &[],
                         cx,
                     )),
-                    p,
                 )
                 .map(|s| {
                     let rows = self.device_rows(machine, &["usb"], cx);
@@ -512,9 +477,9 @@ impl Workspace {
                     "Advanced",
                     Some(
                         Button::new("edit-xml")
-                            .outline()
+                            .ghost()
                             .small()
-                            .label("Edit XML")
+                            .label("Edit XML…")
                             .disabled(!editable)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 if let Some(m) = this.selected_machine().cloned() {
@@ -524,60 +489,53 @@ impl Workspace {
                             }))
                             .into_any_element(),
                     ),
-                    p,
                 )
-                .child(
-                    v_flex()
-                        .max_w(px(480.))
-                        .w_full()
-                        .gap_1()
-                        .child(advanced_row(
-                            "Reclaim unused guest memory",
-                            self.switch(
-                                "balloon",
-                                "Reclaim unused guest memory",
-                                d.platform.balloon,
-                                editable,
-                                |d, on| d.platform.balloon = on,
-                                cx,
-                            ),
-                        ))
-                        .child(advanced_row(
-                            "Provide hardware randomness",
-                            self.switch(
-                                "rng",
-                                "Provide hardware randomness",
-                                d.platform.rng,
-                                editable,
-                                |d, on| d.platform.rng = on,
-                                cx,
-                            ),
-                        ))
-                        .child(advanced_row(
-                            "Optimize Windows virtualization",
-                            self.switch(
-                                "hyperv",
-                                "Optimize Windows virtualization",
-                                d.platform.hyperv,
-                                editable,
-                                |d, on| d.platform.hyperv = on,
-                                cx,
-                            ),
-                        ))
-                        .child(advanced_row(
-                            "Use local time for the guest clock",
-                            self.switch(
-                                "localtime",
-                                "Use local time for the guest clock",
-                                d.platform.localtime,
-                                editable,
-                                |d, on| d.platform.localtime = on,
-                                cx,
-                            ),
-                        )),
-                ),
+                .child(setting(
+                    "Reclaim memory",
+                    self.switch(
+                        "balloon",
+                        "Reclaim unused guest memory",
+                        d.platform.balloon,
+                        editable,
+                        |d, on| d.platform.balloon = on,
+                        cx,
+                    ),
+                ))
+                .child(setting(
+                    "Hardware RNG",
+                    self.switch(
+                        "rng",
+                        "Provide hardware randomness",
+                        d.platform.rng,
+                        editable,
+                        |d, on| d.platform.rng = on,
+                        cx,
+                    ),
+                ))
+                .child(setting(
+                    "Hyper-V tuning",
+                    self.switch(
+                        "hyperv",
+                        "Optimize Windows virtualization",
+                        d.platform.hyperv,
+                        editable,
+                        |d, on| d.platform.hyperv = on,
+                        cx,
+                    ),
+                ))
+                .child(setting(
+                    "Guest clock",
+                    self.segmented(
+                        "localtime",
+                        &["UTC", "Local time"],
+                        usize::from(d.platform.localtime),
+                        editable,
+                        |d, i| d.platform.localtime = i == 1,
+                        cx,
+                    ),
+                )),
             )
-            .layout(page, self.wide, self.hardware_section, self.hardware_section_from, cx)
+            .layout(page, self.wide, self.hardware_section, cx)
     }
 
     /// Network cards: model, MAC address, isolation.
@@ -600,36 +558,23 @@ impl Workspace {
             cx,
         );
         let forwards = self.device_rows(machine, &["forward"], cx);
-        let mut group = section("Network", Some(new), p);
+        let mut group = section("Network", Some(new));
         if d.nics.is_empty() {
-            return group.child(caption("No network cards", p)).when(!forwards.is_empty(), |g| {
+            return group.child(notice("No network cards", p)).when(!forwards.is_empty(), |g| {
                 g.child(super::primitives::item_list(forwards, p))
             });
         }
         for (i, nic) in d.nics.iter().enumerate() {
-            let setting = |label: &'static str, control: AnyElement| {
-                h_flex()
-                    .gap_4()
-                    .w_full()
-                    .min_h(px(40.))
-                    .child(
-                        div().w(px(LABEL_WIDTH)).flex_shrink_0().text_color(p.muted).child(label),
-                    )
-                    .child(div().flex_1().min_w_0().child(control))
-            };
+            let setting = |label: &'static str, control: AnyElement| setting_row(label, control, p);
             let card_xml = self
                 .details
                 .devices
                 .iter()
                 .find(|dev| dev.kind == "network" && dev.target == nic.mac)
                 .map(|dev| dev.xml.clone());
-            // The card itself reads like a Storage row: what it is, its address, and a
-            // menu for actions on the card. Its settings follow, indented to the label column.
-            let mode = match nic.kind.as_str() {
-                "network" => "Virtual network",
-                "bridge" => "Bridged network",
-                _ => "Shared network",
-            };
+            // The card itself reads like a Storage row: which card, its address, and a
+            // menu for actions on the card. Its mode is the setting just below, not repeated.
+            let title = format!("Network card {}", i + 1);
             let weak = cx.entity().downgrade();
             let busy = self.busy();
             let card_menu = Button::new(("nic-actions", i))
@@ -693,7 +638,7 @@ impl Workspace {
                             Icon::new(Glyph::Network).size_4().flex_shrink_0().text_color(p.muted),
                         )
                         .child(
-                            v_flex().flex_1().min_w_0().child(mode).child(
+                            v_flex().flex_1().min_w_0().child(title).child(
                                 caption(nic.new_mac.clone(), p)
                                     .font_family(cx.theme().mono_font_family.clone()),
                             ),
@@ -782,7 +727,7 @@ impl Workspace {
     ) -> AnyElement {
         let p = Palette::get(cx);
         if options.is_empty() {
-            return caption("None available", p).into_any_element();
+            return div().text_color(p.muted).child("None").into_any_element();
         }
         let apply = std::rc::Rc::new(apply);
         let weak = cx.entity().downgrade();
@@ -840,7 +785,7 @@ impl Workspace {
                             .ghost()
                             .xsmall()
                             .icon(Icon::new(Glyph::Minus))
-                            .accessibility_label("1 GB less memory")
+                            .accessibility_label("1 GiB less memory")
                             .disabled(!enabled || mib <= 1024)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.edit_hardware(
@@ -854,7 +799,7 @@ impl Workspace {
                             Input::new(&self.memory_input)
                                 .appearance(false)
                                 .small()
-                                .aria_label("Memory in MB")
+                                .aria_label("Memory in MiB")
                                 .disabled(!enabled),
                         ),
                     )
@@ -863,7 +808,7 @@ impl Workspace {
                             .ghost()
                             .xsmall()
                             .icon(Icon::new(Glyph::Plus))
-                            .accessibility_label("1 GB more memory")
+                            .accessibility_label("1 GiB more memory")
                             .disabled(!enabled || mib + 1024 > 1024 * 1024)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.edit_hardware(
@@ -873,7 +818,7 @@ impl Workspace {
                             })),
                     ),
             )
-            .child(div().text_color(p.muted).child("MB"))
+            .child(div().text_color(p.muted).child("MiB"))
             .into_any_element()
     }
 
@@ -909,7 +854,13 @@ impl Workspace {
                                 this.edit_hardware(|d| set(d, value - 1), cx)
                             })),
                     )
-                    .child(div().w(px(32.)).text_center().child(value.to_string()))
+                    .child(
+                        div()
+                            .w(px(32.))
+                            .text_center()
+                            .font_features(tabular())
+                            .child(value.to_string()),
+                    )
                     .child(
                         Button::new((unit, 1usize))
                             .ghost()
@@ -1066,9 +1017,9 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let count = d.boot.len();
-        let list = section("Boot order", None, p);
+        let list = section("Boot order", None);
         if count == 0 {
-            return list.child(caption("No bootable devices", p));
+            return list.child(notice("No bootable devices", p));
         }
         let mut rows = Vec::new();
         for (i, entry) in d.boot.iter().enumerate() {
@@ -1083,7 +1034,7 @@ impl Workspace {
                 h_flex()
                     .id(("boot-row", i))
                     .gap_3()
-                    .min_h(px(52.))
+                    .min_h(px(ROW_HEIGHT))
                     .rounded_md()
                     .border_t_2()
                     .border_color(gpui_kit::transparent_black())
@@ -1176,9 +1127,9 @@ impl Workspace {
         );
         let rows = self.device_rows(machine, &["disk", "cdrom"], cx);
         let empty = rows.is_empty();
-        section("Storage", Some(add), p)
+        section("Storage", Some(add))
             .when(!empty, |s| s.child(super::primitives::item_list(rows, p)))
-            .when(empty, |s| s.child(caption("No drives", p)))
+            .when(empty, |s| s.child(notice("No drives", p)))
     }
 
     /// Architecture as a menu of what libvirt can run here. Choosing one confirms first,
@@ -1193,58 +1144,52 @@ impl Workspace {
         if !options.contains(&current) {
             options.insert(0, current.clone());
         }
+        // Same anatomy as Operating system: the value, then Change… when it can change.
+        let value = div().min_w_0().child(machine.architecture().to_owned());
         if !machine.can_edit() || self.busy() || options.len() < 2 {
-            return div().child(machine.architecture().to_owned()).into_any_element();
+            return value.into_any_element();
         }
         let weak = cx.entity().downgrade();
         let m = machine.clone();
         h_flex()
-            .child(
-                Button::new("architecture")
-                    .outline()
-                    .small()
-                    .label(machine.architecture().to_owned())
-                    .dropdown_caret(true)
-                    .dropdown_menu(move |mut menu, _, _| {
-                        menu = menu.min_w(px(super::primitives::MENU_MIN_WIDTH));
-                        let host = std::env::consts::ARCH;
-                        for arch in &options {
-                            let weak = weak.clone();
-                            let m = m.clone();
-                            let value = arch.clone();
-                            let text = label(workflows::ARCHITECTURES, arch).to_owned();
-                            let native = arch == host || (host == "x86_64" && arch == "i686");
-                            let item = PopupMenuItem::element(move |_, cx| {
-                                h_flex()
-                                    .w_full()
-                                    .gap_4()
-                                    .justify_between()
-                                    .child(text.clone())
-                                    .child(
-                                        div()
-                                            .text_size(px(CAPTION_SIZE))
-                                            .text_color(cx.theme().muted_foreground)
-                                            .child(if native {
-                                                "Virtualized"
-                                            } else {
-                                                "Emulated"
-                                            }),
-                                    )
-                            })
-                            .checked(*arch == m.arch)
-                            .on_click(move |_, window, cx| {
-                                if value == m.arch {
-                                    return;
-                                }
-                                let _ = weak.update(cx, |this, cx| {
-                                    this.open_form(workflows::architecture(&m, &value), window, cx)
-                                });
+            .gap_3()
+            .child(value)
+            .child(Button::new("architecture").ghost().small().label("Change…").dropdown_menu(
+                move |mut menu, _, _| {
+                    menu = menu.min_w(px(super::primitives::MENU_MIN_WIDTH));
+                    let host = std::env::consts::ARCH;
+                    for arch in &options {
+                        let weak = weak.clone();
+                        let m = m.clone();
+                        let value = arch.clone();
+                        let text = label(workflows::ARCHITECTURES, arch).to_owned();
+                        let native = arch == host || (host == "x86_64" && arch == "i686");
+                        let item = PopupMenuItem::element(move |_, cx| {
+                            h_flex().w_full().gap_4().justify_between().child(text.clone()).child(
+                                div()
+                                    .text_size(px(CAPTION_SIZE))
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(if native {
+                                        "Virtualized"
+                                    } else {
+                                        "Emulated"
+                                    }),
+                            )
+                        })
+                        .checked(*arch == m.arch)
+                        .on_click(move |_, window, cx| {
+                            if value == m.arch {
+                                return;
+                            }
+                            let _ = weak.update(cx, |this, cx| {
+                                this.open_form(workflows::architecture(&m, &value), window, cx)
                             });
-                            menu = menu.item(item);
-                        }
-                        menu
-                    }),
-            )
+                        });
+                        menu = menu.item(item);
+                    }
+                    menu
+                },
+            ))
             .into_any_element()
     }
 
@@ -1277,11 +1222,10 @@ impl Workspace {
                     }))
                     .into_any_element(),
             ),
-            p,
         );
         let shares: Vec<_> = self.details.devices.iter().filter(|d| d.kind == "share").collect();
         if shares.is_empty() {
-            return group.child(caption("No shared folders", p));
+            return group.child(notice("No shared folders", p));
         }
         let os = self.share_os.unwrap_or_else(|| GuestOs::of(machine));
         let mono = cx.theme().mono_font_family.clone();
@@ -1301,8 +1245,20 @@ impl Workspace {
                             .min_w_0()
                             .child(div().truncate().child(share.source.clone()))
                             .child(
-                                caption(format!("{}  {}", share.target, driver.label()), p)
-                                    .when(unreadable, |c| c.text_color(p.attention)),
+                                // The warning is worded, not only colored.
+                                caption(
+                                    if unreadable {
+                                        format!(
+                                            "{}, {}, not readable by Windows",
+                                            share.target,
+                                            driver.label()
+                                        )
+                                    } else {
+                                        format!("{}, {}", share.target, driver.label())
+                                    },
+                                    p,
+                                )
+                                .when(unreadable, |c| c.text_color(p.attention)),
                             ),
                     )
                     .child({
@@ -1424,7 +1380,7 @@ impl Workspace {
                 Button::new("share-guest-tools")
                     .outline()
                     .small()
-                    .label("Install")
+                    .label("Mount…")
                     .disabled(self.busy() || machine.state == State::Other)
                     .on_click(cx.listener(|this, _, window, cx| {
                         if let Some(m) = this.selected_machine().cloned() {
@@ -1526,8 +1482,8 @@ impl Workspace {
                 .into_any_element(),
         );
         group
-            .child(div().h(px(16.)))
-            .child(section("In the guest", Some(picker), p))
+            .child(div().h_4())
+            .child(section("In the guest", Some(picker)))
             .child(super::primitives::item_list(rows, p))
     }
 
@@ -1556,23 +1512,15 @@ impl Workspace {
                         .is_some_and(matches)
             })
         };
-        let row = |label: &'static str, control: AnyElement| {
-            h_flex()
-                .gap_4()
-                .w_full()
-                .min_h(px(40.))
-                .text_size(px(BODY_SIZE))
-                .child(div().w(px(LABEL_WIDTH)).flex_shrink_0().text_color(p.muted).child(label))
-                .child(div().flex_1().min_w_0().child(control))
-        };
+        let row = |label: &'static str, control: AnyElement| setting_row(label, control, p);
 
         let drivers = if disc(|name| name == "virtio-win.iso") {
-            div().child("Disc mounted").into_any_element()
+            div().child("Mounted").into_any_element()
         } else {
             Button::new("install-guest-tools")
                 .outline()
                 .small()
-                .label("Mount disc")
+                .label("Mount…")
                 .disabled(!can_mount)
                 .on_click(cx.listener(|this, _, window, cx| {
                     if let Some(m) = this.selected_machine().cloned() {
@@ -1598,7 +1546,7 @@ impl Workspace {
                 .into_any_element()
         };
 
-        let section = section("Guest tools", None, p)
+        let section = section("Guest tools", None)
             .when(windows, |s| s.child(row("VirtIO drivers", drivers)))
             .child(row("Guest agent", agent));
         if !triton {
@@ -1622,7 +1570,7 @@ impl Workspace {
                     )
                 });
                 let bundled = Button::new("triton-bundled-qemu")
-                    .label("Switch")
+                    .label("Use bundled")
                     .disabled(!editable)
                     .on_click(cx.listener(|this, _, _, cx| {
                         if let Some(m) = this.selected_machine().cloned() {
@@ -1655,26 +1603,52 @@ impl Workspace {
                     }))
                     .into_any_element()
             };
-        section.child(
-            h_flex()
-                .items_start()
-                .gap_4()
-                .w_full()
-                .text_size(px(BODY_SIZE))
-                .child(
-                    h_flex()
-                        .h(px(40.))
-                        .w(px(LABEL_WIDTH))
-                        .flex_shrink_0()
-                        .text_color(p.muted)
-                        .child("Triton driver"),
-                )
-                .child(div().flex_1().min_w_0().child(triton)),
-        )
+        section.child(row("Triton driver", triton))
     }
 
-    fn locked_notice(&self, machine: &Machine, p: Palette, cx: &mut Context<Self>) -> AnyElement {
+    /// Why a page cannot change the machine yet, with the action that gets it there.
+    /// `goal` names what is blocked: "edit" on Hardware, "restore" on Snapshots.
+    pub(crate) fn locked_notice(
+        &self,
+        machine: &Machine,
+        goal: &'static str,
+        p: Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let running = matches!(machine.state, State::Running | State::Paused);
+        let suspended = machine.saved_state && !running;
+        let action = if running {
+            Some(
+                Button::new("locked-shutdown")
+                    .outline()
+                    .small()
+                    .label("Shut down")
+                    .disabled(self.busy())
+                    .on_click(
+                        cx.listener(|this, _, _, cx| this.machine_action(Action::Shutdown, cx)),
+                    )
+                    .into_any_element(),
+            )
+        } else if suspended {
+            let m = machine.clone();
+            Some(
+                Button::new("locked-discard")
+                    .outline()
+                    .small()
+                    .label("Discard…")
+                    .disabled(self.busy())
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        if let Some(form) =
+                            workflows::action_form(workflows::MachineAction::DiscardState, &m)
+                        {
+                            this.open_form(form, window, cx);
+                        }
+                    }))
+                    .into_any_element(),
+            )
+        } else {
+            None
+        };
         h_flex()
             .gap_3()
             .px_4()
@@ -1683,23 +1657,12 @@ impl Workspace {
             .border_1()
             .border_color(p.border)
             .child(Icon::new(Glyph::Lock).size_4().flex_shrink_0().text_color(p.muted))
-            .child(div().flex_1().min_w_0().child(if machine.saved_state && !running {
-                "Discard the saved state to edit"
+            .child(div().flex_1().min_w_0().child(if suspended {
+                format!("Discard the suspended state to {goal}")
             } else {
-                "Shut down to edit"
+                format!("Shut down to {goal}")
             }))
-            .when(running, |this| {
-                this.child(
-                    Button::new("locked-shutdown")
-                        .outline()
-                        .small()
-                        .label("Shut down")
-                        .disabled(self.busy())
-                        .on_click(
-                            cx.listener(|this, _, _, cx| this.machine_action(Action::Shutdown, cx)),
-                        ),
-                )
-            })
+            .children(action)
             .into_any_element()
     }
 }

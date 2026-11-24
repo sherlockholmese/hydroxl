@@ -38,15 +38,17 @@ impl Workspace {
             };
             if include_new {
                 menu = menu
-                    .item(item("New machine", |w| workflows::create(w.preferences.machines_dir())))
+                    .item(item("New machine…", |w| {
+                        workflows::create(w.preferences.machines_dir())
+                    }))
                     .separator();
             }
-            menu.item(item("Import OVA or OVF", |w| {
+            menu.item(item("Import OVA or OVF…", |w| {
                 workflows::import(w.preferences.machines_dir())
             }))
-            .item(item("Import libvirt XML", |_| workflows::import_xml()))
+            .item(item("Import libvirt XML…", |_| workflows::import_xml()))
             .separator()
-            .item(item("Convert disk", |_| workflows::convert_disk()))
+            .item(item("Convert disk…", |_| workflows::convert_disk()))
         })
     }
 
@@ -189,7 +191,10 @@ impl Workspace {
                     .child(log.clone())
                     .into_any_element(),
                 Ok(_) => div().text_color(p.muted).child("The log is empty.").into_any_element(),
-                Err(error) => div().text_color(p.muted).child(error.to_string()).into_any_element(),
+                Err(error) => div()
+                    .text_color(p.muted)
+                    .child(super::primitives::plain_error(&error.to_string()))
+                    .into_any_element(),
             };
             let folder = path.as_ref().and_then(|p| p.parent()).map(std::path::Path::to_path_buf);
             let copy = text.as_ref().ok().cloned().unwrap_or_default();
@@ -205,7 +210,10 @@ impl Workspace {
                                 .icon(glyph("folder-open"))
                                 .on_click(move |_, window, cx| {
                                     if let Err(error) = crate::operations::open_path(&folder) {
-                                        window.push_notification(error.to_string(), cx);
+                                        window.push_notification(
+                                            super::primitives::plain_error(&error.to_string()),
+                                            cx,
+                                        );
                                     }
                                 }),
                         )
@@ -221,7 +229,7 @@ impl Workspace {
                     })
                     .child(
                         Button::new("log-done")
-                            .primary()
+                            .outline()
                             .label("Done")
                             .on_click(|_, window, cx| window.close_dialog(cx)),
                     ),

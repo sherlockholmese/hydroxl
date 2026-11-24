@@ -21,7 +21,7 @@ impl SnapshotAction {
 pub fn snapshot(m: &Machine) -> FormSpec {
     let machine = m.clone();
     FormSpec::new("New snapshot", "Save snapshot", vec![F::text("Name", "")], move |v| {
-        Ok(operation(machine.clone(), Op::SnapshotCreate(name(&v[0])?)))
+        Ok(operation(machine.clone(), Op::SnapshotCreate(name(v, 0)?)))
     })
 }
 
@@ -59,7 +59,7 @@ pub fn snapshot_action(action: SnapshotAction, m: &Machine, s: &Snapshot) -> For
                     machine.clone(),
                     Op::SnapshotRename {
                         old: snapshot.clone(),
-                        new: name(&v[0])?,
+                        new: name(v, 0)?,
                     },
                 ))
             },

@@ -1,31 +1,19 @@
-use super::devices::human_bytes;
-use super::primitives::caption;
+use super::devices::disk_usage;
+use super::primitives::{fact as row, section};
 use crate::app::{Job, Workspace};
 use crate::backend::{Machine, QemuBackend, State};
 use crate::operations::Operation;
-use crate::theme::{BODY_SIZE, LABEL_WIDTH, Palette, WELL_HEIGHT};
+use crate::theme::{Palette, READABLE_WIDTH, WELL_HEIGHT};
 use crate::workflows;
 use gpui_kit::assets::IconName as Glyph;
-use gpui_kit::component::button::Button;
+use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants as _};
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::*;
 use gpui_kit::{prelude::*, *};
 
-/// A ledger row whose value can be any element, so editable facts sit in the same grid
-/// as read-only ones.
-fn row(label: &'static str, value: impl IntoElement, p: Palette) -> Div {
-    h_flex()
-        .gap_4()
-        .w_full()
-        .min_h(px(34.))
-        .items_center()
-        .text_size(px(BODY_SIZE))
-        .child(div().w(px(LABEL_WIDTH)).flex_shrink_0().text_color(p.muted).child(label))
-        .child(div().flex_1().min_w_0().child(value))
-}
-
+/// A value that wraps instead of clipping, so long lists (addresses, forwards) stay readable.
 fn text(value: impl Into<SharedString>) -> AnyElement {
-    div().truncate().child(value.into()).into_any_element()
+    div().child(value.into()).into_any_element()
 }
 
 impl Workspace {
@@ -67,22 +55,27 @@ impl Workspace {
                     .size(px(40.))
                     .text_color(p.muted),
                 )
-                .child(caption(machine.status(), p))
                 .into_any_element(),
         };
-        let well = div()
-            .id("display-well")
-            .h(px(WELL_HEIGHT))
-            .w_full()
-            .rounded_lg()
-            .bg(p.well)
-            .overflow_hidden()
-            .child(well)
-            .when(on, |w| {
-                w.cursor_pointer().on_click(cx.listener(|this, _, window, cx| {
-                    this.open_display(window, cx);
-                }))
-            });
+        let surface =
+            div().h(px(WELL_HEIGHT)).w_full().rounded_lg().bg(p.well).overflow_hidden().child(well);
+        // While the machine is on, the well is a real button: focusable, named, and the
+        // same action as the header's Open display.
+        let well = if on {
+            let clear = gpui_kit::transparent_black();
+            Button::new("display-well")
+                .custom(ButtonCustomVariant::new(cx).color(clear).hover(clear).active(clear))
+                .accessibility_label("Open display")
+                .w_full()
+                .h(px(WELL_HEIGHT))
+                .p_0()
+                .rounded_lg()
+                .child(surface)
+                .on_click(cx.listener(|this, _, window, cx| this.open_display(window, cx)))
+                .into_any_element()
+        } else {
+            surface.into_any_element()
+        };
 
         let details = &self.details;
         let xml = roxmltree::Document::parse(&details.xml).ok();
@@ -109,7 +102,7 @@ impl Workspace {
             None => "Unknown".to_owned(),
         };
         let acceleration = if machine.acceleration == "KVM" {
-            "KVM"
+            "Virtualized"
         } else {
             "Emulated"
         };
@@ -156,9 +149,7 @@ impl Workspace {
             .map(|d| {
                 details.disk_sizes.iter().find(|(t, ..)| *t == d.target).map_or_else(
                     || file_name(&d.source),
-                    |(_, capacity, used)| {
-                        format!("{} of {}", human_bytes(*used), human_bytes(*capacity))
-                    },
+                    |(_, capacity, used)| disk_usage(*used, *capacity),
                 )
             })
             .collect();
@@ -201,7 +192,7 @@ impl Workspace {
             let m = machine.clone();
             Switch::new("overview-autostart")
                 .checked(machine.autostart)
-                .accessibility_label("Start with this computer")
+                .accessibility_label("Start with computer")
                 .disabled(self.busy())
                 .on_change(cx.listener(move |this, on: &bool, _, cx| {
                     this.begin(Job::Operation(m.clone(), Operation::Autostart(*on)), None, cx);
@@ -211,7 +202,7 @@ impl Workspace {
             .child(row(
                 "Storage",
                 text(if disks.is_empty() {
-                    "No disk".to_owned()
+                    "None".to_owned()
                 } else {
                     disks.join(", ")
                 }),
@@ -242,11 +233,7 @@ impl Workspace {
             ))
             .child(row("Start with computer", autostart, p));
 
-        let heading = |title: &'static str| {
-            div().pb_2().text_size(px(BODY_SIZE)).font_weight(FontWeight::SEMIBOLD).child(title)
-        };
-        let column =
-            |title: &'static str, body: Div| v_flex().w_full().child(heading(title)).child(body);
+        let column = |title: &'static str, body: Div| section(title, None).w_full().child(body);
         v_flex()
             .gap_8()
             .child(well)
@@ -254,8 +241,11 @@ impl Workspace {
             .child(column("Storage and connections", connections))
             .when(!machine.notes.trim().is_empty(), |this| {
                 this.child(
-                    v_flex().gap_2().child(heading("Notes")).child(
-                        div().max_w(px(640.)).text_color(p.muted).child(machine.notes.clone()),
+                    section("Notes", None).child(
+                        div()
+                            .max_w(px(READABLE_WIDTH))
+                            .text_color(p.muted)
+                            .child(machine.notes.clone()),
                     ),
                 )
             })

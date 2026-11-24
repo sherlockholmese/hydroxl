@@ -41,9 +41,13 @@ pub struct Workspace {
     pub(crate) architectures: Vec<String>,
     /// The machine pane is wide enough for two Hardware columns. Set each render.
     pub(crate) wide: bool,
-    /// Hardware category shown beside the category list.
-    pub(crate) hardware_section: usize,
-    /// Category the highlight is sliding from.
-    pub(crate) hardware_section_from: usize,
+    /// Hardware category shown beside the category list; its highlight slides between
+    /// categories and carries on from mid-flight when clicked again.
+    pub(crate) hardware_section: crate::theme::motion::Slide,
+    /// The Save / Discard bar, kept mounted while it leaves.
+    pub(crate) save_bar: crate::theme::motion::Presence,
+    /// When the narrow layout last swapped library and machine pane, so only that swap
+    /// animates (a resize across the breakpoint does not).
+    pub(crate) pane_swapped: Option<std::time::Instant>,
     pub(crate) focus: FocusHandle,
 }

@@ -10,17 +10,18 @@ pub use crate::backend::ARCHITECTURES;
 use crate::{
     app::Job,
     backend::{Machine, NewMachine, State},
-    forms::{FieldSpec as F, FormSpec, Picker, number},
+    forms::{FieldSpec as F, FormSpec, Picker, field_error, number},
     operations::{Operation as Op, Snapshot},
 };
 use anyhow::{Result, bail};
 use std::path::PathBuf;
 pub const BUSES: &[(&str, &str)] =
     &[("virtio", "VirtIO"), ("sata", "SATA"), ("scsi", "SCSI"), ("ide", "IDE"), ("usb", "USB")];
-pub(super) fn name(value: &str) -> Result<String> {
-    let value = value.trim();
+/// The name typed into field `index`, validated; a bad name is reported on that field.
+pub(super) fn name(values: &[String], index: usize) -> Result<String> {
+    let value = values.get(index).map_or("", |v| v.trim());
     if value.is_empty() || value.chars().count() > 64 || value.chars().any(char::is_control) {
-        bail!("Use a name between 1 and 64 characters.");
+        return Err(field_error(index, "Use a name between 1 and 64 characters."));
     }
     Ok(value.to_owned())
 }
@@ -50,8 +51,11 @@ pub(crate) fn convert_disk() -> FormSpec {
         let source = PathBuf::from(values[0].trim());
         let format = values[1].clone();
         let destination = PathBuf::from(values[2].trim());
-        if source.as_os_str().is_empty() || destination.as_os_str().is_empty() {
-            bail!("Choose a source disk and an output file.");
+        if source.as_os_str().is_empty() {
+            return Err(field_error(0, "Choose a source disk."));
+        }
+        if destination.as_os_str().is_empty() {
+            return Err(field_error(2, "Choose an output file."));
         }
         let destination = if destination.extension().is_none() {
             destination.with_extension(&format)

@@ -23,7 +23,7 @@ impl Workspace {
                 .child(
                     h_flex()
                         .items_start()
-                        .gap_5()
+                        .gap_6()
                         .text_color(p.text)
                         .child(img(icon.clone()).size(px(64.)).flex_shrink_0())
                         .child(

@@ -333,7 +333,7 @@ impl Operation {
             Self::AddCdrom {
                 ..
             } => "CD drive added".into(),
-            Self::GuestTools(_) => "Guest tools inserted".into(),
+            Self::GuestTools(_) => "Guest tools mounted".into(),
             Self::TritonDriver => "Triton driver disc mounted".into(),
             Self::SwitchToBundledQemu => "Switched to bundled Neptune QEMU".into(),
             Self::System {
@@ -383,7 +383,7 @@ impl Operation {
             Self::NewDisk {
                 size_gib,
                 ..
-            } => format!("{size_gib} GB disk added"),
+            } => format!("{size_gib} GiB disk added"),
             Self::DetachDisk(target) => format!("{target} removed"),
             Self::MountIso {
                 path,
@@ -393,7 +393,7 @@ impl Operation {
             Self::ResizeDisk {
                 target,
                 size_gib,
-            } => format!("{target} resized to {size_gib} GB"),
+            } => format!("{target} resized to {size_gib} GiB"),
             Self::Network {
                 ..
             } => "Network saved".into(),

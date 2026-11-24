@@ -62,7 +62,7 @@ pub(super) fn configured_xml(
         bail!("Use 1 to 256 virtual CPUs.");
     }
     if memory_mib.is_some_and(|memory| !(64..=1024 * 1024).contains(&memory)) {
-        bail!("Use between 64 MB and 1 TB of memory.");
+        bail!("Use between 64 MiB and 1 TiB of memory.");
     }
     let doc = roxmltree::Document::parse(&xml)?;
     let topology_xml = topology.map(|topology| {

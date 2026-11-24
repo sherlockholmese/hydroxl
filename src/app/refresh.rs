@@ -185,7 +185,7 @@ impl Workspace {
             window.push_notification(notice, cx);
         }
         if let Some(error) = self.error.take() {
-            window.push_notification(Notification::error(error), cx);
+            window.push_notification(Notification::error(crate::ui::plain_error(&error)), cx);
         }
         if let Some(pending) = &mut self.pending {
             let progress = pending.reporter.snapshot();
@@ -234,7 +234,10 @@ impl Workspace {
                     if pending.refresh {
                         if !self.machines.is_empty() && self.library_error.as_ref() != Some(&error)
                         {
-                            window.push_notification(Notification::error(error.clone()), cx);
+                            window.push_notification(
+                                Notification::error(crate::ui::plain_error(&error)),
+                                cx,
+                            );
                         }
                         self.library_error = Some(error);
                         self.loaded = true;
@@ -331,7 +334,8 @@ impl Workspace {
             None => {}
             Some((_, Err(error))) => {
                 if !self.machines.is_empty() && self.library_error.as_ref() != Some(&error) {
-                    window.push_notification(Notification::error(error.clone()), cx);
+                    window
+                        .push_notification(Notification::error(crate::ui::plain_error(&error)), cx);
                 }
                 self.library_error = Some(error);
             }
@@ -372,11 +376,11 @@ fn show_job_error(error: String, source: Option<ActionSource>, window: &mut Wind
     if let Some(ActionSource::Viewer(handle)) = source
         && handle
             .update(cx, |_, window, cx| {
-                window.push_notification(Notification::error(error.clone()), cx)
+                window.push_notification(Notification::error(crate::ui::plain_error(&error)), cx)
             })
             .is_ok()
     {
         return;
     }
-    window.push_notification(Notification::error(error), cx);
+    window.push_notification(Notification::error(crate::ui::plain_error(&error)), cx);
 }

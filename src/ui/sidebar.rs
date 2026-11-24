@@ -12,14 +12,16 @@ use gpui_kit::{prelude::*, *};
 impl Workspace {
     fn activity(&self, p: Palette, _cx: &mut Context<Self>) -> AnyElement {
         let Some(pending) = self.pending.as_ref().filter(|pending| !pending.refresh) else {
-            return div()
-                .truncate()
-                .child(if self.demo {
-                    "Preview"
-                } else {
-                    self.preferences.connection.label()
-                })
-                .into_any_element();
+            // Quiet while normal: only a preview library or the non-default system
+            // connection is worth naming here.
+            let label = if self.demo {
+                Some("Preview")
+            } else if self.preferences.connection == crate::backend::Connection::System {
+                Some(self.preferences.connection.label())
+            } else {
+                None
+            };
+            return div().truncate().children(label).into_any_element();
         };
         // Status, not a control: what is happening, and how far along when that is known.
         // The stage replaces the label when the operation reports one.
@@ -49,6 +51,7 @@ impl Workspace {
                                         .flex_shrink_0()
                                         .text_size(px(CAPTION_SIZE))
                                         .text_color(p.muted)
+                                        .font_features(super::primitives::tabular())
                                         .child(format!("{percent}%")),
                                 )
                             }),
@@ -101,7 +104,7 @@ impl Workspace {
                                     .hover(if selected {
                                         p.sidebar_accent
                                     } else {
-                                        p.sidebar_accent.opacity(0.5)
+                                        p.sidebar_hover
                                     })
                                     .active(p.sidebar_accent)
                                     .foreground(p.text),

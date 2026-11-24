@@ -23,15 +23,15 @@ fn row_actions(device: &Device) -> Vec<(&'static str, RowAction, bool)> {
         "cdrom" => vec![
             ("Mount ISO", RowAction::Form(|m, d| workflows::mount(m, d.target.clone())), false),
             (
-                "Install guest tools",
+                "Mount guest tools",
                 RowAction::Form(|m, d| workflows::guest_tools(m, Some(d.target.clone()))),
                 false,
             ),
             ("Eject", RowAction::Direct(|d| Operation::EjectIso(d.target.clone())), false),
-            ("Edit drive…", RowAction::Form(workflows::edit_drive), true),
+            ("Edit drive", RowAction::Form(workflows::edit_drive), true),
         ],
         "disk" => vec![
-            ("Edit drive…", RowAction::Form(workflows::edit_drive), true),
+            ("Edit drive", RowAction::Form(workflows::edit_drive), true),
             ("Resize", RowAction::Form(|m, d| workflows::resize(m, d.target.clone())), true),
             ("Compact", RowAction::Form(|m, d| workflows::compact(m, d.target.clone())), true),
             (
@@ -160,9 +160,7 @@ impl Workspace {
                 .disk_sizes
                 .iter()
                 .find(|(target, ..)| *target == device.target && device.kind == "disk")
-                .map(|(_, capacity, used)| {
-                    format!("{} GB, {} used", gib(*capacity), human_bytes(*used))
-                });
+                .map(|(_, capacity, used)| disk_usage(*used, *capacity));
             let menu = Button::new((SharedString::from(format!("device-{}", kinds[0])), index))
                 .ghost()
                 .small()
@@ -173,6 +171,11 @@ impl Workspace {
                         let disabled = busy
                             || (needs_off && !editable)
                             || (label == "Eject" && d.source == "Empty");
+                        // An entry that opens a dialog says so, the same way in every menu.
+                        let label = match action {
+                            RowAction::Form(_) => format!("{label}…"),
+                            RowAction::Direct(_) => label.to_owned(),
+                        };
                         let weak = weak.clone();
                         let m = m.clone();
                         let d = d.clone();
@@ -249,11 +252,16 @@ fn gib(bytes: u64) -> String {
     }
 }
 
+/// Disk usage, worded the same wherever it appears.
+pub(crate) fn disk_usage(used: u64, capacity: u64) -> String {
+    format!("{} of {}", human_bytes(used), human_bytes(capacity))
+}
+
 /// Bytes as a short size, in GB above 1 GB and MB below.
 pub(crate) fn human_bytes(bytes: u64) -> String {
     if bytes >= 1 << 30 {
-        format!("{} GB", gib(bytes))
+        format!("{} GiB", gib(bytes))
     } else {
-        format!("{} MB", bytes >> 20)
+        format!("{} MiB", bytes >> 20)
     }
 }

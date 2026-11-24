@@ -18,7 +18,7 @@ pub(super) fn apply_resize_disk(
     editable(c, id)?;
     valid_target(&target)?;
     if !(1..=16384).contains(&size_gib) {
-        bail!("Use a disk size between 1 and 16384 GB.");
+        bail!("Use a disk size between 1 and 16384 GiB.");
     }
     let xml = backend::virsh(c, &["dumpxml", id, "--inactive"])?;
     let doc = roxmltree::Document::parse(&xml)?;

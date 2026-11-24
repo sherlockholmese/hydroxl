@@ -62,9 +62,9 @@ impl Machine {
     }
     pub fn memory(&self) -> String {
         if self.memory_mib.is_multiple_of(1024) {
-            format!("{} GB", self.memory_mib / 1024)
+            format!("{} GiB", self.memory_mib / 1024)
         } else {
-            format!("{} MB", self.memory_mib)
+            format!("{} MiB", self.memory_mib)
         }
     }
     pub fn architecture(&self) -> &str {
@@ -134,14 +134,14 @@ impl NewMachine {
             bail!("Choose between 1 and 64 CPU cores.");
         }
         if !(1..=256).contains(&self.memory_gib) {
-            bail!("Choose between 1 and 256 GB of memory.");
+            bail!("Choose between 1 and 256 GiB of memory.");
         }
         if let Some(disk) = &self.existing_disk {
             if !disk.is_file() {
                 bail!("Choose an existing disk image.");
             }
         } else if !(8..=2048).contains(&self.disk_gib) {
-            bail!("Choose a disk between 8 and 2048 GB.");
+            bail!("Choose a disk between 8 and 2048 GiB.");
         }
         if !ARCHITECTURES.iter().any(|(value, _)| *value == self.architecture) {
             bail!("Choose a supported architecture.");

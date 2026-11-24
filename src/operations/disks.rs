@@ -136,7 +136,7 @@ pub(super) fn apply_new_disk(
     stopped(c, id)?;
     valid_target(&target)?;
     if !(1..=16384).contains(&size_gib) {
-        bail!("Use a disk size between 1 and 16384 GB.");
+        bail!("Use a disk size between 1 and 16384 GiB.");
     }
     let folder = machine
         .disk

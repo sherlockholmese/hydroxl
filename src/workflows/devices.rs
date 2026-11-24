@@ -48,7 +48,7 @@ pub fn device_form(action: DeviceAction, m: &Machine) -> Option<FormSpec> {
             label,
             "Create disk",
             vec![
-                F::text("Size (GB)", "32"),
+                F::text("Size (GiB)", "32"),
                 F::text("Target", "vdb"),
                 F::choice("Interface", BUSES, "virtio"),
             ],
@@ -138,7 +138,7 @@ pub fn device_form(action: DeviceAction, m: &Machine) -> Option<FormSpec> {
                     machine.clone(),
                     Op::Share {
                         path: v[0].clone().into(),
-                        tag: name(&v[2])?,
+                        tag: name(v, 2)?,
                         readonly: v[1] == "ro",
                         driver,
                     },
@@ -327,7 +327,7 @@ pub fn edit_share(m: &Machine, device: &crate::operations::Device) -> FormSpec {
                     Op::DetachDevice(old.clone()),
                     Op::Share {
                         path: v[0].trim().into(),
-                        tag: name(&v[2])?,
+                        tag: name(v, 2)?,
                         readonly: v[1] == "ro",
                         driver: if v[3] == "9p" {
                             ShareDriver::NineP

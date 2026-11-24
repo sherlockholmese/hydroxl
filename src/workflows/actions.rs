@@ -54,14 +54,14 @@ pub fn machine_actions(m: &Machine) -> Vec<ActionEntry> {
     };
     [
         // Power
-        (MachineAction::Restart, "Restart", "rotate-ccw", 0, running, true),
+        (MachineAction::Restart, "Restart", "rotate-ccw", 0, running, false),
         (MachineAction::SaveState, "Suspend to disk", "archive", 0, running, false),
-        (MachineAction::Reset, "Reset", "refresh-ccw-dot", 0, running, true),
-        (MachineAction::ForceStop, "Force stop", "power-off", 0, running, true),
+        (MachineAction::Reset, "Reset…", "refresh-ccw-dot", 0, running, true),
+        (MachineAction::ForceStop, "Force stop…", "power-off", 0, running, true),
         (MachineAction::Disposable, "Start disposable…", "flask-conical", 0, stopped, false),
         (
             MachineAction::DiscardState,
-            "Discard saved state…",
+            "Discard suspended state…",
             "archive-x",
             0,
             stopped && m.saved_state,
@@ -73,7 +73,7 @@ pub fn machine_actions(m: &Machine) -> Vec<ActionEntry> {
         (MachineAction::MemoryDump, "Save memory dump…", "cpu", 1, running, false),
         (
             MachineAction::GuestTools,
-            "Install guest tools…",
+            "Mount guest tools…",
             "package",
             1,
             m.state != State::Other,
@@ -144,7 +144,7 @@ pub fn action_form(action: MachineAction, m: &Machine) -> Option<FormSpec> {
             Op::Reset,
         ),
         MachineAction::DiscardState => confirm(
-            &format!("Discard the saved state of {}", m.name),
+            &format!("Discard the suspended state of {}", m.name),
             "Discard",
             "Unsaved work in the suspended state will be lost.",
             machine,
@@ -158,7 +158,7 @@ pub fn action_form(action: MachineAction, m: &Machine) -> Option<FormSpec> {
         MachineAction::Remove => FormSpec::new(
             format!("Remove {}", m.name),
             "Remove",
-            vec![F::checkbox("Delete disk files", false)],
+            vec![F::checkbox("Delete disk files permanently", false)],
             move |v| {
                 Ok(operation(
                     machine.clone(),
@@ -168,7 +168,6 @@ pub fn action_form(action: MachineAction, m: &Machine) -> Option<FormSpec> {
                 ))
             },
         )
-        .note("Disk files are kept unless selected for deletion. Deletion is permanent.")
         .danger(),
         MachineAction::MemoryDump => FormSpec::new(
             format!("Save memory dump of {}", m.name),
@@ -224,7 +223,7 @@ pub fn action_form(action: MachineAction, m: &Machine) -> Option<FormSpec> {
             "Clone configuration",
             "Clone",
             vec![F::text("Name", format!("{} Template", m.name))],
-            move |v| Ok(operation(machine.clone(), Op::CloneConfiguration(name(&v[0])?))),
+            move |v| Ok(operation(machine.clone(), Op::CloneConfiguration(name(v, 0)?))),
         ),
         MachineAction::MoveStorage => FormSpec::new(
             "Move storage",
@@ -240,14 +239,14 @@ pub fn action_form(action: MachineAction, m: &Machine) -> Option<FormSpec> {
         ),
         MachineAction::Rename => {
             FormSpec::new("Rename", "Rename", vec![F::text("Name", m.name.clone())], move |v| {
-                Ok(operation(machine.clone(), Op::Rename(name(&v[0])?)))
+                Ok(operation(machine.clone(), Op::Rename(name(v, 0)?)))
             })
         }
         MachineAction::Clone => FormSpec::new(
             "Clone",
             "Clone",
             vec![F::text("Name", format!("{} Copy", m.name))],
-            move |v| Ok(operation(machine.clone(), Op::Clone(name(&v[0])?))),
+            move |v| Ok(operation(machine.clone(), Op::Clone(name(v, 0)?))),
         ),
         MachineAction::ExportOva => FormSpec::new(
             "Export OVA",

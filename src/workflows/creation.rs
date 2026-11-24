@@ -41,9 +41,9 @@ pub fn create(location: PathBuf) -> FormSpec {
             F::choice("Boot from", BOOT_FROM, "media").advanced(),
             F::text("Name", "").step(1),
             F::text("CPU cores", "2").step(1).row(2),
-            F::text("Memory", "4").suffix("GB").step(1).row(2),
+            F::text("Memory", "4").suffix("GiB").step(1).row(2),
             F::choice("Hard disk", DISK_MODES, "new").step(1).row(4),
-            F::text("Disk size", "32").suffix("GB").step(1).row(4),
+            F::text("Disk size", "32").suffix("GiB").step(1).row(4),
             F::path("Disk image", Picker::Disk).step(1),
             F::choice("Architecture", ARCHITECTURES, host).step(1).advanced().row(3),
             F::choice("Execution", EXECUTION, "virtualize").step(1).advanced().row(3),
@@ -106,7 +106,10 @@ pub fn create(location: PathBuf) -> FormSpec {
             0 => {
                 let iso = v[ISO].trim();
                 if !iso.is_empty() && !PathBuf::from(iso).is_file() {
-                    bail!("Choose an existing ISO, or leave it empty to install later.")
+                    return Err(field_error(
+                        ISO,
+                        "Choose an existing ISO, or leave it empty to install later.",
+                    ));
                 }
             }
             1 => {
@@ -121,7 +124,7 @@ pub fn create(location: PathBuf) -> FormSpec {
 fn new_machine(v: &[String]) -> Result<NewMachine> {
     let iso = v[ISO].trim();
     let spec = NewMachine {
-        name: name(&v[NAME])?,
+        name: name(v, NAME)?,
         os_variant: v[OS].clone(),
         architecture: v[ARCH].clone(),
         qemu_build: QemuBuild::from_choice(&v[QEMU_BUILD])?,
@@ -191,7 +194,7 @@ pub fn import_xml() -> FormSpec {
             F::path("Libvirt configuration", Picker::Xml),
             F::choice("QEMU backend", QemuBuild::OPTIONS, "bundled"),
             F::text("Virtual CPUs", "").row(1),
-            F::text("Memory", "").suffix("MB").row(1),
+            F::text("Memory", "").suffix("MiB").row(1),
         ],
         |v| {
             let path = PathBuf::from(&v[0]);
@@ -205,7 +208,7 @@ pub fn import_xml() -> FormSpec {
                     bail!("Use 1 to 256 virtual CPUs.");
                 }
                 if !(64..=1024 * 1024).contains(&memory_mib) {
-                    bail!("Use between 64 MB and 1 TB of memory.");
+                    bail!("Use between 64 MiB and 1 TiB of memory.");
                 }
                 Some(ImportHardware {
                     vcpus,
@@ -260,11 +263,11 @@ pub fn import(location: PathBuf) -> FormSpec {
         |v| {
             let path = PathBuf::from(&v[0]);
             if !path.is_file() {
-                bail!("Choose an existing OVA or OVF file.");
+                return Err(field_error(0, "Choose an existing OVA or OVF file."));
             }
             let location = PathBuf::from(v[5].trim());
             if !location.is_dir() {
-                bail!("Choose an existing destination folder.");
+                return Err(field_error(5, "Choose an existing destination folder."));
             }
             Ok(Job::Appliance(crate::appliance::ImportSpec {
                 path,

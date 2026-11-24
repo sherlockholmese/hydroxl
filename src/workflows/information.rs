@@ -42,9 +42,7 @@ pub fn architecture(m: &Machine, arch: &str) -> FormSpec {
     let label = super::label(ARCHITECTURES, arch);
     let host = std::env::consts::ARCH;
     let native = arch == host || (host == "x86_64" && arch == "i686");
-    let mut note = format!(
-        "The machine type, firmware and controllers are reset for {label}. The installed system must support {label}."
-    );
+    let mut note = format!("The machine type, firmware and controllers are reset for {label}.");
     if !native {
         note.push_str(" It runs under emulation, which is much slower.");
     }

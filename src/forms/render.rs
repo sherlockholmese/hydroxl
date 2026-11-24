@@ -1,5 +1,5 @@
 use super::editor::{Control, EditorForm};
-use crate::theme::{CAPTION_SIZE, LABEL_SIZE, LABEL_WIDTH, Palette};
+use crate::theme::{CAPTION_SIZE, LABEL_SIZE, Palette};
 use gpui_kit::assets::IconName as Glyph;
 use gpui_kit::component::{
     button::*,
@@ -15,8 +15,30 @@ fn field_label(text: &'static str, p: Palette) -> Div {
     div().text_size(px(LABEL_SIZE)).font_weight(FontWeight::MEDIUM).text_color(p.muted).child(text)
 }
 
+/// A validation message in the one error anatomy: danger icon and text.
+fn error_line(text: &str, p: Palette) -> Div {
+    h_flex()
+        .items_start()
+        .gap_2()
+        .text_color(p.danger)
+        .child(Icon::new(Glyph::CircleAlert).size_4().mt(px(2.)).flex_shrink_0())
+        .child(div().flex_1().min_w_0().child(crate::ui::plain_error(text)))
+}
+
 impl EditorForm {
+    /// A field with its validation message directly beneath it, when it has one.
     fn field(&self, index: usize, p: Palette, cx: &mut Context<Self>) -> AnyElement {
+        let error = self.error.as_deref().filter(|_| self.error_field == Some(index));
+        let control = self.field_control(index, p, cx);
+        match error {
+            Some(error) => {
+                v_flex().gap(px(6.)).child(control).child(error_line(error, p)).into_any_element()
+            }
+            None => control,
+        }
+    }
+
+    fn field_control(&self, index: usize, p: Palette, cx: &mut Context<Self>) -> AnyElement {
         let field = &self.fields[index];
         if let Control::Checkbox(checked) = &field.control {
             return checkbox::Checkbox::new(("checkbox", index))
@@ -152,18 +174,7 @@ impl EditorForm {
                     if let Some(suffix) = field.spec.suffix {
                         shown = format!("{shown} {suffix}");
                     }
-                    h_flex()
-                        .items_start()
-                        .gap_4()
-                        .min_h(px(28.))
-                        .child(
-                            div()
-                                .w(px(LABEL_WIDTH))
-                                .flex_shrink_0()
-                                .text_color(p.muted)
-                                .child(field.spec.label),
-                        )
-                        .child(div().flex_1().min_w_0().child(shown))
+                    crate::ui::fact(field.spec.label, div().child(shown), p)
                 },
             ),
         )
@@ -188,7 +199,7 @@ impl Render for EditorForm {
             let advanced: Vec<usize> = (0..self.fields.len())
                 .filter(|i| on_step(i) && self.fields[*i].spec.advanced)
                 .collect();
-            let mut body = v_flex().gap_5().w_full();
+            let mut body = v_flex().gap_4().w_full();
             for row in self.rows(&basic) {
                 body = body.child(self.row_element(row, p, cx));
             }
@@ -229,6 +240,7 @@ impl Render for EditorForm {
                 .disabled(self.pending)
                 .on_click(cx.listener(Self::back))
         });
+        // While work runs, closing does not cancel it, so the button says Hide.
         let cancel = Button::new("cancel-form")
             .outline()
             .label(if self.pending {
@@ -275,16 +287,13 @@ impl Render for EditorForm {
                         .child(body),
                 )
             })
-            .when_some(self.error.clone(), |this, error| {
-                this.child(
-                    h_flex()
-                        .items_start()
-                        .gap_2()
-                        .text_color(p.danger)
-                        .child(Icon::new(Glyph::CircleAlert).size_4().mt(px(2.)).flex_shrink_0())
-                        .child(div().flex_1().min_w_0().child(error)),
-                )
-            })
+            // Errors that name no field (or a field not on screen) stay above the buttons.
+            .when_some(
+                self.error.clone().filter(|_| {
+                    self.error_field.is_none_or(|i| review || !self.shown(i, &self.values(cx)))
+                }),
+                |this, error| this.child(error_line(&error, p)),
+            )
             // The submit button already spins; a bar appears only with real progress to show.
             .when_some(
                 progress.filter(|p| p.percent.is_some() || !p.stage.is_empty()),
@@ -300,7 +309,11 @@ impl Render for EditorForm {
                                     .text_size(px(CAPTION_SIZE))
                                     .child(div().text_color(p.muted).child(stage))
                                     .when_some(progress.percent, |row, percent| {
-                                        row.child(div().child(format!("{percent}%")))
+                                        row.child(
+                                            div()
+                                                .font_features(crate::ui::tabular())
+                                                .child(format!("{percent}%")),
+                                        )
                                     }),
                             )
                             .child(

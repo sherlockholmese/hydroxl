@@ -67,18 +67,18 @@ const SPECIAL_KEYS: &[(&[&str], &[u32], u8)] = &[
 fn keycap(label: &'static str, cx: &App) -> Div {
     let p = Palette::get(cx);
     div()
-        .px(px(5.))
+        .px_1()
         .min_w(px(20.))
         .h(px(20.))
         .flex()
         .items_center()
         .justify_center()
-        .rounded(px(4.))
+        .rounded_sm()
         .border_1()
         .border_b_2()
         .border_color(p.border)
         .bg(p.well)
-        .text_size(px(11.))
+        .text_size(px(CAPTION_SIZE))
         .font_weight(FontWeight::MEDIUM)
         .text_color(p.text)
         .child(label)
@@ -107,7 +107,12 @@ pub(crate) struct DisplayView {
     scaling: Scaling,
     guest_resize: Option<GuestResize>,
     toolbar_pinned: bool,
+    /// Host USB devices this window redirected, by (bus, address), so the menu shows which
+    /// are connected.
+    usb_attached: std::collections::HashSet<(u8, u8)>,
     toolbar_revealed: bool,
+    /// The fullscreen toolbar sliding down from, and back into, the top edge.
+    toolbar_presence: crate::theme::motion::Presence,
     toolbar_menu_open: bool,
     connection: Connection,
     device_scale: f32,
@@ -260,7 +265,9 @@ impl DisplayView {
             session: None,
             connection,
             toolbar_pinned,
+            usb_attached: Default::default(),
             toolbar_revealed: false,
+            toolbar_presence: crate::theme::motion::Presence::new(false),
             toolbar_menu_open: false,
             image: None,
             gpu_image: false,
@@ -430,12 +437,14 @@ impl DisplayView {
                             }
                             Err(error) => {
                                 if this.machine_is_active() {
-                                    this.status = Some(format!("{error:#}"));
+                                    this.status =
+                                        Some(super::primitives::plain_error(&error.to_string()));
                                     cx.notify();
                                     return true;
                                 }
                                 this.connecting = false;
-                                this.status = Some(format!("{error:#}"));
+                                this.status =
+                                    Some(super::primitives::plain_error(&error.to_string()));
                                 false
                             }
                         };
@@ -699,11 +708,11 @@ impl DisplayView {
                 self.reconnect_attempts = 0;
             }
             if self.machine_is_active() && self.reconnect_attempts < RECONNECT_DELAYS.len() {
-                self.status = Some(error);
+                self.status = Some(super::primitives::plain_error(&error));
                 self.connecting = true;
                 Self::connect_session(self.connection, self.machine.clone(), true, window, cx);
             } else if self.machine_is_active() {
-                self.status = Some(error);
+                self.status = Some(super::primitives::plain_error(&error));
             } else {
                 self.status = Some(self.power_status.into());
             }
@@ -719,7 +728,7 @@ impl DisplayView {
         }
         if let Some(error) = &frame.display_error {
             if self.image.is_none() {
-                self.status = Some(error.clone());
+                self.status = Some(super::primitives::plain_error(error));
                 cx.notify();
             }
             return true;
@@ -881,6 +890,7 @@ impl DisplayView {
                             div()
                                 .w_12()
                                 .text_right()
+                                .font_features(super::primitives::tabular())
                                 .font_weight(FontWeight::MEDIUM)
                                 .child(rate(fps)),
                         )
@@ -1273,7 +1283,8 @@ impl DisplayView {
                     && !matches!(session, Session::Dbus(_))
                     && self.copy_requested.take().is_some()
                 {
-                    window.push_notification(error.to_string(), cx);
+                    window
+                        .push_notification(super::primitives::plain_error(&error.to_string()), cx);
                 }
                 self.clipboard_read = None;
             }
@@ -1335,7 +1346,8 @@ impl DisplayView {
             Ok(None) => {}
             Err(error) => {
                 if self.copy_requested.take().is_some() {
-                    window.push_notification(error.to_string(), cx);
+                    window
+                        .push_notification(super::primitives::plain_error(&error.to_string()), cx);
                 }
             }
         }
@@ -1389,14 +1401,14 @@ impl DisplayView {
 
     fn receive_session_result<T: Send + 'static>(
         result: anyhow::Result<mpsc::Receiver<anyhow::Result<T>>>,
-        done: impl FnOnce(T, &mut Window, &mut App) + 'static,
+        done: impl FnOnce(&mut Self, T, &mut Window, &mut Context<Self>) + 'static,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let rx = match result {
             Ok(rx) => rx,
             Err(error) => {
-                window.push_notification(error.to_string(), cx);
+                window.push_notification(super::primitives::plain_error(&error.to_string()), cx);
                 return;
             }
         };
@@ -1409,9 +1421,11 @@ impl DisplayView {
                         .and_then(|result| result)
                 })
                 .await;
-            let _ = view.update_in(cx, |_, window, cx| match result {
-                Ok(value) => done(value, window, cx),
-                Err(error) => window.push_notification(error.to_string(), cx),
+            let _ = view.update_in(cx, |view, window, cx| match result {
+                Ok(value) => done(view, value, window, cx),
+                Err(error) => {
+                    window.push_notification(super::primitives::plain_error(&error.to_string()), cx)
+                }
             });
         })
         .detach();
@@ -1430,9 +1444,7 @@ impl DisplayView {
         window.open_dialog(cx, move |dialog, _, _| {
             let this = this.clone();
             let op = op.clone();
-            dialog
-                .title(title)
-                .width(px(400.))
+            crate::forms::frame(dialog, title, 400.)
                 .child("Unsaved work inside the guest is lost.")
                 .footer(
                     h_flex()
@@ -1478,7 +1490,7 @@ impl DisplayView {
                     "mouse-pointer-2"
                 })
                 .text_color(if self.captured {
-                    p.positive
+                    p.text
                 } else {
                     p.muted
                 }),
@@ -1618,13 +1630,7 @@ impl DisplayView {
                 .icon(glyph(scaling_icon(current)))
                 .label(current.label())
                 .accessibility_label(format!("Display options: {}", current.menu_label()))
-                .tooltip(match current {
-                    Scaling::Fit => "Fit the existing guest image inside the window",
-                    Scaling::GuestResize => {
-                        "Match the window when the guest display driver supports resizing"
-                    }
-                    _ => "Display scaling",
-                })
+                .tooltip("Display scaling")
                 .dropdown_caret(true)
                 .dropdown_menu(move |mut menu, _, _| {
                     menu = menu.min_w(px(MENU_MIN_WIDTH)).check_side(Side::Right);
@@ -1674,7 +1680,7 @@ impl DisplayView {
                             let _ = this.update(cx, |this, cx| f(this, window, cx));
                         })
                     };
-                    menu.min_w(px(180.))
+                    menu.min_w(px(MENU_MIN_WIDTH))
                         .item(item("Reset…", |this, window, cx| {
                             this.confirm("Reset", "Reset", Operation::Reset, window, cx)
                         })
@@ -1743,7 +1749,7 @@ impl DisplayView {
                         Button::new("restart")
                             .ghost()
                             .small()
-                            .icon(Icon::new(Glyph::RotateCcw).text_color(p.danger))
+                            .icon(Icon::new(Glyph::RotateCcw))
                             .accessibility_label("Restart")
                             .tooltip("Restart")
                             .disabled(busy)
@@ -1758,6 +1764,7 @@ impl DisplayView {
             .child(scaling)
             .when(usb, |toolbar| {
                 let session = self.session.clone();
+                let attached = self.usb_attached.clone();
                 let view = cx.entity().downgrade();
                 toolbar.child(
                     icon("viewer-usb", Glyph::Usb, "Redirect USB devices")
@@ -1766,10 +1773,9 @@ impl DisplayView {
                             if devices.is_empty() {
                                 return menu.label("No USB devices");
                             }
-                            menu = menu.label("Select a device to connect or disconnect");
-                            if devices.len() > 8 {
-                                menu = menu.max_h(px(360.)).scrollable(true);
-                            }
+                            // A flat list that never scrolls; a check marks what the guest
+                            // has, so choosing an entry reads as connect or disconnect.
+                            menu = menu.min_w(px(MENU_MIN_WIDTH)).check_side(Side::Right);
                             for (address, label) in devices {
                                 let Some((bus, address)) =
                                     address.split_once(':').and_then(|(bus, addr)| {
@@ -1780,29 +1786,42 @@ impl DisplayView {
                                 };
                                 let session = session.clone();
                                 let view = view.clone();
-                                menu = menu.item(PopupMenuItem::new(label).on_click(
-                                    move |_, window, cx| {
-                                        if let Some(session) = &session {
+                                let name = label.clone();
+                                menu = menu.item(
+                                    PopupMenuItem::new(label)
+                                        .checked(attached.contains(&(bus, address)))
+                                        .on_click(move |_, window, cx| {
+                                            let Some(session) = &session else {
+                                                return;
+                                            };
+                                            let name = name.clone();
                                             let _ = view.update(cx, |_, cx| {
                                                 Self::receive_session_result(
                                                     session.toggle_usb(bus, address),
-                                                    |attached, window, cx| {
+                                                    move |view, attached, window, cx| {
+                                                        if attached {
+                                                            view.usb_attached
+                                                                .insert((bus, address));
+                                                        } else {
+                                                            view.usb_attached
+                                                                .remove(&(bus, address));
+                                                        }
                                                         window.push_notification(
                                                             if attached {
-                                                                "USB device connected"
+                                                                format!("{name} connected")
                                                             } else {
-                                                                "USB device disconnected"
+                                                                format!("{name} disconnected")
                                                             },
                                                             cx,
-                                                        )
+                                                        );
+                                                        cx.notify();
                                                     },
                                                     window,
                                                     cx,
                                                 )
                                             });
-                                        }
-                                    },
-                                ));
+                                        }),
+                                );
                             }
                             menu
                         }),
@@ -2099,6 +2118,21 @@ impl Render for DisplayView {
         let fullscreen = window.is_fullscreen();
         let show_toolbar =
             !fullscreen || self.toolbar_pinned || self.toolbar_revealed || self.toolbar_menu_open;
+        // In fullscreen the toolbar is a sheet owned by the top edge: it slides down to
+        // reveal and back up to hide, reversing from mid-flight if the pointer changes its
+        // mind, and stops taking input as soon as it starts to leave.
+        let now = Instant::now();
+        let reduce = cx.reduce_motion();
+        if let Some(duration) = self.toolbar_presence.set(fullscreen && show_toolbar, reduce, now)
+            && !self.toolbar_presence.shown()
+        {
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(duration).await;
+                let _ = this.update(cx, |_, cx| cx.notify());
+            })
+            .detach();
+        }
+        let presence = self.toolbar_presence;
         v_flex()
             .relative()
             .size_full()
@@ -2106,15 +2140,20 @@ impl Render for DisplayView {
             .text_color(p.text)
             .when(!fullscreen, |root| root.child(self.top_bar(p, window, cx)))
             .child(surface)
-            .when(fullscreen && show_toolbar, |root| {
+            .when(fullscreen && presence.mounted(now), |root| {
+                let at = |el: Div, v: f32| el.top(px(-TOOLBAR_HEIGHT * (1. - v)));
                 root.child(
-                    div()
-                        .absolute()
-                        .top_0()
-                        .left_0()
-                        .w_full()
-                        .occlude()
-                        .child(self.top_bar(p, window, cx)),
+                    at(div().absolute().left_0().w_full(), presence.value(now))
+                        .when(presence.shown(), |bar| bar.occlude())
+                        .child(self.top_bar(p, window, cx))
+                        .with_animation(
+                            SharedString::from(format!(
+                                "fullscreen-toolbar-{}",
+                                presence.generation()
+                            )),
+                            Animation::new(presence.remaining(now).max(crate::theme::motion::EXIT)),
+                            move |el, _| at(el, presence.value(Instant::now())),
+                        ),
                 )
             })
             .id("display-window")

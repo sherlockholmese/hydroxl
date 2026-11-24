@@ -57,8 +57,9 @@ impl Workspace {
             live_preview: None,
             share_os: None,
             wide: false,
-            hardware_section: 0,
-            hardware_section_from: 0,
+            hardware_section: crate::theme::motion::Slide::at(0),
+            save_bar: crate::theme::motion::Presence::new(false),
+            pane_swapped: None,
             architectures: if demo {
                 vec!["x86_64".into(), "i686".into(), "aarch64".into(), "riscv64".into()]
             } else {
@@ -209,11 +210,16 @@ impl Workspace {
             self.saved_hardware_for = None;
             self.details_error = None;
             self.share_os = None;
+            // A different machine is a new view, not navigation: nothing slides.
+            self.hardware_section.settle();
             self.preferences.selected = self.selected.clone();
             self.preferences.save();
             if !self.demo {
                 self.begin(Job::Refresh, None, cx);
             }
+        }
+        if self.library_open {
+            self.pane_swapped = Some(std::time::Instant::now());
         }
         self.library_open = false;
         cx.notify();

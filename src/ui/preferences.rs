@@ -2,7 +2,7 @@ use crate::PreferencesAction;
 use crate::app::{Job, Workspace};
 use crate::backend::Connection;
 use crate::operations::Details;
-use crate::theme::{self, LABEL_WIDTH, Palette};
+use crate::theme::{self, Palette};
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::*;
 use gpui_kit::{prelude::*, *};
@@ -25,19 +25,7 @@ impl Workspace {
             let connection = (!state.demo).then_some(state.preferences.connection);
             let busy = state.busy();
             let row = |label: &'static str, control: AnyElement| {
-                h_flex()
-                    .gap_4()
-                    .items_center()
-                    .child(
-                        div()
-                            .w(px(LABEL_WIDTH - 32.))
-                            .flex_shrink_0()
-                            .text_size(px(theme::LABEL_SIZE))
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(p.muted)
-                            .child(label),
-                    )
-                    .child(control)
+                super::primitives::setting(label, control, p)
             };
             let appearance = super::primitives::segmented(
                 "appearance",
@@ -133,13 +121,8 @@ impl Workspace {
                 .gap_2()
                 .min_w_0()
                 .flex_1()
-                .child(
-                    div()
-                        .text_size(px(theme::CAPTION_SIZE))
-                        .text_color(p.muted)
-                        .truncate()
-                        .child(location.to_string_lossy().into_owned()),
-                )
+                // The whole path, wrapped: its end is the part that identifies the folder.
+                .child(div().pt_2().child(home_relative(&location)))
                 .child(h_flex().gap_2().child(choose_folder).when(custom_location, |row| {
                     let weak = weak.clone();
                     row.child(
@@ -159,11 +142,11 @@ impl Workspace {
             crate::forms::frame(dialog, "Preferences", 480.)
                 .child(
                     v_flex()
-                        .gap_5()
+                        .gap_2()
                         .text_color(p.text)
                         .child(row("Appearance", appearance))
                         .child(row("Connection", connections))
-                        .child(row("VM folder", folder.into_any_element()).items_start()),
+                        .child(row("VM folder", folder.into_any_element())),
                 )
                 .footer(
                     h_flex()
@@ -189,5 +172,17 @@ impl Workspace {
                         ),
                 )
         });
+    }
+}
+
+/// A path with the home folder shown as `~`.
+fn home_relative(path: &std::path::Path) -> String {
+    match std::env::var_os("HOME").map(std::path::PathBuf::from) {
+        Some(home) => match path.strip_prefix(&home) {
+            Ok(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
+            Ok(rest) => format!("~/{}", rest.display()),
+            Err(_) => path.display().to_string(),
+        },
+        None => path.display().to_string(),
     }
 }

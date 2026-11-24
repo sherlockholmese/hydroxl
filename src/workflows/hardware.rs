@@ -271,11 +271,11 @@ pub fn machine_type_family(kind: &str) -> &str {
 }
 pub const VIDEO_MEMORY: &[(&str, &str)] = &[
     ("0", "Default"),
-    ("16", "16 MB"),
-    ("32", "32 MB"),
-    ("64", "64 MB"),
-    ("128", "128 MB"),
-    ("256", "256 MB"),
+    ("16", "16 MiB"),
+    ("32", "32 MiB"),
+    ("64", "64 MiB"),
+    ("128", "128 MiB"),
+    ("256", "256 MiB"),
 ];
 
 fn platform(doc: &roxmltree::Document) -> crate::operations::Platform {

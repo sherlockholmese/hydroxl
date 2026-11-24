@@ -7,7 +7,7 @@ pub fn mount(m: &Machine, target: String) -> FormSpec {
         vec![F::path("ISO image", Picker::Iso)],
         move |v| {
             if !PathBuf::from(&v[0]).is_file() {
-                bail!("Choose an existing ISO image.");
+                return Err(field_error(0, "Choose an existing ISO image."));
             }
             Ok(operation(
                 machine.clone(),
@@ -22,7 +22,7 @@ pub fn mount(m: &Machine, target: String) -> FormSpec {
 
 pub fn resize(m: &Machine, target: String) -> FormSpec {
     let machine = m.clone();
-    FormSpec::new("Grow disk", "Resize", vec![F::text("New size", "").suffix("GB")], move |v| {
+    FormSpec::new("Grow disk", "Resize", vec![F::text("New size", "").suffix("GiB")], move |v| {
         Ok(operation(
             machine.clone(),
             Op::ResizeDisk {
@@ -45,14 +45,15 @@ pub fn compact(m: &Machine, target: String) -> FormSpec {
 
 pub fn guest_tools(m: &Machine, target: Option<String>) -> FormSpec {
     let machine = m.clone();
+    // The note states only what changes on the machine.
     let drive = match &target {
-        Some(target) => format!("Replaces any disc in {target} with the VirtIO driver ISO."),
-        None => "Uses an empty CD/DVD drive or adds one for the VirtIO driver ISO.".to_owned(),
+        Some(target) => format!("Replaces the disc in {target}."),
+        None => "Uses an empty CD/DVD drive, or adds one.".to_owned(),
     };
-    FormSpec::new("Mount Windows guest tools", "Download and mount", vec![], move |_| {
+    FormSpec::new("Mount guest tools", "Mount", vec![], move |_| {
         Ok(operation(machine.clone(), Op::GuestTools(target.clone())))
     })
-    .note(format!("{drive} Open the disc inside Windows to install the drivers."))
+    .note(drive)
 }
 
 pub fn edit_drive(m: &Machine, device: &crate::operations::Device) -> FormSpec {

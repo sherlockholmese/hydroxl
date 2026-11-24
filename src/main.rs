@@ -35,6 +35,7 @@ fn main() -> ExitCode {
     let initial = args.iter().find(|a| !a.to_string_lossy().starts_with('-')).map(PathBuf::from);
     gpui_kit::application().with_assets(gpui_kit::assets::AllAssets).run(move |cx| {
         theme::load_fonts(cx);
+        cx.set_reduce_motion(theme::reduce_motion_preference());
         gpui_kit::init(cx);
         theme::apply(Preferences::load().dark, cx);
         cx.bind_keys([
