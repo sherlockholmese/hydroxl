@@ -79,6 +79,7 @@ pub struct Framebuffer {
     /// Incremented on every applied update; the UI uploads when it differs.
     pub generation: u64,
     pub closed: Option<String>,
+    pub display_error: Option<String>,
     /// Guest cursor shape, drawn by the client at the host pointer. `None` hides it.
     pub cursor: Option<Cursor>,
     /// Incremented when the cursor shape changes.
@@ -94,10 +95,13 @@ pub struct Framebuffer {
     pub dbus_clipboard: bool,
     /// QEMU's VNC clipboard extension is active (guest agent through qemu-vdagent).
     pub vnc_clipboard: bool,
-    /// Latest guest clipboard text received over VNC.
+    /// Latest text received from the guest.
     pub clipboard_text: Option<String>,
-    /// Incremented each time the guest announces new clipboard text.
+    /// Changes each time the guest claims or releases the clipboard.
     pub guest_clipboard: u64,
+    pub guest_clipboard_has_text: bool,
+    /// The agent reset its clipboard state and needs the current host offer again.
+    pub clipboard_reset: u64,
     pub(crate) gpu_draw: Option<super::scanout::GpuDraw>,
     /// Wakes the UI the moment a GPU draw is offered, instead of at its next vsync.
     pub(crate) draw_waker: Option<std::task::Waker>,
@@ -108,6 +112,17 @@ pub struct Framebuffer {
 impl Framebuffer {
     pub(crate) fn shares_clipboard(&self) -> bool {
         self.spice_clipboard || self.vnc_clipboard || self.dbus_clipboard
+    }
+
+    pub(crate) fn guest_clipboard_changed(&mut self, has_text: bool) {
+        self.guest_clipboard = self.guest_clipboard.wrapping_add(1);
+        self.guest_clipboard_has_text = has_text;
+        self.clipboard_text = None;
+    }
+
+    pub(crate) fn received_clipboard(&mut self, text: String) {
+        self.guest_clipboard_changed(true);
+        self.clipboard_text = Some(text);
     }
 }
 
@@ -133,12 +148,19 @@ pub struct Session {
     /// Last absolute position sent, for relative-mode deltas.
     last: Mutex<Option<(u16, u16)>>,
     pressed_keys: Mutex<std::collections::BTreeSet<u32>>,
+    clipboard: Mutex<Clipboard>,
+    share_clipboard: bool,
+}
+
+#[derive(Default)]
+struct Clipboard {
     /// Host text offered to the guest, sent when the server asks for it.
-    clipboard_offer: Mutex<Option<String>>,
+    offer: Option<String>,
+    requested: bool,
 }
 
 impl Session {
-    pub fn connect(endpoint: &Endpoint) -> Result<Arc<Self>> {
+    pub fn connect(endpoint: &Endpoint, share_clipboard: bool) -> Result<Arc<Self>> {
         let mut stream: Box<dyn Stream> = match endpoint {
             Endpoint::Unix(path) => {
                 Box::new(UnixStream::connect(path).context("Could not reach the guest display.")?)
@@ -156,7 +178,7 @@ impl Session {
             }
         };
         stream.set_read_timeout(Some(Duration::from_secs(3)))?;
-        let (width, height) = handshake(&mut stream)?;
+        let (width, height) = handshake(&mut stream, share_clipboard)?;
         stream.set_read_timeout(None)?;
         let writer = stream.duplicate()?;
         let session = Arc::new(Self {
@@ -176,7 +198,8 @@ impl Session {
             writer: Mutex::new(writer),
             last: Mutex::new(None),
             pressed_keys: Mutex::default(),
-            clipboard_offer: Mutex::default(),
+            clipboard: Mutex::default(),
+            share_clipboard,
         });
         session.request(false)?;
         let reader = session.clone();
@@ -227,19 +250,30 @@ impl Session {
     /// Offers host clipboard text to the guest. QEMU asks for the data when the guest
     /// pastes, so large text is only transferred when it is used.
     pub fn offer_clipboard(&self, text: String) {
-        if !self.frame.lock().unwrap_or_else(|e| e.into_inner()).vnc_clipboard {
+        let mut clipboard = self.clipboard.lock().unwrap_or_else(|e| e.into_inner());
+        let mut frame = self.frame.lock().unwrap_or_else(|e| e.into_inner());
+        if !frame.vnc_clipboard || text.len() > MAX_CLIPBOARD_TEXT {
             return;
         }
-        *self.clipboard_offer.lock().unwrap_or_else(|e| e.into_inner()) = Some(text);
+        frame.guest_clipboard_changed(false);
+        drop(frame);
+        clipboard.offer = Some(text);
+        clipboard.requested = false;
         let _ = self.send_clipboard_message(CLIP_NOTIFY | CLIP_TEXT, &[]);
     }
 
     /// Asks the guest for its clipboard text; it arrives as `clipboard_text`.
     pub fn request_clipboard(&self) -> Result<()> {
+        let mut clipboard = self.clipboard.lock().unwrap_or_else(|e| e.into_inner());
         if !self.frame.lock().unwrap_or_else(|e| e.into_inner()).vnc_clipboard {
             bail!("Clipboard sharing needs the guest agent.");
         }
-        self.send_clipboard_message(CLIP_REQUEST | CLIP_TEXT, &[])
+        if clipboard.offer.is_some() {
+            bail!("The guest has no clipboard text of its own.");
+        }
+        self.send_clipboard_message(CLIP_REQUEST | CLIP_TEXT, &[])?;
+        clipboard.requested = true;
+        Ok(())
     }
 
     /// ClientCutText in the extended form: a negative length, then flags and data.
@@ -251,11 +285,15 @@ impl Session {
         self.send(&msg)
     }
 
-    fn received_clipboard(&self, text: String) {
-        let text = text.trim_end_matches('\0').to_owned();
+    fn received_clipboard(&self, text: String, extended: bool) {
+        let mut clipboard = self.clipboard.lock().unwrap_or_else(|e| e.into_inner());
+        if extended && !clipboard.requested {
+            return;
+        }
+        clipboard.offer = None;
+        clipboard.requested = false;
         let mut frame = self.frame.lock().unwrap_or_else(|e| e.into_inner());
-        frame.clipboard_text = Some(text);
-        frame.guest_clipboard = frame.guest_clipboard.wrapping_add(1);
+        frame.received_clipboard(text);
     }
 
     /// QEMU's extended clipboard (`vnc-clipboard.c`): capabilities, notify, request, provide.
@@ -266,37 +304,51 @@ impl Session {
         let flags = u32::from_be_bytes(payload[..4].try_into().unwrap_or_default());
         let data = &payload[4..];
         if flags & CLIP_CAPS != 0 {
-            self.frame.lock().unwrap_or_else(|e| e.into_inner()).vnc_clipboard = true;
-            // Our capabilities: text, every action, and the largest text we accept.
+            if flags & CLIP_TEXT == 0 || flags & CLIP_PROVIDE == 0 {
+                return Ok(());
+            }
+            // Request data explicitly after a notification.
             let actions = CLIP_REQUEST | CLIP_PEEK | CLIP_NOTIFY | CLIP_PROVIDE;
-            self.send_clipboard_message(
-                CLIP_CAPS | CLIP_TEXT | actions,
-                &(MAX_CLIPBOARD_TEXT as u32).to_be_bytes(),
-            )?;
+            self.send_clipboard_message(CLIP_CAPS | CLIP_TEXT | actions, &0u32.to_be_bytes())?;
+            self.frame.lock().unwrap_or_else(|e| e.into_inner()).vnc_clipboard = true;
             return Ok(());
+        }
+        if flags & CLIP_NOTIFY != 0 {
+            let mut clipboard = self.clipboard.lock().unwrap_or_else(|e| e.into_inner());
+            let has_text = flags & CLIP_TEXT != 0;
+            clipboard.offer = None;
+            clipboard.requested = has_text;
+            self.frame.lock().unwrap_or_else(|e| e.into_inner()).guest_clipboard_changed(has_text);
+            if has_text {
+                self.send_clipboard_message(CLIP_REQUEST | CLIP_TEXT, &[])?;
+            }
+            return Ok(());
+        }
+        if flags & CLIP_PEEK != 0 {
+            let has_text = self.clipboard.lock().unwrap_or_else(|e| e.into_inner()).offer.is_some();
+            self.send_clipboard_message(
+                CLIP_NOTIFY
+                    | if has_text {
+                        CLIP_TEXT
+                    } else {
+                        0
+                    },
+                &[],
+            )?;
         }
         if flags & CLIP_TEXT == 0 {
             return Ok(());
         }
         if flags & CLIP_PROVIDE != 0 {
             if let Some(text) = inflate_text(data) {
-                self.received_clipboard(text);
+                self.received_clipboard(text, true);
             }
         }
         if flags & CLIP_REQUEST != 0 {
-            let offer = self.clipboard_offer.lock().unwrap_or_else(|e| e.into_inner()).clone();
-            if let Some(text) = offer {
-                self.send_clipboard_message(CLIP_PROVIDE | CLIP_TEXT, &deflate_text(&text)?)?;
+            let clipboard = self.clipboard.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(text) = &clipboard.offer {
+                self.send_clipboard_message(CLIP_PROVIDE | CLIP_TEXT, &deflate_text(text)?)?;
             }
-        }
-        if flags & CLIP_PEEK != 0
-            && self.clipboard_offer.lock().unwrap_or_else(|e| e.into_inner()).is_some()
-        {
-            self.send_clipboard_message(CLIP_NOTIFY | CLIP_TEXT, &[])?;
-        }
-        if flags & CLIP_NOTIFY != 0 {
-            // The guest copied text: fetch it so the host clipboard follows.
-            self.send_clipboard_message(CLIP_REQUEST | CLIP_TEXT, &[])?;
         }
         Ok(())
     }
@@ -538,7 +590,7 @@ impl Session {
                     skip(&mut s, 3)?;
                     let len = i32::from_be_bytes(array(&mut s)?);
                     let size = len.unsigned_abs() as usize;
-                    if size > MAX_CLIPBOARD_MESSAGE {
+                    if !self.share_clipboard || size > MAX_CLIPBOARD_MESSAGE {
                         skip(&mut s, size)?;
                         continue;
                     }
@@ -546,7 +598,10 @@ impl Session {
                     s.read_exact(&mut payload)?;
                     if len >= 0 {
                         // Classic ServerCutText: Latin-1 text.
-                        self.received_clipboard(payload.iter().map(|&b| b as char).collect());
+                        self.received_clipboard(
+                            payload.iter().map(|&b| b as char).collect(),
+                            false,
+                        );
                     } else {
                         self.extended_clipboard(&payload)?;
                     }
@@ -565,16 +620,16 @@ const CLIP_REQUEST: u32 = 1 << 25;
 const CLIP_PEEK: u32 = 1 << 26;
 const CLIP_NOTIFY: u32 = 1 << 27;
 const CLIP_PROVIDE: u32 = 1 << 28;
-const MAX_CLIPBOARD_TEXT: usize = 1 << 20;
+// QEMU caps the inflated buffer at 1 MiB, including the length and terminator.
+const MAX_CLIPBOARD_TEXT: usize = (1 << 20) - 5;
 const MAX_CLIPBOARD_MESSAGE: usize = 4 << 20;
 
-/// Provide payload: zlib stream of a big-endian size and the NUL-terminated UTF-8 text.
+/// QEMU forwards the exact payload bytes to its guest agent.
 fn deflate_text(text: &str) -> Result<Vec<u8>> {
     use std::io::Write as _;
-    let mut raw = Vec::with_capacity(text.len() + 5);
-    raw.extend_from_slice(&((text.len() + 1) as u32).to_be_bytes());
+    let mut raw = Vec::with_capacity(text.len() + 4);
+    raw.extend_from_slice(&(text.len() as u32).to_be_bytes());
     raw.extend_from_slice(text.as_bytes());
-    raw.push(0);
     let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
     encoder.write_all(&raw)?;
     Ok(encoder.finish()?)
@@ -583,12 +638,19 @@ fn deflate_text(text: &str) -> Result<Vec<u8>> {
 fn inflate_text(data: &[u8]) -> Option<String> {
     let mut raw = Vec::new();
     flate2::read::ZlibDecoder::new(data)
-        .take(MAX_CLIPBOARD_TEXT as u64 + 4)
+        .take(MAX_CLIPBOARD_TEXT as u64 + 6)
         .read_to_end(&mut raw)
         .ok()?;
     let size = u32::from_be_bytes(raw.get(..4)?.try_into().ok()?) as usize;
-    let text = raw.get(4..4 + size.min(raw.len() - 4))?;
-    Some(String::from_utf8_lossy(text).trim_end_matches('\0').to_owned())
+    let text = raw.get(4..)?;
+    if size != text.len() {
+        return None;
+    }
+    let text = text.strip_suffix(&[0]).unwrap_or(text);
+    if text.len() > MAX_CLIPBOARD_TEXT {
+        return None;
+    }
+    Some(std::str::from_utf8(text).ok()?.to_owned())
 }
 
 fn validate_size(w: usize, h: usize) -> Result<()> {
@@ -613,7 +675,7 @@ fn validate_rect(
     Ok(())
 }
 
-fn handshake(s: &mut Box<dyn Stream>) -> Result<(u32, u32)> {
+fn handshake(s: &mut Box<dyn Stream>, share_clipboard: bool) -> Result<(u32, u32)> {
     let mut version = [0u8; 12];
     s.read_exact(&mut version)?;
     if !version.starts_with(b"RFB ") {
@@ -649,7 +711,10 @@ fn handshake(s: &mut Box<dyn Stream>) -> Result<(u32, u32)> {
     s.write_all(&format)?;
     // CopyRect, Raw, DesktopSize, Cursor: QEMU then sends the cursor shape instead of
     // painting it into the framebuffer, so the client draws it without lag.
-    let encodings = [1, 0, -223, -239, -257, EXTENDED_DESKTOP_SIZE, CLIPBOARD_EXT];
+    let mut encodings = vec![1, 0, -223, -239, -257, EXTENDED_DESKTOP_SIZE];
+    if share_clipboard {
+        encodings.push(CLIPBOARD_EXT);
+    }
     let mut msg = vec![2, 0];
     msg.extend_from_slice(&(encodings.len() as u16).to_be_bytes());
     for e in encodings {
@@ -769,7 +834,8 @@ mod tests {
             writer: Mutex::new(Box::new(client.clone())),
             last: Mutex::new(None),
             pressed_keys: Mutex::default(),
-            clipboard_offer: Mutex::default(),
+            clipboard: Mutex::default(),
+            share_clipboard: true,
         };
         (session, client, output)
     }
@@ -791,6 +857,35 @@ mod tests {
         for text in ["", "hello", "naïve — ünïcode\nline two"] {
             assert_eq!(inflate_text(&deflate_text(text).unwrap()).unwrap(), text);
         }
+        let text = "héllo";
+        let mut raw = Vec::new();
+        flate2::read::ZlibDecoder::new(deflate_text(text).unwrap().as_slice())
+            .read_to_end(&mut raw)
+            .unwrap();
+        assert_eq!(&raw[4..], text.as_bytes());
+        assert!(
+            inflate_text(&deflate_text(&"a".repeat(MAX_CLIPBOARD_TEXT + 1)).unwrap()).is_none()
+        );
+    }
+
+    #[test]
+    fn vnc_clipboard_ignores_guest_data_after_a_new_host_offer() -> Result<()> {
+        let (session, _, peer) = local_session(4, 3);
+        session.extended_clipboard(&(CLIP_CAPS | CLIP_TEXT | CLIP_PROVIDE).to_be_bytes())?;
+        session.extended_clipboard(&(CLIP_NOTIFY | CLIP_TEXT).to_be_bytes())?;
+        assert!(peer.lock().unwrap().ends_with(&(CLIP_REQUEST | CLIP_TEXT).to_be_bytes()));
+        let mut guest = (CLIP_PROVIDE | CLIP_TEXT).to_be_bytes().to_vec();
+        guest.extend(deflate_text("guest text")?);
+        session.offer_clipboard("host text".into());
+        session.extended_clipboard(&guest)?;
+        assert!(session.frame.lock().unwrap().clipboard_text.is_none());
+
+        session.extended_clipboard(&(CLIP_NOTIFY | CLIP_TEXT).to_be_bytes())?;
+        session.extended_clipboard(&guest)?;
+        assert_eq!(session.frame.lock().unwrap().clipboard_text.as_deref(), Some("guest text"));
+        session.extended_clipboard(&CLIP_NOTIFY.to_be_bytes())?;
+        assert!(session.frame.lock().unwrap().clipboard_text.is_none());
+        Ok(())
     }
 
     #[test]
@@ -895,7 +990,7 @@ mod tests {
     #[ignore]
     fn live_qemu_frames() {
         let socket = std::env::var("HYDROXL_VNC_SOCKET").expect("HYDROXL_VNC_SOCKET");
-        let session = Session::connect(&Endpoint::Unix(socket.into())).expect("connect");
+        let session = Session::connect(&Endpoint::Unix(socket.into()), true).expect("connect");
         let start = std::time::Instant::now();
         let mut updates = 0;
         let mut last = 0;

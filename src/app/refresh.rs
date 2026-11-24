@@ -9,6 +9,7 @@ use gpui_kit::component::WindowExt;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::{prelude::*, *};
 use std::sync::mpsc;
+use std::time::Instant;
 
 impl Workspace {
     pub(crate) fn begin(
@@ -65,7 +66,6 @@ impl Workspace {
             _ => None,
         };
         let selected = self.selected.clone();
-        let cached_machines = matches!(job, Job::ConvertDisk { .. }).then(|| self.machines.clone());
         let previous_ids: Vec<_> = self.machines.iter().map(|m| m.id.clone()).collect();
         let importing = matches!(&job, Job::Import(..) | Job::Appliance(_));
         let need_architectures = self.architectures.is_empty() && !self.demo;
@@ -118,40 +118,33 @@ impl Workspace {
             {
                 let _ = tx.send(JobEvent::DisplayReady(Box::new(machine), source));
             }
-            if outcome.is_ok() && cached_machines.is_none() && !refresh {
+            if outcome.is_ok() && !disk_conversion && !refresh {
                 progress.update("Refreshing library", None);
             }
-            let machines = match cached_machines {
-                Some(machines) => Ok(machines),
-                None => backend::machines(c).map_err(|e| format!("{e:#}")),
-            };
+            let machines = (!disk_conversion)
+                .then(|| (Instant::now(), backend::machines(c).map_err(|e| format!("{e:#}"))));
+            let list = machines.as_ref().and_then(|(_, machines)| machines.as_ref().ok());
             if importing && outcome.is_ok() {
-                select_name = machines
-                    .as_ref()
-                    .ok()
+                select_name = list
                     .and_then(|list| list.iter().find(|m| !previous_ids.contains(&m.id)))
                     .map(|m| m.name.clone());
             }
-            let details = (!disk_conversion).then_some(&machines).and_then(|machines| {
-                machines
-                    .as_ref()
-                    .ok()
-                    .and_then(|list| {
-                        select_name
-                            .as_ref()
-                            .and_then(|name| list.iter().find(|m| &m.name == name))
-                            .or_else(|| {
-                                selected.as_ref().and_then(|id| list.iter().find(|m| &m.id == id))
-                            })
-                            .or_else(|| list.first())
-                    })
-                    .map(|machine| {
-                        (
-                            machine.id.clone(),
-                            operations::details(c, &machine.id).map_err(|e| format!("{e:#}")),
-                        )
-                    })
-            });
+            let details = list
+                .and_then(|list| {
+                    select_name
+                        .as_ref()
+                        .and_then(|name| list.iter().find(|m| &m.name == name))
+                        .or_else(|| {
+                            selected.as_ref().and_then(|id| list.iter().find(|m| &m.id == id))
+                        })
+                        .or_else(|| list.first())
+                })
+                .map(|machine| {
+                    (
+                        machine.id.clone(),
+                        operations::details(c, &machine.id).map_err(|e| format!("{e:#}")),
+                    )
+                });
             let _ = tx.send(JobEvent::Complete(Box::new(Response {
                 machines,
                 details,
@@ -207,6 +200,13 @@ impl Workspace {
         let response = match self.pending.as_ref().map(|p| p.receiver.try_recv()) {
             Some(Ok(JobEvent::Complete(response))) => response,
             Some(Ok(JobEvent::DisplayReady(machine, source))) => {
+                self.last_library_sample = Some(Instant::now());
+                self.machine_statuses = None;
+                if let Some(current) = self.machines.iter_mut().find(|m| m.id == machine.id) {
+                    current.state = machine.state;
+                    current.saved_state = false;
+                    cx.notify();
+                }
                 match source {
                     ActionSource::Library => self.open_machine_display(*machine, cx),
                     ActionSource::Viewer(handle) => {
@@ -247,6 +247,7 @@ impl Workspace {
             }
             _ => return,
         };
+        let response = *response;
         let Some(pending) = self.pending.take() else {
             return;
         };
@@ -296,10 +297,21 @@ impl Workspace {
         if let Some(architectures) = response.architectures.filter(|a| !a.is_empty()) {
             self.architectures = architectures;
         }
-        let loaded_list = response.machines.is_ok();
+        let loaded_list = matches!(response.machines, Some((_, Ok(_))));
         let previous_selection = self.selected.clone();
         match response.machines {
-            Ok(machines) => {
+            Some((sampled_at, Ok(mut machines))) => {
+                self.last_library_sample = Some(
+                    self.last_library_sample
+                        .map_or(sampled_at, |previous| previous.max(sampled_at)),
+                );
+                if let Some((time, statuses)) = &self.machine_statuses
+                    && *time > sampled_at
+                {
+                    for machine in &mut machines {
+                        statuses.apply(machine);
+                    }
+                }
                 self.library_error = None;
                 self.machines = machines;
                 self.apply_icons();
@@ -316,7 +328,8 @@ impl Workspace {
                     self.preferences.save();
                 }
             }
-            Err(error) => {
+            None => {}
+            Some((_, Err(error))) => {
                 if !self.machines.is_empty() && self.library_error.as_ref() != Some(&error) {
                     window.push_notification(Notification::error(error.clone()), cx);
                 }

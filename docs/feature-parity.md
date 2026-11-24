@@ -6,9 +6,8 @@ explicit requirements. Apple Virtualization, macOS recovery/IPSW installation,
 Rosetta, Apple-only integrations, and the separate UTM Remote/Server product are
 outside this Linux local-manager scope.
 
-All entries below describe source implementation. `cargo build --locked` passes;
-runtime behavior and visual presentation have not been verified. Do not treat
-this matrix as a release claim.
+The matrix describes Hydroxl's implementation. The [viewer regression checks](architecture.md#viewer-and-vm-status-regression-checks)
+cover clipboard, power state, and SPICE connection behavior.
 
 | Workflow | Implementation | Limits / remaining work |
 | --- | --- | --- |
@@ -28,7 +27,7 @@ this matrix as a release claim.
 | Display screenshot | Actual intermittent guest capture, PNG save | Captured frame is labeled; never presented as live video |
 | Display performance | Viewer overlay with live FPS, average FPS, and 1% low | Measures changing guest textures drawn by the viewer. [Repeatable 60 FPS check](display-performance.md) |
 | Fullscreen / resolution / keyboard capture | In-app fullscreen, guest input capture, Ctrl+Alt release | Host shortcuts depend on compositor support |
-| Clipboard sharing | Automatic both ways over SPICE and VNC: guest copies reach the host as they happen; host text is offered when the display window regains focus or captures input. "Copy guest clipboard" copies on demand. "Type clipboard text" types into any guest. With VNC the guest agent channel is connected to QEMU's `qemu-vdagent` | spice-vdagent required in the guest for sync; typing uses a US layout. VNC clipboard is text only |
+| Clipboard sharing | Two-way text sync over SPICE, VNC, and local D-Bus. The viewer checks for host clipboard changes while focused. "Copy guest clipboard" copies on demand, and "Type clipboard text" types into any guest. | Sync requires spice-vdagent in the guest. VNC and D-Bus also require QEMU's `qemu-vdagent`. Wayland can defer guest copies until the viewer regains focus. Typing uses a US layout. |
 | Shared folders | virtio-fs (default, needs host virtiofsd, required for Windows) or 9p. Edit or stop sharing per folder. Setup in the guest through the guest agent, keyboard automation on Windows, or copy / type commands. Linux entries are added to fstab with automount | Windows needs guest tools and WinFsp (installed automatically when the guest has network) |
 | Architecture change | Stopped machines, from libvirt's available emulators, with confirmation | Machine type, firmware and controllers reset; the installed system must support the new architecture |
 | Operating system | Set from the libosinfo catalog in libvirt metadata | |

@@ -34,6 +34,16 @@ fn prepare_xml(xml: &str) -> Result<Option<String>> {
     let spice = devices
         .children()
         .find(|node| node.has_tag_name("graphics") && node.attribute("type") == Some("spice"));
+    let spice_without_clipboard =
+        "<graphics type='spice'><listen type='none'/><clipboard copypaste='no'/></graphics>";
+    let new_spice = if doc
+        .descendants()
+        .any(|node| node.has_tag_name("clipboard") && node.attribute("copypaste") == Some("no"))
+    {
+        spice_without_clipboard
+    } else {
+        "<graphics type='spice'><listen type='none'/></graphics>"
+    };
     let usb_disabled = devices.children().any(|node| {
         node.has_tag_name("controller")
             && node.attribute("type") == Some("usb")
@@ -71,8 +81,8 @@ fn prepare_xml(xml: &str) -> Result<Option<String>> {
     let mut edited = xml.to_owned();
     let range = devices.range();
     if xml[range.clone()].ends_with("/>") {
-        let spice = "<graphics type='spice'><listen type='none'/></graphics>";
-        edited.replace_range(range.end - 2..range.end, &format!(">{spice}{additions}</devices>"));
+        edited
+            .replace_range(range.end - 2..range.end, &format!(">{new_spice}{additions}</devices>"));
     } else {
         let end = range.end - "</devices>".len();
         edited.insert_str(end, &additions);
@@ -84,7 +94,7 @@ fn prepare_xml(xml: &str) -> Result<Option<String>> {
             }
             (first, None) => {
                 let at = first.map_or(end, |node| node.range().start);
-                edited.insert_str(at, "<graphics type='spice'><listen type='none'/></graphics>");
+                edited.insert_str(at, new_spice);
             }
             _ => {}
         }
@@ -317,7 +327,21 @@ pub(crate) fn route_agent_clipboard(
             }
         }
         Some(node) if node.attribute("type") == Some(other) => {
-            edited.replace_range(node.range(), &element);
+            // Reuse the guest's existing virtio port, including its slot and alias.
+            let children: String = node
+                .children()
+                .filter(|child| child.is_element() && !child.has_tag_name("source"))
+                .map(|child| &xml[child.range()])
+                .collect();
+            let source = if vdagent {
+                format!("<source><clipboard copypaste='{copypaste}'/></source>")
+            } else {
+                String::new()
+            };
+            edited.replace_range(
+                node.range(),
+                &format!("<channel type='{wanted}'>{source}{children}</channel>"),
+            );
         }
         Some(_) => return Ok(None),
         None if vdagent || clipboard.is_some() => {
@@ -432,6 +456,7 @@ mod tests {
             "<channel type='qemu-vdagent'><source><clipboard copypaste='yes'/></source>"
         ));
         assert!(!vnc.contains("spicevmc"));
+        assert!(vnc.contains("<address type='virtio-serial' controller='0' bus='0' port='1'/>"));
         assert!(route_agent(&vnc, true)?.is_none());
         let back = route_agent(&vnc, false)?.unwrap();
         assert!(back.contains("<channel type='spicevmc'>"));

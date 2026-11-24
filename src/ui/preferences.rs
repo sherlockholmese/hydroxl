@@ -74,10 +74,14 @@ impl Workspace {
                             if this.busy() || (!this.demo && this.preferences.connection == value) {
                                 return;
                             }
-                            this.demo = false;
+                            if std::mem::replace(&mut this.demo, false) {
+                                this.watch_machine_statuses(cx);
+                            }
                             this.preferences.connection = value;
                             this.preferences.save();
                             this.machines.clear();
+                            this.machine_statuses = None;
+                            this.last_library_sample = Some(std::time::Instant::now());
                             this.selected = None;
                             this.details = Details::default();
                             if let Some((_, preview)) = this.live_preview.take() {

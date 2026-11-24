@@ -22,7 +22,9 @@ pub use gpu::{
     HOSTMEM_BYTES, NEPTUNE_HOST_MISSING, TRITON_ARCH_UNSUPPORTED, gpu_features, triton_arch,
 };
 pub use hardware::{Topology, configure, nested_host_feature};
-pub(crate) use library::{DisplayTarget, SpiceOptions, display_target, is_peer_dbus};
+pub(crate) use library::{
+    DisplayTarget, MachineStatuses, SpiceOptions, display_target, is_peer_dbus,
+};
 pub use library::{action, demo_machines, ensure_live_tablet, machines, virsh};
 pub use model::{ARCHITECTURES, Action, Connection, Machine, NewMachine, State};
 pub(crate) use process::{

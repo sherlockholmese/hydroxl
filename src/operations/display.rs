@@ -92,6 +92,7 @@ pub(super) fn apply_display(
     let mut xml = backend::virsh(c, &["dumpxml", id, "--inactive"])?;
     let doc = roxmltree::Document::parse(&xml)?;
     let was_peer_dbus = doc.descendants().any(backend::is_peer_dbus);
+    let settings_were_applied = settings.is_some();
     let clipboard = settings.as_ref().map_or_else(
         || {
             if was_peer_dbus {
@@ -134,6 +135,16 @@ pub(super) fn apply_display(
             if let Some(agent) = agent {
                 xml.replace_range(agent.range(), "");
             }
+        }
+    } else if settings_were_applied && local_dbus.is_none() {
+        let doc = roxmltree::Document::parse(&xml)?;
+        let uses_vdagent = doc.descendants().any(|node| {
+            backend::is_agent_channel(node) && node.attribute("type") == Some("qemu-vdagent")
+        });
+        if uses_vdagent
+            && let Some(updated) = backend::route_agent_clipboard(&xml, true, Some(clipboard))?
+        {
+            xml = updated;
         }
     }
     temporary_xml(&xml, |path| backend::virsh(c, &["define", path]).map(|_| ()))

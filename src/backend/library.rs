@@ -1,5 +1,6 @@
 use super::{Action, Connection, Machine, State, run};
 use anyhow::{Context, Result, bail};
+use std::collections::{HashMap, HashSet};
 pub fn virsh(connection: Connection, args: &[&str]) -> Result<String> {
     let mut all = vec!["--connect", connection.uri()];
     all.extend_from_slice(args);
@@ -7,21 +8,117 @@ pub fn virsh(connection: Connection, args: &[&str]) -> Result<String> {
 }
 
 pub fn machines(connection: Connection) -> Result<Vec<Machine>> {
-    let ids = virsh(connection, &["list", "--all", "--uuid"])?;
+    let ids = machine_ids(connection)?;
     let mut result = Vec::new();
-    for id in ids.lines().map(str::trim).filter(|id| !id.is_empty()) {
-        let xml = virsh(connection, &["dumpxml", id])?;
-        let state = virsh(connection, &["domstate", id])?;
-        let mut machine = parse_machine(id, &xml, State::from_virsh(&state))?;
-        let info = virsh(connection, &["dominfo", id])?;
-        machine.saved_state =
-            info.lines().any(|line| line.starts_with("Managed save:") && line.contains("yes"));
-        machine.autostart =
-            info.lines().any(|line| line.starts_with("Autostart:") && line.contains("enable"));
-        result.push(machine);
+    for id in &ids {
+        match machine(connection, id) {
+            Ok(machine) => result.push(machine),
+            // A transient VM can vanish between enumeration and inspection.
+            Err(_) if machine_ids(connection).is_ok_and(|current| !current.contains(id)) => {}
+            Err(error) => return Err(error),
+        }
     }
     result.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
     Ok(result)
+}
+
+fn machine_ids(connection: Connection) -> Result<Vec<String>> {
+    Ok(virsh(connection, &["list", "--all", "--uuid"])?
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect())
+}
+
+fn machine(connection: Connection, id: &str) -> Result<Machine> {
+    let xml = virsh(connection, &["dumpxml", id])?;
+    let info = virsh(connection, &["dominfo", id])?;
+    let field = |name| {
+        info.lines()
+            .filter_map(|line| line.split_once(':'))
+            .find_map(|(key, value)| (key == name).then(|| value.trim()))
+    };
+    let state = field("State").context("Libvirt did not return the machine state.")?;
+    let mut machine = parse_machine(id, &xml, State::from_virsh(state))?;
+    machine.saved_state = field("Managed save") == Some("yes");
+    machine.autostart = field("Autostart") == Some("enable");
+    Ok(machine)
+}
+
+pub(crate) struct MachineStatuses {
+    states: HashMap<String, State>,
+    saved: HashSet<String>,
+}
+
+impl MachineStatuses {
+    pub(crate) fn read(connection: Connection) -> Result<Self> {
+        let saved = virsh(connection, &["list", "--all", "--with-managed-save", "--uuid"])?;
+        let states = virsh(connection, &["domstats", "--state", "--raw", "--nowait"])?;
+        Ok(Self {
+            states: parse_domain_states(&states),
+            saved: saved.split_whitespace().map(str::to_owned).collect(),
+        })
+    }
+
+    pub(crate) fn apply(&self, machine: &mut Machine) -> bool {
+        let Some(&state) = self.states.get(&machine.name) else {
+            return false;
+        };
+        let saved = state == State::Stopped && self.saved.contains(&machine.id);
+        let changed = (machine.state, machine.saved_state) != (state, saved);
+        machine.state = state;
+        machine.saved_state = saved;
+        changed
+    }
+}
+
+fn parse_domain_states(output: &str) -> HashMap<String, State> {
+    // `domstats --raw` returns virDomainState values grouped by domain name.
+    let mut states = HashMap::new();
+    let mut name = None;
+    for line in output.lines() {
+        if let Some(domain) = line.strip_prefix("Domain: '").and_then(|s| s.strip_suffix('\'')) {
+            name = Some(domain);
+        } else if let Some(value) = line.trim_start().strip_prefix("state.state=")
+            && let Some(name) = name.take()
+        {
+            let state = match value {
+                "1" | "2" | "4" => State::Running,
+                "3" | "7" => State::Paused,
+                "5" | "6" => State::Stopped,
+                _ => State::Other,
+            };
+            states.insert(name.to_owned(), state);
+        }
+    }
+    states
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_state_snapshot_updates_power_and_clears_managed_save_when_running() {
+        let states = parse_domain_states(
+            "Domain: 'Ubuntu 24.04'\n  state.state=3\n  state.reason=2\n\n\
+             Domain: 'Debian Server'\n  state.state=5\n\n\
+             Domain: 'Windows 11'\n  state.state=2\n",
+        );
+        let statuses = MachineStatuses {
+            states,
+            saved: ["ubuntu".into(), "debian".into()].into(),
+        };
+        let mut machines = demo_machines();
+        assert!(statuses.apply(&mut machines[0]));
+        assert_eq!(machines[0].state, State::Paused);
+        assert!(!machines[0].saved_state);
+        assert!(statuses.apply(&mut machines[2]));
+        assert_eq!(machines[2].status(), "Suspended");
+        assert!(statuses.apply(&mut machines[4]));
+        assert_eq!(machines[4].state, State::Running);
+        assert!(!statuses.apply(&mut machines[1]));
+        assert!(!statuses.apply(&mut machines[4]));
+    }
 }
 
 fn parse_machine(id: &str, xml: &str, state: State) -> Result<Machine> {
@@ -288,7 +385,10 @@ pub fn ensure_display(connection: Connection, id: &str) -> Result<()> {
 }
 
 pub(crate) enum DisplayTarget {
-    Vnc(String),
+    Vnc {
+        uri: String,
+        clipboard: bool,
+    },
     Spice(SpiceOptions),
     Dbus {
         graphics: u32,
@@ -312,7 +412,10 @@ pub(crate) fn display_target(
 ) -> Result<DisplayTarget> {
     // Test hook: point the display at a VNC socket directly, without libvirt.
     if let Some(socket) = std::env::var_os("HYDROXL_VNC_SOCKET") {
-        return Ok(DisplayTarget::Vnc(format!("vnc+unix://{}", socket.to_string_lossy())));
+        return Ok(DisplayTarget::Vnc {
+            uri: format!("vnc+unix://{}", socket.to_string_lossy()),
+            clipboard: true,
+        });
     }
     let xml = virsh(connection, &["dumpxml", id])?;
     let doc = roxmltree::Document::parse(&xml)?;
@@ -361,7 +464,13 @@ pub(crate) fn display_target(
     if vnc {
         let endpoint = virsh(connection, &["domdisplay", "--type", "vnc", id])?;
         if !endpoint.trim().is_empty() {
-            return Ok(DisplayTarget::Vnc(endpoint));
+            let clipboard = !doc.descendants().any(|node| {
+                node.has_tag_name("clipboard") && node.attribute("copypaste") == Some("no")
+            });
+            return Ok(DisplayTarget::Vnc {
+                uri: endpoint,
+                clipboard,
+            });
         }
     }
     bail!("The guest has no SPICE, VNC, or peer D-Bus display.")

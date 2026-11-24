@@ -105,7 +105,7 @@ impl Job {
     }
 }
 pub(crate) struct Response {
-    pub(crate) machines: Result<Vec<Machine>, String>,
+    pub(crate) machines: Option<(std::time::Instant, Result<Vec<Machine>, String>)>,
     pub(crate) details: Option<(String, Result<Details, String>)>,
     pub(crate) outcome: Option<Result<(), String>>,
     pub(crate) select_name: Option<String>,

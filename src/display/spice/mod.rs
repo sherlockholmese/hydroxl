@@ -27,7 +27,8 @@ const DISPLAY: i32 = 2;
 const INPUTS: i32 = 3;
 const CURSOR: i32 = 4;
 const USBREDIR: i32 = 9;
-const MAIN_CLOSED: i32 = 12;
+const CHANNEL_OPENED: i32 = 10;
+const CHANNEL_CLOSED: i32 = 12;
 const CHANNEL_ERROR_CONNECT: i32 = 20;
 const CLIENT_MOUSE_MODE: i32 = 2;
 const MONITORS_CONFIG: u32 = 1;
@@ -35,6 +36,7 @@ const CLIPBOARD_BY_DEMAND: u32 = 5;
 const CLIPBOARD: u32 = 0;
 const UTF8_TEXT: u32 = 1;
 const MAX_CLIPBOARD_BYTES: usize = 1024 * 1024;
+const CLIPBOARD_TIMEOUT: Duration = Duration::from_secs(4);
 const G_SIGNAL_MATCH_DATA: u32 = 1 << 4;
 
 type Frame = Arc<Mutex<Framebuffer>>;
@@ -172,10 +174,17 @@ fn work(api: &'static Api, rx: mpsc::Receiver<Message>) {
                     gpu,
                     frame,
                     result,
-                } => match Client::open(api, connection.uri(), &machine, options, gpu, frame) {
+                } => match Client::open(
+                    api,
+                    connection.uri(),
+                    &machine,
+                    options,
+                    gpu,
+                    frame,
+                    result.clone(),
+                ) {
                     Ok(client) => {
                         clients.insert(id, client);
-                        let _ = result.send(Ok(()));
                     }
                     Err(error) => {
                         let _ = result.send(Err(error));
@@ -320,6 +329,7 @@ impl SoftwareDisplay {
             };
         }
         if updated {
+            frame.display_error = None;
             frame.generation += 1;
         }
     }
@@ -334,13 +344,16 @@ struct Client {
     display: Cell<Object>,
     inputs: Cell<Object>,
     channels: RefCell<Vec<Object>>,
+    ready: RefCell<Option<mpsc::SyncSender<Result<()>>>>,
+    main_open: Cell<bool>,
+    display_open: Cell<bool>,
     frame: Frame,
     software: RefCell<SoftwareDisplay>,
     pressed: RefCell<BTreeSet<u32>>,
     buttons: Cell<u8>,
     last_pointer: Cell<Option<(u16, u16)>>,
-    clipboard_offer: RefCell<String>,
-    clipboard_request: RefCell<Option<mpsc::Sender<Result<String>>>>,
+    clipboard_offer: RefCell<Option<String>>,
+    clipboard_request: RefCell<Option<ClipboardRequest>>,
     gpu: Cell<bool>,
     /// A GPU draw QEMU is waiting on. SPICE sends no other draw until it is acknowledged.
     pending: RefCell<Option<PendingDraw>>,
@@ -350,6 +363,12 @@ struct Client {
     /// Last scanout layout described in the debug log.
     logged_scanout: Cell<Option<(u32, u32, u32, u64, u32)>>,
     logged_scanout_visible: Cell<Option<bool>>,
+}
+
+struct ClipboardRequest {
+    revision: u64,
+    started: Instant,
+    result: mpsc::Sender<Result<String>>,
 }
 
 #[derive(Default)]
@@ -384,6 +403,7 @@ impl Client {
         options: SpiceOptions,
         gpu: bool,
         frame: Frame,
+        ready: mpsc::SyncSender<Result<()>>,
     ) -> Result<Box<Self>> {
         let mut client = Box::new(Self {
             api,
@@ -394,6 +414,9 @@ impl Client {
             display: Cell::default(),
             inputs: Cell::default(),
             channels: RefCell::default(),
+            ready: RefCell::new(Some(ready)),
+            main_open: Cell::default(),
+            display_open: Cell::default(),
             frame,
             software: RefCell::default(),
             pressed: RefCell::default(),
@@ -473,8 +496,13 @@ impl Client {
 
     fn disconnect(&self, message: &str) {
         let mut frame = self.frame();
-        frame.closed = Some(message.to_owned());
-        frame.generation += 1;
+        if frame.closed.is_none() {
+            frame.closed = Some(message.to_owned());
+            frame.generation += 1;
+            if let Some(ready) = self.ready.take() {
+                let _ = ready.send(Err(anyhow::anyhow!("{message}")));
+            }
+        }
     }
 
     fn input(&self, command: Input) {
@@ -513,7 +541,8 @@ impl Client {
                     && text.len() <= MAX_CLIPBOARD_BYTES
                     && self.frame().spice_clipboard
                 {
-                    self.clipboard_offer.replace(text);
+                    self.clipboard_offer.replace(Some(text));
+                    self.frame().guest_clipboard_changed(false);
                     unsafe {
                         (self.api.spice_main_channel_clipboard_selection_grab)(
                             main, CLIPBOARD, &UTF8_TEXT, 1,
@@ -524,11 +553,26 @@ impl Client {
             }
             Input::ReadClipboard(result) => {
                 let main = self.main.get();
-                if main.is_null() || !self.frame().spice_clipboard {
+                let (available, revision) = {
+                    let frame = self.frame();
+                    (frame.spice_clipboard, frame.guest_clipboard)
+                };
+                if main.is_null() || !available || self.clipboard_offer.borrow().is_some() {
                     let _ =
                         result.send(Err(anyhow::anyhow!("The guest clipboard is unavailable.")));
+                } else if self
+                    .clipboard_request
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|request| request.started.elapsed() < CLIPBOARD_TIMEOUT)
+                {
+                    let _ = result.send(Err(anyhow::anyhow!("A clipboard request is pending.")));
                 } else {
-                    self.clipboard_request.replace(Some(result));
+                    self.clipboard_request.replace(Some(ClipboardRequest {
+                        revision,
+                        started: Instant::now(),
+                        result,
+                    }));
                     unsafe {
                         (self.api.spice_main_channel_clipboard_selection_request)(
                             main, CLIPBOARD, UTF8_TEXT,
@@ -753,7 +797,11 @@ unsafe extern "C" fn on_channel(_: Object, channel: Object, data: Object) {
         match kind {
             MAIN => {
                 client.main.set(channel);
-                client.signal(channel, c"channel-event", on_main_event as *const c_void);
+                client.signal(
+                    channel,
+                    c"channel-event",
+                    on_required_channel_event as *const c_void,
+                );
                 for name in [c"main-mouse-update", c"main-agent-update"] {
                     client.signal(channel, name, on_main_update as *const c_void);
                 }
@@ -772,12 +820,22 @@ unsafe extern "C" fn on_channel(_: Object, channel: Object, data: Object) {
                     c"main-clipboard-selection-grab",
                     on_clipboard_grab as *const c_void,
                 );
+                client.signal(
+                    channel,
+                    c"main-clipboard-selection-release",
+                    on_clipboard_release as *const c_void,
+                );
             }
             DISPLAY if client.property(channel, c"channel-id") == 0 => {
                 if std::env::var_os("HYDROXL_DEBUG_DISPLAY").is_some() {
                     eprintln!("display channel, gl {}", client.options.gl);
                 }
                 client.display.set(channel);
+                client.signal(
+                    channel,
+                    c"channel-event",
+                    on_required_channel_event as *const c_void,
+                );
                 client.signal(channel, c"display-primary-create", on_create as *const c_void);
                 client.signal(
                     channel,
@@ -794,7 +852,9 @@ unsafe extern "C" fn on_channel(_: Object, channel: Object, data: Object) {
                     );
                     client.signal(channel, c"gl-draw", on_gl_draw as *const c_void);
                 }
-                (client.api.spice_channel_connect)(channel);
+                if (client.api.spice_channel_connect)(channel) == 0 {
+                    client.disconnect("Could not start the SPICE display channel.");
+                }
             }
             INPUTS => {
                 client.inputs.set(channel);
@@ -1053,6 +1113,7 @@ impl Client {
             }
 
             let mut frame = self.frame();
+            frame.display_error = None;
             if gpu_copied {
                 frame.thumbnail = super::thumbnail::sample(w as u32, h as u32, &pixels);
                 return Ok(());
@@ -1080,7 +1141,13 @@ impl Client {
         if let Err(error) = result
             && !gpu_copied
         {
-            self.disconnect(&format!("Could not draw the SPICE GPU buffer. {error:#}"));
+            let mut frame = self.frame();
+            if frame.display_error.is_none() {
+                let message = format!("Could not draw the SPICE GPU buffer. {error:#}");
+                eprintln!("{message}");
+                frame.display_error = Some(message);
+                frame.generation += 1;
+            }
         }
     }
 }
@@ -1088,7 +1155,11 @@ impl Client {
 unsafe extern "C" fn on_channel_destroy(_: Object, channel: Object, data: Object) {
     let client = unsafe { &*data.cast::<Client>() };
     if client.display.get() == channel {
+        client.display_open.set(false);
         client.software.borrow_mut().destroy();
+    }
+    if client.main.get() == channel {
+        client.main_open.set(false);
     }
     if client.pending.borrow().as_ref().is_some_and(|pending| pending.channel == channel) {
         client.pending.take();
@@ -1116,28 +1187,60 @@ unsafe extern "C" fn on_channel_destroy(_: Object, channel: Object, data: Object
 
 unsafe extern "C" fn on_open_fd(channel: Object, tls: c_int, data: Object) {
     let client = unsafe { &*data.cast::<Client>() };
+    let report = |message: &str| {
+        if client.main.get() == channel || client.display.get() == channel {
+            client.disconnect(message);
+        } else {
+            eprintln!("Could not open an auxiliary SPICE channel. {message}");
+        }
+    };
     if tls != 0 {
-        client.disconnect("The local SPICE connection requested TLS.");
+        report("The local SPICE connection requested TLS.");
         return;
     }
     let fd = match client.attachment.open(client.options.graphics) {
         Ok(fd) => fd,
         Err(error) => {
-            client.disconnect(&format!("{error:#}"));
+            report(&format!("{error:#}"));
             return;
         }
     };
     if unsafe { (client.api.spice_channel_open_fd)(channel, fd.as_raw_fd()) } != 0 {
         let _ = fd.into_raw_fd();
     } else {
-        client.disconnect("Could not open a channel on the guest's SPICE display.");
+        report("Could not open a channel on the guest's SPICE display.");
     }
 }
 
-unsafe extern "C" fn on_main_event(_: Object, event: c_int, data: Object) {
+unsafe extern "C" fn on_required_channel_event(channel: Object, event: c_int, data: Object) {
     let client = unsafe { &*data.cast::<Client>() };
-    if event == MAIN_CLOSED || event >= CHANNEL_ERROR_CONNECT {
-        client.disconnect("The guest's SPICE display disconnected.");
+    if event == CHANNEL_OPENED {
+        if client.main.get() == channel {
+            client.main_open.set(true);
+            unsafe { on_main_update(channel, data) };
+        } else if client.display.get() == channel {
+            client.display_open.set(true);
+        }
+        if client.main_open.get()
+            && client.display_open.get()
+            && let Some(ready) = client.ready.take()
+        {
+            let _ = ready.send(Ok(()));
+        }
+    } else if event == CHANNEL_CLOSED || event >= CHANNEL_ERROR_CONNECT {
+        let name = if client.main.get() == channel {
+            "main"
+        } else {
+            "display"
+        };
+        let mut message = format!("The SPICE {name} channel disconnected.");
+        let error = unsafe { (client.api.spice_channel_get_error)(channel) };
+        if !error.is_null() && !unsafe { (*error).message }.is_null() {
+            let detail = unsafe { CStr::from_ptr((*error).message) }.to_string_lossy();
+            message.push(' ');
+            message.push_str(&detail);
+        }
+        client.disconnect(&message);
     }
 }
 
@@ -1147,16 +1250,26 @@ unsafe extern "C" fn on_main_update(channel: Object, data: Object) {
     let can_resize = unsafe {
         (client.api.spice_main_channel_agent_test_capability)(channel, MONITORS_CONFIG) != 0
     };
-    let clipboard = unsafe {
-        (client.api.spice_main_channel_agent_test_capability)(channel, CLIPBOARD_BY_DEMAND) != 0
-    };
+    let clipboard = client.options.clipboard
+        && client.property(channel, c"agent-connected") != 0
+        && unsafe {
+            (client.api.spice_main_channel_agent_test_capability)(channel, CLIPBOARD_BY_DEMAND) != 0
+        };
     let mut frame = client.frame();
     if frame.absolute != Some(absolute) {
         client.last_pointer.set(None);
     }
     frame.absolute = Some(absolute);
     frame.spice_resize = can_resize;
-    frame.spice_clipboard = clipboard && client.options.clipboard;
+    if frame.spice_clipboard && !clipboard {
+        frame.guest_clipboard_changed(false);
+        client.clipboard_offer.take();
+        client.clipboard_request.take();
+    }
+    if clipboard && !frame.spice_clipboard {
+        frame.clipboard_reset = frame.clipboard_reset.wrapping_add(1);
+    }
+    frame.spice_clipboard = clipboard;
     frame.generation += 1;
 }
 
@@ -1170,10 +1283,10 @@ unsafe extern "C" fn on_clipboard_request(
     if selection != CLIPBOARD || kind != UTF8_TEXT {
         return 0;
     }
-    let text = client.clipboard_offer.borrow();
-    if text.is_empty() {
+    let offer = client.clipboard_offer.borrow();
+    let Some(text) = offer.as_ref() else {
         return 0;
-    }
+    };
     unsafe {
         (client.api.spice_main_channel_clipboard_selection_notify)(
             channel,
@@ -1194,16 +1307,25 @@ unsafe extern "C" fn on_clipboard_grab(
     ntypes: u32,
     data: Object,
 ) -> c_int {
-    if selection != CLIPBOARD || types.is_null() {
-        return 1;
-    }
     let client = unsafe { &*data.cast::<Client>() };
-    let types = unsafe { std::slice::from_raw_parts(types, ntypes as usize) };
-    if types.contains(&UTF8_TEXT) {
-        let mut frame = client.frame();
-        frame.guest_clipboard = frame.guest_clipboard.wrapping_add(1);
+    if selection != CLIPBOARD || !client.options.clipboard {
+        return 0;
     }
+    let has_text = !types.is_null()
+        && unsafe { std::slice::from_raw_parts(types, ntypes as usize) }.contains(&UTF8_TEXT);
+    client.clipboard_offer.take();
+    client.frame().guest_clipboard_changed(has_text);
     1
+}
+
+unsafe extern "C" fn on_clipboard_release(_: Object, selection: u32, data: Object) {
+    let client = unsafe { &*data.cast::<Client>() };
+    if selection == CLIPBOARD
+        && client.options.clipboard
+        && client.clipboard_offer.borrow().is_none()
+    {
+        client.frame().guest_clipboard_changed(false);
+    }
 }
 
 unsafe extern "C" fn on_clipboard_data(
@@ -1218,14 +1340,24 @@ unsafe extern "C" fn on_clipboard_data(
         return;
     }
     let client = unsafe { &*data.cast::<Client>() };
-    if let Some(result) = client.clipboard_request.take() {
-        let text = if kind != UTF8_TEXT || bytes.is_null() || len as usize > MAX_CLIPBOARD_BYTES {
+    if let Some(request) = client.clipboard_request.take() {
+        let text = if request.revision != client.frame().guest_clipboard {
+            Err(anyhow::anyhow!("The clipboard changed during the request."))
+        } else if kind != UTF8_TEXT
+            || (bytes.is_null() && len != 0)
+            || len as usize > MAX_CLIPBOARD_BYTES
+        {
             Err(anyhow::anyhow!("The guest clipboard did not provide text."))
+        } else if len == 0 {
+            Ok(String::new())
         } else {
             let bytes = unsafe { std::slice::from_raw_parts(bytes, len as usize) };
             std::str::from_utf8(bytes).map(str::to_owned).map_err(Into::into)
         };
-        let _ = result.send(text);
+        if let Ok(text) = &text {
+            client.frame().received_clipboard(text.clone());
+        }
+        let _ = request.result.send(text);
     }
 }
 
@@ -1574,6 +1706,7 @@ mod tests {
     fn loads_runtime_and_handles_an_unavailable_graphics_socket() -> Result<()> {
         let api = api::api()?;
         let frame = Frame::default();
+        let (ready, result) = mpsc::sync_channel(1);
         let client = Client::open(
             api,
             "test:///default",
@@ -1586,6 +1719,7 @@ mod tests {
             },
             false,
             frame.clone(),
+            ready,
         )?;
         assert!(!client.main.get().is_null());
         for _ in 0..20 {
@@ -1596,6 +1730,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(frame.lock().unwrap().closed.is_some());
+        assert!(result.try_recv()?.is_err());
         drop(client);
         unsafe { (api.g_main_context_iteration)(null_mut(), 0) };
         Ok(())

@@ -23,11 +23,22 @@ use std::time::{Duration, Instant};
 
 const TOOLBAR_HEIGHT: f32 = 44.;
 const COMPACT_TOOLBAR_WIDTH: f32 = 480.;
+const CLIPBOARD_POLL_INTERVAL: Duration = Duration::from_millis(350);
+const CLIPBOARD_TIMEOUT: Duration = Duration::from_secs(4);
+const DBUS_CLIPBOARD_TIMEOUT: Duration = Duration::from_secs(8);
+const RECONNECT_DELAYS: [u64; 4] = [1, 2, 4, 8];
+const STABLE_DISPLAY_AFTER: Duration = Duration::from_secs(30);
 
 struct GuestResize {
     dimensions: (u16, u16),
     changed_at: Instant,
     sent: bool,
+}
+
+struct ClipboardRead {
+    revision: u64,
+    started: Instant,
+    receiver: mpsc::Receiver<anyhow::Result<String>>,
 }
 
 const CTRL: u32 = 0xffe3;
@@ -114,12 +125,15 @@ pub(crate) struct DisplayView {
     /// Tile settling for software frames: last generation seen, when it was seen, and
     /// when the first not-yet-shown change arrived.
     settle: (u64, Instant, Option<Instant>),
-    /// Last guest clipboard announcement copied to the host.
+    /// Last guest clipboard announcement processed by this viewer.
     guest_clipboard_seen: u64,
-    /// The manual "Copy guest clipboard" is waiting for text, to confirm when it arrives.
-    copy_requested: bool,
+    clipboard_reset_seen: u64,
+    copy_requested: Option<Instant>,
+    clipboard_read: Option<ClipboardRead>,
+    last_clipboard_poll: Option<Instant>,
     /// Last text exchanged either way, so a copy is never echoed back.
     clipboard_text: Option<String>,
+    clipboard_from_host: bool,
     /// Last host pointer position, where the guest cursor is drawn.
     pointer: Option<Point<Pixels>>,
     cursor: Option<(Arc<RenderImage>, vnc::Cursor)>,
@@ -132,13 +146,17 @@ pub(crate) struct DisplayView {
     cursor_generation: u64,
     /// At most one SPICE upload callback is pending on the platform frame clock.
     frame_scheduled: bool,
+    gpu_task: Option<Task<()>>,
     last_preview: Option<(u64, Instant)>,
     workspace: WeakEntity<Workspace>,
     machine: String,
     /// Copied from the workspace when it changes; render never reads the workspace.
     state: Option<State>,
+    power_status: &'static str,
     busy: bool,
     connecting: bool,
+    reconnect_attempts: usize,
+    connected_at: Option<Instant>,
     frame_revision: u64,
     performance: Option<Rc<RefCell<FrameStats>>>,
     performance_readout: FrameRates,
@@ -160,23 +178,44 @@ impl DisplayView {
     pub(crate) fn connect(
         connection: Connection,
         id: String,
-        state: State,
+        machine: &Machine,
         workspace: WeakEntity<Workspace>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let machine = id.clone();
+        let state = machine.state;
+        let power_status = machine.status();
         // A guest capture has its own explicit hide/show lifecycle. Typing must
         // not leave a second automatic hide active after the capture releases.
         window.set_cursor_hide_mode_override(Some(CursorHideMode::Never));
         let observe = workspace.upgrade().map(|w| {
-            cx.observe(&w, |this: &mut Self, workspace, cx| {
+            cx.observe_in(&w, window, |this: &mut Self, workspace, window, cx| {
                 let w = workspace.read(cx);
-                let state = w.machines.iter().find(|m| m.id == this.machine).map(|m| m.state);
-                let busy = w.busy();
-                if (this.state, this.busy) != (state, busy) {
+                let same_connection = w.preferences.connection == this.connection;
+                let machine = same_connection
+                    .then(|| w.machines.iter().find(|m| m.id == this.machine))
+                    .flatten();
+                let state = machine.map(|m| m.state);
+                let power_status = machine.map_or("Unavailable", Machine::status);
+                let busy = same_connection && w.busy();
+                let powered_off = same_connection
+                    && w.loaded
+                    && (state == Some(State::Stopped) || state.is_none());
+                let changed = (this.state, this.power_status) != (state, power_status);
+                if changed || this.busy != busy {
                     this.state = state;
+                    this.power_status = power_status;
                     this.busy = busy;
+                    if changed {
+                        if powered_off && std::env::var_os("HYDROXL_VNC_SOCKET").is_none() {
+                            this.detach_session(window);
+                            this.status = Some(power_status.into());
+                        } else if this.machine_is_active() {
+                            this.ensure_session(window, cx);
+                        } else if !this.connecting && this.session.is_none() {
+                            this.status = Some(power_status.into());
+                        }
+                    }
                     cx.notify();
                 }
             })
@@ -202,8 +241,8 @@ impl DisplayView {
                 cx.notify();
             }
             if window.is_window_active() {
-                // Coming back from another app is when a host copy is about to be pasted.
-                this.offer_host_clipboard(cx);
+                // Wayland can deliver its selection offer after the focus event.
+                this.last_clipboard_poll = None;
             }
         });
         let (scaling, toolbar_pinned, capture_on_click) = workspace
@@ -211,7 +250,7 @@ impl DisplayView {
             .map(|workspace| {
                 let preferences = &workspace.read(cx).preferences;
                 (
-                    preferences.scaling_for(&machine),
+                    preferences.scaling_for(&id),
                     preferences.toolbar_pinned,
                     preferences.capture_on_click,
                 )
@@ -236,14 +275,18 @@ impl DisplayView {
             focus,
             buttons: 0,
             modifiers: Modifiers::default(),
-            status: Some(state.label().into()),
+            status: Some(power_status.into()),
             captured: false,
             capture_on_click,
             hover_suppressed: false,
             guest_clipboard_seen: 0,
+            clipboard_reset_seen: 0,
             settle: (u64::MAX, Instant::now(), None),
             clipboard_text: None,
-            copy_requested: false,
+            clipboard_from_host: false,
+            copy_requested: None,
+            clipboard_read: None,
+            last_clipboard_poll: None,
             pointer: None,
             cursor: None,
             system_cursor: None,
@@ -251,15 +294,19 @@ impl DisplayView {
             system_cursor_unsupported: false,
             cursor_generation: 0,
             frame_scheduled: false,
+            gpu_task: None,
             last_preview: None,
             state: Some(state),
+            power_status,
             busy: false,
             connecting: false,
+            reconnect_attempts: 0,
+            connected_at: None,
             frame_revision: 0,
             performance: None,
             performance_readout: FrameRates::default(),
             workspace,
-            machine,
+            machine: id,
             _observe: observe,
             _focus_out: focus_out,
             _activation: activation,
@@ -272,8 +319,13 @@ impl DisplayView {
         view
     }
 
+    fn machine_is_active(&self) -> bool {
+        matches!(self.state, Some(State::Running | State::Paused))
+    }
+
     pub(crate) fn ensure_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.session.is_none() && !self.connecting {
+            self.reconnect_attempts = 0;
             self.status = Some("Connecting".into());
             self.connecting = true;
             Self::connect_session(self.connection, self.machine.clone(), false, window, cx);
@@ -290,26 +342,54 @@ impl DisplayView {
     ) {
         let gpu = window.supports_dma_buf();
         cx.spawn_in(window, async move |this, cx| {
+            let mut retry = retry;
             loop {
                 if retry {
-                    cx.background_executor().timer(Duration::from_secs(1)).await;
+                    let delay = this.update(cx, |view, cx| {
+                        if !view.machine_is_active() {
+                            view.connecting = false;
+                            view.status = Some(view.power_status.into());
+                            cx.notify();
+                            return None;
+                        }
+                        let Some(&seconds) = RECONNECT_DELAYS.get(view.reconnect_attempts) else {
+                            view.connecting = false;
+                            cx.notify();
+                            return None;
+                        };
+                        view.reconnect_attempts += 1;
+                        Some(Duration::from_secs(seconds))
+                    });
+                    let Ok(Some(delay)) = delay else {
+                        return;
+                    };
+                    cx.background_executor().timer(delay).await;
                 }
-                if this.upgrade().is_none() {
+                let prefer_spice = this.update(cx, |view, cx| {
+                    if retry && !view.machine_is_active() {
+                        view.connecting = false;
+                        view.status = Some(view.power_status.into());
+                        cx.notify();
+                        return None;
+                    }
+                    Some(view.machine(cx).is_none_or(|m| m.spice_viewer))
+                });
+                let Ok(Some(prefer_spice)) = prefer_spice else {
                     return;
-                }
+                };
                 let id = id.clone();
-                let prefer_spice = this
-                    .update(cx, |view, cx| view.machine(cx).is_none_or(|m| m.spice_viewer))
-                    .unwrap_or(true);
                 let result = cx
                     .background_executor()
                     .spawn(async move {
                         match crate::backend::display_target(connection, &id, prefer_spice)? {
-                            DisplayTarget::Vnc(uri) => {
+                            DisplayTarget::Vnc {
+                                uri,
+                                clipboard,
+                            } => {
                                 let endpoint = Endpoint::parse(&uri).ok_or_else(|| {
                                     anyhow::anyhow!("Invalid guest display address.")
                                 })?;
-                                let session = Session::vnc(&endpoint)?;
+                                let session = Session::vnc(&endpoint, clipboard)?;
                                 if std::env::var_os("HYDROXL_VNC_SOCKET").is_none()
                                     && let Err(error) =
                                         crate::backend::ensure_live_tablet(connection, &id)
@@ -334,6 +414,14 @@ impl DisplayView {
                 let mut result = Some(result);
                 let keep_waiting = this
                     .update_in(cx, |this, window, cx| {
+                        if !this.machine_is_active()
+                            && std::env::var_os("HYDROXL_VNC_SOCKET").is_none()
+                        {
+                            this.connecting = false;
+                            this.status = Some(this.power_status.into());
+                            cx.notify();
+                            return false;
+                        }
                         let wait = match result.take().expect("one display connection result") {
                             Ok(session) => {
                                 this.connecting = false;
@@ -341,18 +429,13 @@ impl DisplayView {
                                 false
                             }
                             Err(error) => {
-                                if retry && this.state != Some(State::Stopped) {
+                                if this.machine_is_active() {
                                     this.status = Some(format!("{error:#}"));
                                     cx.notify();
                                     return true;
                                 }
                                 this.connecting = false;
-                                this.status =
-                                    Some(if retry && this.state == Some(State::Stopped) {
-                                        State::Stopped.label().into()
-                                    } else {
-                                        format!("{error:#}")
-                                    });
+                                this.status = Some(format!("{error:#}"));
                                 false
                             }
                         };
@@ -366,6 +449,7 @@ impl DisplayView {
                 if !keep_waiting {
                     return;
                 }
+                retry = true;
             }
         })
         .detach();
@@ -374,6 +458,7 @@ impl DisplayView {
     fn attach(&mut self, session: Arc<Session>, window: &mut Window, cx: &mut Context<Self>) {
         let frame_clock = matches!(session.as_ref(), Session::Spice(_));
         self.session = Some(session.clone());
+        self.connected_at = Some(Instant::now());
         if let Some(stats) = &self.performance {
             stats.borrow_mut().reset();
             self.performance_readout = FrameRates::default();
@@ -382,8 +467,12 @@ impl DisplayView {
         self.guest_resize = None;
         self.last_preview = None;
         self.guest_clipboard_seen = 0;
-        self.copy_requested = false;
+        self.clipboard_reset_seen = 0;
+        self.copy_requested = None;
+        self.clipboard_read = None;
+        self.last_clipboard_poll = None;
         self.clipboard_text = None;
+        self.clipboard_from_host = false;
         self.generation = u64::MAX;
         self.cursor_generation = 0;
         if let Some((cursor, _)) = self.cursor.take() {
@@ -394,16 +483,13 @@ impl DisplayView {
             self.status = Some("Connecting".into());
         }
         self.focus.focus(window, cx);
-        if matches!(session.as_ref(), Session::Dbus(_)) && window.is_window_active() {
-            self.offer_host_clipboard(cx);
-        }
         if frame_clock {
             self.schedule_spice_upload(window, cx);
         }
         // GPU draws are copied the moment they arrive; the frame loop only presents.
         {
             let session = session.clone();
-            cx.spawn_in(window, async move |this, cx| {
+            self.gpu_task = Some(cx.spawn_in(window, async move |this, cx| {
                 loop {
                     scanout::DrawOffered(session.frame()).await;
                     let current = this.update_in(cx, |this, window, cx| {
@@ -420,8 +506,7 @@ impl DisplayView {
                         break;
                     }
                 }
-            })
-            .detach();
+            }));
         }
         // SPICE uses platform frame opportunities while visible. A slow timer
         // handles hidden-window housekeeping and restarts the frame loop on show.
@@ -460,6 +545,18 @@ impl DisplayView {
             }
         })
         .detach();
+    }
+
+    fn detach_session(&mut self, window: &mut Window) {
+        self.release(window);
+        if let Some(session) = self.session.take() {
+            session.close();
+        }
+        self.gpu_task = None;
+        if let Some(image) = self.image.take() {
+            window.drop_texture(image);
+        }
+        self.gpu_image = false;
     }
 
     fn schedule_spice_upload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -544,7 +641,7 @@ impl DisplayView {
             self.update_guest_resolution(&session);
         }
         self.update_overview_preview(&session, window, cx);
-        self.copy_guest_clipboard(&session, window, cx);
+        self.sync_clipboard(&session, false, window, cx);
         let mut frame = session.frame().lock().unwrap_or_else(|e| e.into_inner());
         let relative = frame.absolute == Some(false);
         if self.captured {
@@ -596,16 +693,20 @@ impl DisplayView {
         self.generation = frame.generation;
         if let Some(error) = frame.closed.clone() {
             drop(frame);
-            self.release(window);
-            session.close();
-            self.session = None;
-            if let Some(image) = self.image.take() {
-                window.drop_texture(image);
+            self.detach_session(window);
+            if self.connected_at.take().is_some_and(|since| since.elapsed() >= STABLE_DISPLAY_AFTER)
+            {
+                self.reconnect_attempts = 0;
             }
-            self.gpu_image = false;
-            self.status = Some(error);
-            self.connecting = true;
-            Self::connect_session(self.connection, self.machine.clone(), true, window, cx);
+            if self.machine_is_active() && self.reconnect_attempts < RECONNECT_DELAYS.len() {
+                self.status = Some(error);
+                self.connecting = true;
+                Self::connect_session(self.connection, self.machine.clone(), true, window, cx);
+            } else if self.machine_is_active() {
+                self.status = Some(error);
+            } else {
+                self.status = Some(self.power_status.into());
+            }
             cx.notify();
             return false;
         }
@@ -614,6 +715,13 @@ impl DisplayView {
                 eprintln!("upload: window not visible");
             }
             self.generation = u64::MAX;
+            return true;
+        }
+        if let Some(error) = &frame.display_error {
+            if self.image.is_none() {
+                self.status = Some(error.clone());
+                cx.notify();
+            }
             return true;
         }
         let (w, h) = (frame.width, frame.height);
@@ -1031,7 +1139,7 @@ impl DisplayView {
                 session.key(key, true);
             }
         }
-        self.offer_host_clipboard(cx);
+        self.sync_clipboard(&session, true, window, cx);
         cx.notify();
     }
 
@@ -1064,125 +1172,206 @@ impl DisplayView {
         cx.notify();
     }
 
-    /// Host to guest: offers the host's clipboard text to the guest agent when it changed.
-    fn offer_host_clipboard(&mut self, cx: &mut Context<Self>) {
+    fn offer_host_clipboard(&mut self, force: bool, cx: &mut Context<Self>) {
         let Some(session) = &self.session else {
             return;
         };
-        let shared = {
+        {
             let frame = session.frame().lock().unwrap_or_else(|e| e.into_inner());
-            frame.shares_clipboard()
-        };
-        if !shared {
-            return;
+            if !frame.shares_clipboard() {
+                self.clipboard_text = None;
+                return;
+            }
+            if frame.closed.is_some()
+                || (frame.guest_clipboard_has_text
+                    && (frame.guest_clipboard != self.guest_clipboard_seen
+                        || (frame.vnc_clipboard
+                            && frame.clipboard_text.is_none()
+                            && self
+                                .last_clipboard_poll
+                                .is_some_and(|last| last.elapsed() < CLIPBOARD_POLL_INTERVAL))))
+                || self.clipboard_read.is_some()
+                || self.copy_requested.is_some()
+            {
+                return;
+            }
         }
+        self.last_clipboard_poll = Some(Instant::now());
         let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
             return;
         };
-        if self.clipboard_text.as_ref() != Some(&text) {
+        if self.clipboard_text.as_ref() != Some(&text)
+            || (force && self.clipboard_from_host && matches!(session.as_ref(), Session::Vnc(_)))
+        {
             self.clipboard_text = Some(text.clone());
+            self.clipboard_from_host = true;
             session.send_clipboard(text);
         }
     }
 
-    /// Guest to host: copies new guest clipboard text to the host as soon as it is announced.
-    fn copy_guest_clipboard(
-        &mut self,
-        session: &Arc<Session>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let (serial, vnc_text) = {
-            let mut frame = session.frame().lock().unwrap_or_else(|e| e.into_inner());
-            if !frame.shares_clipboard() || frame.guest_clipboard == self.guest_clipboard_seen {
-                return;
-            }
-            (frame.guest_clipboard, frame.clipboard_text.take())
-        };
-        self.guest_clipboard_seen = serial;
-        // VNC delivers the text with the announcement. SPICE and D-Bus request it.
-        if let Some(text) = vnc_text {
-            self.clipboard_text = Some(text.clone());
-            cx.write_to_clipboard(ClipboardItem::new_string(text));
-            if std::mem::take(&mut self.copy_requested) {
-                window.push_notification("Guest clipboard copied", cx);
-            }
-            return;
-        }
-        let announce = std::mem::take(&mut self.copy_requested);
-        let Ok(rx) = session.read_clipboard() else {
-            return;
-        };
-        let origin = Arc::downgrade(session);
-        cx.spawn_in(window, async move |view, cx| {
-            let text =
-                cx.background_executor()
-                    .spawn(async move {
-                        rx.recv_timeout(Duration::from_secs(4)).ok().and_then(Result::ok)
-                    })
-                    .await;
-            if let Some(text) = text.filter(|t| !t.is_empty()) {
-                let _ = view.update_in(cx, |view, window, cx| {
-                    if view.guest_clipboard_seen != serial
-                        || !origin.upgrade().is_some_and(|session| {
-                            view.session
-                                .as_ref()
-                                .is_some_and(|current| Arc::ptr_eq(current, &session))
-                        })
-                    {
-                        return;
-                    }
-                    view.clipboard_text = Some(text.clone());
-                    cx.write_to_clipboard(ClipboardItem::new_string(text));
-                    if announce {
-                        window.push_notification("Guest clipboard copied", cx);
-                    }
-                });
-            }
-        })
-        .detach();
-    }
-
-    /// Manual guest-to-host copy, for when automatic sync is off or missed a change.
-    fn copy_guest_clipboard_now(
+    fn sync_clipboard(
         &mut self,
         session: &Session,
+        force_host_offer: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let (shared, vnc) = {
+        let can_write = window.is_window_active() || cx.compositor_name() != "Wayland";
+        let (revision, shared, has_text, has_cached_text, text) = {
             let frame = session.frame().lock().unwrap_or_else(|e| e.into_inner());
-            (frame.shares_clipboard(), frame.vnc_clipboard)
-        };
-        if vnc {
-            self.copy_requested = true;
-            if let Err(error) = session.request_vnc_clipboard() {
-                self.copy_requested = false;
-                window.push_notification(error.to_string(), cx);
+            if frame.closed.is_some() {
+                return;
             }
-        } else if shared {
-            let view = cx.entity().downgrade();
-            Self::receive_session_result(
-                session.read_clipboard(),
-                move |text, window, cx| {
-                    let _ = view.update(cx, |view, _| view.clipboard_text = Some(text.clone()));
-                    cx.write_to_clipboard(ClipboardItem::new_string(text));
-                    window.push_notification("Guest clipboard copied", cx);
-                },
-                window,
-                cx,
-            );
+            if frame.clipboard_reset != self.clipboard_reset_seen {
+                self.clipboard_reset_seen = frame.clipboard_reset;
+                if self.clipboard_from_host {
+                    self.clipboard_text = None;
+                    self.last_clipboard_poll = None;
+                }
+            }
+            let revision = frame.guest_clipboard;
+            let has_cached_text = frame.clipboard_text.is_some();
+            let text = if can_write
+                && (revision != self.guest_clipboard_seen || self.copy_requested.is_some())
+            {
+                frame.clipboard_text.clone()
+            } else {
+                None
+            };
+            (
+                revision,
+                frame.shares_clipboard(),
+                frame.guest_clipboard_has_text,
+                has_cached_text,
+                text,
+            )
+        };
+
+        if let Some(text) = text {
+            self.guest_clipboard_seen = revision;
+            self.clipboard_read = None;
+            self.clipboard_text = Some(text.clone());
+            self.clipboard_from_host = false;
+            self.last_clipboard_poll = Some(Instant::now());
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+            if self.copy_requested.take().is_some() {
+                window.push_notification("Guest clipboard copied", cx);
+            }
+        }
+
+        if let Some(read) = &self.clipboard_read {
+            let error = match read.receiver.try_recv() {
+                Ok(result) => Some(result.err()),
+                Err(mpsc::TryRecvError::Empty) if read.started.elapsed() < CLIPBOARD_TIMEOUT => {
+                    None
+                }
+                Err(_) => Some(Some(anyhow::anyhow!("The guest clipboard did not respond."))),
+            };
+            if let Some(error) = error {
+                if read.revision == revision
+                    && let Some(error) = error
+                    && !matches!(session, Session::Dbus(_))
+                    && self.copy_requested.take().is_some()
+                {
+                    window.push_notification(error.to_string(), cx);
+                }
+                self.clipboard_read = None;
+            }
+        }
+
+        if revision != self.guest_clipboard_seen
+            && !has_cached_text
+            && (!has_text || shared)
+            && self.clipboard_read.is_none()
+        {
+            self.guest_clipboard_seen = revision;
+            if has_text {
+                self.last_clipboard_poll = Some(Instant::now());
+                if !matches!(session, Session::Vnc(_)) {
+                    self.request_guest_clipboard(session, revision, window, cx);
+                }
+            }
+        }
+        // Older agents can leave a D-Bus request pending until QEMU's five-second timeout.
+        let copy_timeout = if matches!(session, Session::Dbus(_)) {
+            DBUS_CLIPBOARD_TIMEOUT
         } else {
+            CLIPBOARD_TIMEOUT
+        };
+        if self.copy_requested.is_some_and(|started| started.elapsed() >= copy_timeout) {
+            self.copy_requested = None;
+            window.push_notification("The guest clipboard did not provide text.", cx);
+        }
+        if window.is_window_active()
+            && (force_host_offer
+                || self
+                    .last_clipboard_poll
+                    .is_none_or(|last| last.elapsed() >= CLIPBOARD_POLL_INTERVAL))
+        {
+            self.offer_host_clipboard(force_host_offer, cx);
+        }
+    }
+
+    fn request_guest_clipboard(
+        &mut self,
+        session: &Session,
+        revision: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let result = if matches!(session, Session::Vnc(_)) {
+            session.request_vnc_clipboard().map(|()| None)
+        } else {
+            session.read_clipboard().map(Some)
+        };
+        match result {
+            Ok(Some(receiver)) => {
+                self.clipboard_read = Some(ClipboardRead {
+                    revision,
+                    started: Instant::now(),
+                    receiver,
+                });
+            }
+            Ok(None) => {}
+            Err(error) => {
+                if self.copy_requested.take().is_some() {
+                    window.push_notification(error.to_string(), cx);
+                }
+            }
+        }
+    }
+
+    fn copy_guest_clipboard_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(session) = self.session.clone() else {
+            return;
+        };
+        let (shared, revision, cached) = {
+            let frame = session.frame().lock().unwrap_or_else(|e| e.into_inner());
+            (frame.shares_clipboard(), frame.guest_clipboard, frame.clipboard_text.is_some())
+        };
+        if !shared && !cached {
             window.push_notification(
                 "Clipboard sharing needs the guest agent (spice-vdagent) in the guest.",
                 cx,
             );
+            return;
+        }
+        self.copy_requested = Some(Instant::now());
+        if cached {
+            self.sync_clipboard(&session, false, window, cx);
+        } else if self.clipboard_read.is_none() {
+            self.guest_clipboard_seen = revision;
+            self.request_guest_clipboard(&session, revision, window, cx);
         }
     }
 
     fn machine(&self, cx: &App) -> Option<Machine> {
         let workspace = self.workspace.upgrade()?;
-        workspace.read(cx).machines.iter().find(|m| m.id == self.machine).cloned()
+        let workspace = workspace.read(cx);
+        if workspace.preferences.connection != self.connection {
+            return None;
+        }
+        workspace.machines.iter().find(|m| m.id == self.machine).cloned()
     }
 
     fn run(&self, job: impl FnOnce(Machine) -> Job, cx: &mut Context<Self>) {
@@ -1384,15 +1573,11 @@ impl DisplayView {
                 }
                 let copy = {
                     let view = view.clone();
-                    let session = session.clone();
                     PopupMenuItem::new("Copy guest clipboard")
                         .icon(glyph("clipboard-copy"))
                         .on_click(move |_, window, cx| {
-                            let Some(session) = session.clone() else {
-                                return;
-                            };
                             let _ = view.update(cx, |view, cx| {
-                                view.copy_guest_clipboard_now(&session, window, cx)
+                                view.copy_guest_clipboard_now(window, cx);
                             });
                         })
                 };
@@ -1746,7 +1931,21 @@ impl Render for DisplayView {
                         .px_6()
                         .text_color(p.muted)
                         .when(status == "Connecting", |t| t.child(Spinner::new().small()))
-                        .child(div().min_w_0().max_w(px(480.)).child(status)),
+                        .child(div().min_w_0().max_w(px(480.)).child(status))
+                        .when(
+                            self.session.is_none() && !self.connecting && self.machine_is_active(),
+                            |t| {
+                                t.child(
+                                    Button::new("retry-display")
+                                        .outline()
+                                        .small()
+                                        .label("Reconnect")
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.ensure_session(window, cx)
+                                        })),
+                                )
+                            },
+                        ),
                 )
             })
             .on_mouse_move(cx.listener(|this, e: &MouseMoveEvent, window, cx| {
@@ -1839,11 +2038,18 @@ impl Render for DisplayView {
                     }
                 }
             }))
-            .capture_key_down(cx.listener(|this, e: &KeyDownEvent, _, cx| {
+            .capture_key_down(cx.listener(|this, e: &KeyDownEvent, window, cx| {
                 if !this.captured {
                     return;
                 }
-                if let Some(s) = &this.session {
+                if let Some(s) = this.session.clone() {
+                    let key = &e.keystroke.key;
+                    let modifiers = e.keystroke.modifiers;
+                    if (key.eq_ignore_ascii_case("v") && (modifiers.control || modifiers.platform))
+                        || (key == "insert" && modifiers.shift)
+                    {
+                        this.sync_clipboard(&s, true, window, cx);
+                    }
                     if let Some(sym) = vnc::keysym(&e.keystroke.key) {
                         s.key(sym, true);
                     }
@@ -1994,14 +2200,19 @@ impl Workspace {
             app_id: Some("dev.hydroxl.Hydroxl".into()),
             ..Default::default()
         };
-        let state = machine.state;
         let busy = self.busy();
         // Opened after this update: the new window renders immediately, outside the workspace.
         cx.defer(move |cx| {
             let opened = gpui_kit::open_window(options, cx, |window, cx| {
                 cx.new(|cx| {
-                    let mut view =
-                        DisplayView::connect(connection, id, state, workspace.clone(), window, cx);
+                    let mut view = DisplayView::connect(
+                        connection,
+                        id,
+                        &machine,
+                        workspace.clone(),
+                        window,
+                        cx,
+                    );
                     view.busy = busy;
                     view
                 })

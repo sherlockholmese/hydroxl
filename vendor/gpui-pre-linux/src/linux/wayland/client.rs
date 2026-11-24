@@ -420,6 +420,7 @@ pub(crate) struct WaylandClientState {
     cursor_style: Option<CursorStyle>,
     cursor_hidden_window: Option<WaylandWindowStatePtr>,
     clipboard: Clipboard,
+    pending_clipboard: Option<gpui::ClipboardItem>,
     data_offers: Vec<DataOffer<WlDataOffer>>,
     primary_data_offer: Option<DataOffer<ZwpPrimarySelectionOfferV1>>,
     cursor: Cursor,
@@ -571,6 +572,29 @@ pub(crate) enum PendingActivation {
 }
 
 impl WaylandClientState {
+    fn publish_clipboard(&mut self) {
+        let (Some(manager), Some(device), Some(serial)) = (
+            &self.globals.data_device_manager,
+            &self.data_device,
+            self.serial_tracker.selection_serial(),
+        ) else {
+            return;
+        };
+        if self.keyboard_focused_window.is_none() {
+            return;
+        }
+        let Some(item) = self.pending_clipboard.take() else {
+            return;
+        };
+        self.clipboard.set(item);
+        let source = manager.create_data_source(&self.globals.qh, DataSourceKind::Clipboard);
+        for mime in TEXT_MIME_TYPES {
+            source.offer(mime.to_string());
+        }
+        source.offer(self.clipboard.self_mime());
+        device.set_selection(Some(&source), serial.as_raw());
+    }
+
     fn consume_startup_activation_token(&mut self, surface: &wl_surface::WlSurface) {
         let Some(startup_activation_token) = self.startup_activation_token.take() else {
             return;
@@ -1149,6 +1173,7 @@ impl WaylandConnection {
             cursor_style: None,
             cursor_hidden_window: None,
             clipboard: Clipboard::new(conn.clone(), handle.clone()),
+            pending_clipboard: None,
             data_offers: Vec::new(),
             primary_data_offer: None,
             cursor,
@@ -1478,28 +1503,8 @@ impl WaylandConnection {
 
     pub(crate) fn write_to_clipboard(&self, item: gpui::ClipboardItem) {
         let mut state = self.0.borrow_mut();
-        let (Some(data_device_manager), Some(data_device)) = (
-            state.globals.data_device_manager.clone(),
-            state.data_device.clone(),
-        ) else {
-            return;
-        };
-        if state.mouse_focused_window.is_some() || state.keyboard_focused_window.is_some() {
-            state.clipboard.set(item);
-            let Some(serial) = state.serial_tracker.selection_serial() else {
-                log::warn!(
-                    "Skipping Wayland clipboard ownership request because no keyboard or pointer press serial has been received"
-                );
-                return;
-            };
-            let data_source = data_device_manager
-                .create_data_source(&state.globals.qh, DataSourceKind::Clipboard);
-            for mime_type in TEXT_MIME_TYPES {
-                data_source.offer(mime_type.to_string());
-            }
-            data_source.offer(state.clipboard.self_mime());
-            data_device.set_selection(Some(&data_source), serial.as_raw());
-        }
+        state.pending_clipboard = Some(item);
+        state.publish_clipboard();
     }
 
     pub(crate) fn read_from_primary(&self) -> Option<gpui::ClipboardItem> {
@@ -1507,7 +1512,8 @@ impl WaylandConnection {
     }
 
     pub(crate) fn read_from_clipboard(&self) -> Option<gpui::ClipboardItem> {
-        self.0.borrow_mut().clipboard.read()
+        let mut state = self.0.borrow_mut();
+        state.pending_clipboard.clone().or_else(|| state.clipboard.read())
     }
 
     pub(crate) fn active_window(&self) -> Option<AnyWindowHandle> {
@@ -2189,6 +2195,7 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                         serial,
                         focused_surface,
                     );
+                    state.publish_clipboard();
                 }
 
                 let focused_window = state.keyboard_focused_window.clone();
@@ -2560,6 +2567,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                         serial,
                         focused_surface,
                     );
+                    state.publish_clipboard();
                 }
                 let button = linux_button_to_gpui(button);
                 let Some(button) = button else { return };

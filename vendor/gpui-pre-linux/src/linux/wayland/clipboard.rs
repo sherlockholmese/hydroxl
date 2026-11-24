@@ -18,9 +18,6 @@ pub(crate) const TEXT_MIME_TYPES: [&str; 3] =
     ["text/plain;charset=utf-8", "UTF8_STRING", "text/plain"];
 pub(crate) const FILE_LIST_MIME_TYPE: &str = "text/uri-list";
 
-/// Text mime types that we'll accept from other programs.
-pub(crate) const ALLOWED_TEXT_MIME_TYPES: [&str; 2] = ["text/plain;charset=utf-8", "UTF8_STRING"];
-
 pub(crate) struct Clipboard {
     connection: Connection,
     loop_handle: LoopHandle<'static, ()>,
@@ -96,11 +93,7 @@ impl<T: ReceiveData> DataOffer<T> {
     }
 
     fn read_text(&self, connection: &Connection) -> Option<ClipboardItem> {
-        let mime_type = self.mime_types.iter().find(|&mime_type| {
-            ALLOWED_TEXT_MIME_TYPES
-                .iter()
-                .any(|&allowed| allowed == mime_type)
-        })?;
+        let mime_type = TEXT_MIME_TYPES.iter().find(|&&mime| self.has_mime_type(mime))?;
         let bytes = self.read_bytes(connection, mime_type)?;
         let text_content = match String::from_utf8(bytes) {
             Ok(content) => content,
@@ -153,6 +146,7 @@ impl Clipboard {
     }
 
     pub fn set(&mut self, item: ClipboardItem) {
+        self.cached_read = Some(item.clone());
         self.contents = Some(item);
     }
 
@@ -191,10 +185,10 @@ impl Clipboard {
     }
 
     pub fn read(&mut self) -> Option<ClipboardItem> {
-        let offer = self.current_offer.as_ref()?;
         if let Some(cached) = self.cached_read.clone() {
             return Some(cached);
         }
+        let offer = self.current_offer.as_ref()?;
 
         if offer.has_mime_type(&self.self_mime) {
             return self.contents.clone();

@@ -1,6 +1,7 @@
 use super::{Frame, Peer};
 use anyhow::{Context, Result, ensure};
 use std::sync::{Arc, Mutex, mpsc};
+use std::time::Duration;
 use zbus::fdo;
 
 pub(super) const PATH: &str = "/org/qemu/Display1/Clipboard";
@@ -50,39 +51,55 @@ impl Clipboard {
         let control = control.clone();
         let (send, receive) = mpsc::channel();
         std::thread::spawn(move || {
-            while let Ok(command) = receive.recv() {
-                match command {
-                    Command::Offer(text) => {
+            loop {
+                match receive.recv_timeout(Duration::from_secs(1)) {
+                    Ok(Command::Offer(text)) => {
                         if let Err(error) = self.offer(&control, text) {
                             eprintln!("Could not offer text to the QEMU clipboard: {error:#}");
                         }
                     }
-                    Command::Read(result) => {
+                    Ok(Command::Read(result)) => {
                         let _ = result.send(self.read(&control));
                     }
-                    Command::Close => break,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        // QEMU omits Grab notifications for guest agents without grab serials.
+                        let _ = self.read(&control);
+                    }
+                    Ok(Command::Close) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 }
             }
+            let _ = control.call_method(None::<&str>, PATH, Some(INTERFACE), "Unregister", &());
         });
         Ok(send)
     }
 
     fn offer(&self, control: &Peer, text: String) -> Result<()> {
         ensure!(text.len() <= MAX_TEXT_BYTES, "Clipboard text is too large.");
-        let serial = {
+        let (serial, revision) = {
             let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
             state.serial = state.serial.wrapping_add(1);
             state.revision = state.revision.wrapping_add(1);
             state.owner = Owner::Host(text);
-            state.serial
+            self.frame
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .guest_clipboard_changed(false);
+            (state.serial, state.revision)
         };
-        control.call_method(
+        let result = control.call_method(
             None::<&str>,
             PATH,
             Some(INTERFACE),
             "Grab",
             &(SELECTION, serial, [MIME].as_slice()),
-        )?;
+        );
+        if let Err(error) = result {
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            if state.revision == revision {
+                state.owner = Owner::None;
+            }
+            return Err(error.into());
+        }
         Ok(())
     }
 
@@ -100,15 +117,56 @@ impl Clipboard {
         let body = reply.body();
         let (mime, bytes): (&str, &[u8]) = body.deserialize()?;
         ensure!(mime == MIME && bytes.len() <= MAX_TEXT_BYTES, "Invalid clipboard text.");
-        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let text = std::str::from_utf8(bytes)?.to_owned();
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         ensure!(state.revision == revision, "The clipboard changed during the request.");
-        Ok(std::str::from_utf8(bytes)?.to_owned())
+        state.owner = Owner::Guest;
+        let mut frame = self.frame.lock().unwrap_or_else(|error| error.into_inner());
+        if frame.clipboard_text.as_ref() != Some(&text) {
+            frame.received_clipboard(text.clone());
+        }
+        Ok(text)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zbus::{blocking::connection::Builder, connection::socket::Channel};
+
+    struct GuestClipboard;
+
+    #[zbus::interface(name = "org.qemu.Display1.Clipboard")]
+    impl GuestClipboard {
+        #[zbus(out_args("mime", "data"))]
+        fn request(&self, selection: u32, mimes: Vec<String>) -> (&'static str, Vec<u8>) {
+            assert_eq!(selection, SELECTION);
+            assert_eq!(mimes, [MIME]);
+            (MIME, "D-Bus café\n".as_bytes().to_vec())
+        }
+    }
+
+    #[test]
+    fn accepts_qemus_utf8_reply_and_caches_unannounced_text() -> Result<()> {
+        let (client, server) = Channel::pair();
+        let guid = zbus::Guid::generate();
+        let _server = Builder::authenticated_socket(server, guid.clone())?
+            .p2p()
+            .serve_at(PATH, GuestClipboard)?
+            .build()?;
+        let client = Builder::authenticated_socket(client, guid)?
+            .p2p()
+            .method_timeout(Duration::from_secs(2))
+            .build()?;
+        let frame = Frame::default();
+        let clipboard = Clipboard::new(frame.clone());
+        assert_eq!(clipboard.read(&client)?, "D-Bus café\n");
+        assert_eq!(clipboard.read(&client)?, "D-Bus café\n");
+        let frame = frame.lock().unwrap();
+        assert_eq!(frame.clipboard_text.as_deref(), Some("D-Bus café\n"));
+        assert_eq!(frame.guest_clipboard, 1);
+        Ok(())
+    }
 
     #[test]
     fn accepts_newer_guest_grabs_and_preserves_host_ownership_on_a_tie() -> Result<()> {
@@ -140,6 +198,8 @@ impl Clipboard {
     fn register(&self) {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         state.serial = 0;
+        let mut frame = self.frame.lock().unwrap_or_else(|error| error.into_inner());
+        frame.clipboard_reset = frame.clipboard_reset.wrapping_add(1);
     }
 
     fn unregister(&self) {
@@ -159,10 +219,11 @@ impl Clipboard {
         state.serial = serial;
         state.revision = state.revision.wrapping_add(1);
         state.owner = Owner::Guest;
-        if mimes.iter().any(|mime| mime == MIME) {
-            let mut frame = self.frame.lock().unwrap_or_else(|error| error.into_inner());
-            frame.guest_clipboard = frame.guest_clipboard.wrapping_add(1);
-        }
+        let has_text = mimes.iter().any(|mime| mime == MIME);
+        self.frame
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .guest_clipboard_changed(has_text);
     }
 
     fn release(&self, selection: u32) {
@@ -171,6 +232,10 @@ impl Clipboard {
             if matches!(state.owner, Owner::Guest) {
                 state.owner = Owner::None;
                 state.revision = state.revision.wrapping_add(1);
+                self.frame
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .guest_clipboard_changed(false);
             }
         }
     }

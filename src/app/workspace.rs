@@ -5,7 +5,10 @@ use crate::operations::Details;
 use crate::workflows;
 use gpui_kit::component::input::{self, InputState};
 use gpui_kit::{prelude::*, *};
-use std::{path::PathBuf, time::Duration};
+use std::{
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 impl Workspace {
     pub(crate) fn new(
@@ -30,6 +33,8 @@ impl Workspace {
             } else {
                 Vec::new()
             },
+            machine_statuses: None,
+            last_library_sample: None,
             selected: preferences.selected.clone(),
             preferences,
             details: Details::default(),
@@ -97,7 +102,55 @@ impl Workspace {
             }
         })
         .detach();
+        if !demo {
+            this.watch_machine_statuses(cx);
+        }
         this
+    }
+
+    pub(crate) fn watch_machine_statuses(&self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_secs(1)).await;
+                let Ok(connection) = this.update(cx, |this, _| {
+                    (!this.machines.is_empty()).then_some(this.preferences.connection)
+                }) else {
+                    break;
+                };
+                let Some(connection) = connection else {
+                    continue;
+                };
+                let sampled_at = Instant::now();
+                let Ok(statuses) = cx
+                    .background_executor()
+                    .spawn(async move { backend::MachineStatuses::read(connection) })
+                    .await
+                else {
+                    continue;
+                };
+                if this
+                    .update(cx, |this, cx| {
+                        if this.preferences.connection != connection
+                            || this.last_library_sample.is_some_and(|time| time >= sampled_at)
+                        {
+                            return;
+                        }
+                        let mut changed = false;
+                        for machine in &mut this.machines {
+                            changed |= statuses.apply(machine);
+                        }
+                        this.machine_statuses = Some((sampled_at, statuses));
+                        if changed {
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     pub(crate) fn selected_machine(&self) -> Option<&Machine> {

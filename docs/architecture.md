@@ -43,6 +43,41 @@ Source files remain unchanged. New appliance files are staged in an owned
 folder, and the VM is defined only after conversion finishes. Failures before registration remove only the newly allocated folder. If the
 registration result is uncertain, files are retained for recovery.
 
+## Viewer and VM status regression checks
+
+- **Clipboard ownership.** Wait for the display transport to negotiate clipboard
+  support before offering host text. When a guest announces a new selection,
+  associate the response with that selection and invalidate the previous cache.
+  Host clipboard polling should skip text just copied from the guest. SPICE
+  announces support when the guest agent connects. VNC negotiates extended
+  clipboard on the RFB connection. Local D-Bus also needs a request fallback
+  because QEMU can omit grab notifications for agents without grab serials.
+  With these agents, stock QEMU may delay a copy until its pending request
+  expires and the viewer retries.
+- **Power state.** Read live state independently of domain XML and machine
+  details. A slow details refresh can otherwise overwrite a newer status
+  snapshot. Keep the managed-save flag tied to the stopped state, and tolerate
+  transient domains disappearing during enumeration. The viewer follows
+  workspace power state when a VM starts or stops outside Hydroxl.
+- **SPICE readiness.** Treat the connection as ready after the main and primary
+  display channels open. Handle auxiliary channel failures and failed GPU
+  readbacks without restarting the session. Back off after a transport failure
+  and stop automatic reconnecting when the VM powers off or the retries run out.
+
+Before releasing a viewer change, run `cargo test --locked`. The clipboard
+protocol tests cover UTF-8 payloads, stale VNC responses, and D-Bus reads without
+a grab announcement. The VM status test covers paused state, managed saves, and
+resumes.
+
+Use a disposable VM with the SPICE guest agent for the live checks. Copy
+multiline Unicode text in both directions over SPICE, VNC, and local D-Bus.
+Repeat after the guest agent starts late, after the viewer regains focus, and
+with **Copy guest clipboard** while automatic sync is fetching a selection.
+Use `virsh suspend`, `resume`, `managedsave`, and `start` outside Hydroxl and
+check that the library and any open viewer reflect the resulting state. The
+ignored `live_spice_frames` test exercises display attachment and frame delivery.
+See [SPICE test setup](spice-2d-tearing.md#diagnostics) for its invocation.
+
 ## Extension rules
 
 - Add a typed command and a focused handler for new engine behavior.
@@ -58,5 +93,4 @@ registration result is uncertain, files are retained for recovery.
   catch-all; avoid arbitrary one-function abstractions without a boundary.
 - Keep source integrity and successful mutation separate from presentation and
   refresh failures.
-- Report validation precisely. `cargo build --locked` passes. Runtime tests,
-  interaction checks, and visual verification remain deferred by the user.
+- Report which build, automated checks, and live scenarios were verified.

@@ -10,6 +10,8 @@ pub(crate) use jobs::{ActionSource, Job, JobEvent, Pending, Response};
 pub(crate) use preferences::Preferences;
 pub struct Workspace {
     pub(crate) machines: Vec<Machine>,
+    pub(crate) machine_statuses: Option<(std::time::Instant, crate::backend::MachineStatuses)>,
+    pub(crate) last_library_sample: Option<std::time::Instant>,
     pub(crate) selected: Option<String>,
     pub(crate) details: Details,
     pub(crate) details_error: Option<String>,

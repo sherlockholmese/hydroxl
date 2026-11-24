@@ -21,8 +21,8 @@ pub(crate) enum Resize {
 }
 
 impl Session {
-    pub(crate) fn vnc(endpoint: &vnc::Endpoint) -> Result<Arc<Self>> {
-        Ok(Arc::new(Self::Vnc(vnc::Session::connect(endpoint)?)))
+    pub(crate) fn vnc(endpoint: &vnc::Endpoint, clipboard: bool) -> Result<Arc<Self>> {
+        Ok(Arc::new(Self::Vnc(vnc::Session::connect(endpoint, clipboard)?)))
     }
 
     pub(crate) fn spice(

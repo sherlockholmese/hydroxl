@@ -82,6 +82,7 @@ bindings! {
         spice_session_disconnect: unsafe extern "C" fn(Object),
         spice_channel_connect: unsafe extern "C" fn(Object) -> c_int,
         spice_channel_open_fd: unsafe extern "C" fn(Object, c_int) -> c_int,
+        spice_channel_get_error: unsafe extern "C" fn(Object) -> *const GlibError,
         spice_display_channel_get_primary: unsafe extern "C" fn(Object, u32, *mut Primary) -> c_int,
         spice_display_channel_get_gl_scanout: unsafe extern "C" fn(Object) -> *const LegacyScanout,
         spice_display_channel_gl_draw_done: unsafe extern "C" fn(Object),

@@ -18,7 +18,7 @@ impl State {
     }
     pub fn from_virsh(value: &str) -> Self {
         match value.trim() {
-            "running" | "idle" => Self::Running,
+            "running" | "idle" | "blocked" | "in shutdown" => Self::Running,
             "paused" | "pmsuspended" => Self::Paused,
             "shut off" | "crashed" => Self::Stopped,
             _ => Self::Other,

@@ -551,6 +551,7 @@ pub(super) fn scanout_copied(shared: &Mutex<Framebuffer>, scanout: Scanout) {
     let mut frame = shared.lock().unwrap_or_else(|error| error.into_inner());
     frame.width = scanout.width;
     frame.height = scanout.height;
+    frame.display_error = None;
     frame.pixels.clear();
     frame.discard_damage();
     frame.generation += 1;
