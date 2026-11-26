@@ -1,11 +1,7 @@
-use super::support::{path_text, stamp};
+use super::support::path_text;
 use crate::backend::{self, Connection, Machine};
-use anyhow::{Context, Result};
-use std::os::unix::fs::OpenOptionsExt;
-use std::{
-    fs,
-    path::{Path, PathBuf},
-};
+use anyhow::{Context, Result, ensure};
+use std::path::{Path, PathBuf};
 
 pub(super) fn apply_screenshot(c: Connection, machine: &Machine, path: PathBuf) -> Result<()> {
     let id = machine.id.as_str();
@@ -14,28 +10,23 @@ pub(super) fn apply_screenshot(c: Connection, machine: &Machine, path: PathBuf) 
 }
 
 pub(super) fn screenshot(c: Connection, id: &str, destination: &Path) -> Result<()> {
-    let raw =
-        std::env::temp_dir().join(format!("hydroxl-screen-{}-{}.ppm", std::process::id(), stamp()));
-    let result = (|| -> Result<()> {
-        std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&raw)?;
-        backend::virsh(c, &["screenshot", id, "--file", path_text(&raw)?])?;
-        let image = image::ImageReader::open(&raw)?
-            .with_guessed_format()?
-            .decode()
-            .context("Could not read the display image.")?;
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(destination)?;
-        image
-            .save_with_format(destination, image::ImageFormat::Png)
-            .context("Could not save the screenshot.")?;
-        Ok(())
-    })();
-    let _ = fs::remove_file(raw);
-    result
+    let raw = tempfile::NamedTempFile::new().context("Could not create a temporary screenshot.")?;
+    backend::virsh(c, &["screenshot", id, "--file", path_text(raw.path())?])
+        .context("Could not capture the guest display.")?;
+    let image = image::ImageReader::open(raw.path())?
+        .with_guessed_format()?
+        .decode()
+        .context("Could not read the captured display image.")?;
+    let mut staged = crate::files::stage(destination)
+        .context("Could not create a screenshot file in the chosen folder.")?;
+    image
+        .write_to(staged.as_file_mut(), image::ImageFormat::Png)
+        .context("Could not encode the screenshot as PNG.")?;
+    staged.as_file().sync_all().context("Could not finish writing the screenshot.")?;
+    staged
+        .persist(destination)
+        .context("Could not save the screenshot. Check the output folder.")?;
+    Ok(())
 }
 
 /// Writes guest memory to `path` without stopping the guest. The file is created
@@ -50,18 +41,19 @@ pub(super) fn apply_memory_dump(
     if !["elf", "kdump-zlib", "win-dmp"].contains(&format.as_str()) {
         anyhow::bail!("Choose a memory dump format.");
     }
-    if path.exists() {
-        anyhow::bail!("Choose a new file name for the memory dump.");
-    }
-    std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path)?;
-    let result = backend::virsh_with_progress(
+    ensure!(!path.try_exists()?, "Choose a new file name for the memory dump.");
+    let staged = crate::files::stage(&path)
+        .context("Could not create the memory dump in the chosen folder.")?;
+    backend::virsh_with_progress(
         c,
-        &["dump", &machine.id, path_text(&path)?, "--memory-only", "--format", &format],
+        &["dump", &machine.id, path_text(staged.path())?, "--memory-only", "--format", &format],
         progress,
         "Saving memory dump",
-    );
-    if result.is_err() {
-        let _ = fs::remove_file(&path);
-    }
-    result.map(|_| ())
+    )
+    .context("Could not capture guest memory.")?;
+    staged.as_file().sync_all().context("Could not finish writing the memory dump.")?;
+    staged.persist_noclobber(&path).context(
+        "Could not save the memory dump. Check the output folder and choose an unused file name.",
+    )?;
+    Ok(())
 }

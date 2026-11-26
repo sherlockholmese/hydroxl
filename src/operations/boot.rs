@@ -1,4 +1,4 @@
-use super::support::{editable, esc, replace_child, temporary_xml};
+use super::support::{editable, esc, replace_child};
 use crate::backend::{self, Connection, Machine};
 use anyhow::{Context, Result, bail};
 
@@ -24,7 +24,7 @@ pub(super) fn apply_firmware(c: Connection, machine: &Machine, uefi: bool) -> Re
             "<os>"
         },
     );
-    temporary_xml(&xml, |path| backend::virsh(c, &["define", path]).map(|_| ()))?;
+    backend::define_xml(c, &xml)?;
     Ok(())
 }
 
@@ -70,10 +70,7 @@ pub(super) fn apply_system(
         .context("Boot configuration is missing.")?;
     let mut changes = Vec::new();
     if !machine_type.trim().is_empty() {
-        if !machine_type
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || [b'-', b'_', b'.'].contains(&b))
-        {
+        if !machine_type.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)) {
             bail!("Use a valid QEMU machine type.");
         }
         let kind = os
@@ -92,7 +89,7 @@ pub(super) fn apply_system(
         for (range, replacement) in changes {
             xml.replace_range(range, &replacement);
         }
-        temporary_xml(&xml, |path| backend::virsh(c, &["define", path]).map(|_| ()))?;
+        backend::define_xml(c, &xml)?;
         return Ok(());
     }
     if !["hd", "cdrom", "network"].contains(&boot.as_str()) {
@@ -117,7 +114,7 @@ pub(super) fn apply_system(
     for (range, replacement) in changes {
         xml.replace_range(range, &replacement);
     }
-    temporary_xml(&xml, |path| backend::virsh(c, &["define", path]).map(|_| ()))?;
+    backend::define_xml(c, &xml)?;
     Ok(())
 }
 
@@ -167,6 +164,6 @@ pub(super) fn apply_boot_order(c: Connection, machine: &Machine, order: Vec<Stri
     for (range, replacement) in changes {
         xml.replace_range(range, &replacement);
     }
-    temporary_xml(&xml, |path| backend::virsh(c, &["define", path]).map(|_| ()))?;
+    backend::define_xml(c, &xml)?;
     Ok(())
 }

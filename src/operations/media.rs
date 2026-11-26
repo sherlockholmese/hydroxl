@@ -1,4 +1,4 @@
-use super::support::{attach, esc, path_text, stamp, temporary_xml, valid_target};
+use super::support::{attach, esc, path_text, temporary_xml, valid_target};
 use crate::backend::{self, Connection, Machine};
 use anyhow::{Context, Result, bail};
 use roxmltree::{Document, Node};
@@ -165,9 +165,9 @@ fn guest_tools_iso() -> Result<PathBuf> {
     fs::create_dir_all(&folder)?;
     let iso = folder.join("virtio-win.iso");
     if !valid_iso(&iso) {
-        let download = folder.join(format!("virtio-win-{}.part", stamp()));
-        let result = (|| -> Result<()> {
-            backend::run(
+        let download = crate::files::stage(&iso)
+            .context("Could not create a file in the guest tools cache.")?;
+        backend::run(
                 "curl",
                 &[
                     "--fail",
@@ -179,20 +179,17 @@ fn guest_tools_iso() -> Result<PathBuf> {
                     "--silent",
                     "--show-error",
                     "--output",
-                    path_text(&download)?,
+                    path_text(download.path())?,
                     "https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso",
                 ],
-            )?;
-            if !valid_iso(&download) {
-                bail!("The guest tools download is incomplete. Try again.");
-            }
-            fs::rename(&download, &iso)?;
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(&download);
+            ).context("Could not download guest tools. Check your internet connection and available disk space.")?;
+        if !valid_iso(download.path()) {
+            bail!("The guest tools download is incomplete. Try again.");
         }
-        result?;
+        std::fs::File::open(download.path())?
+            .sync_all()
+            .context("Could not finish writing the guest tools download.")?;
+        download.persist(&iso).context("Could not update the guest tools cache.")?;
     }
     Ok(iso)
 }

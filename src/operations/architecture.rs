@@ -4,7 +4,7 @@
 //! Everything tied to the old platform is dropped so libvirt fills in the new platform's
 //! defaults: the emulator binary, PCI controllers and addresses, x86-only features and
 //! timers, firmware image paths, and a CPU model that cannot run under emulation.
-use super::support::{editable, esc, temporary_xml};
+use super::support::{editable, esc};
 use crate::backend::{self, ARCHITECTURES, Connection, Machine};
 use anyhow::{Context, Result, bail};
 
@@ -57,7 +57,7 @@ pub(super) fn apply(c: Connection, machine: &Machine, arch: String) -> Result<()
         backend::QemuBuild::Bundled
     };
     let updated = build.configure_xml(&updated)?.unwrap_or(updated);
-    temporary_xml(&updated, |path| backend::virsh(c, &["define", path]).map(|_| ())).context(
+    backend::define_xml(c, &updated).context(
         "libvirt could not use this architecture. Check that its QEMU emulator is installed.",
     )
 }
@@ -184,29 +184,28 @@ pub(super) fn retarget(xml: &str, arch: &str, kvm: bool) -> Result<String> {
             edits.push((model.range(), "<model type='virtio' heads='1' primary='yes'/>".into()));
         }
         for tpm in root.descendants().filter(|n| n.has_tag_name("tpm")) {
-            if let Some(model) = tpm.attribute("model") {
-                if model != "tpm-tis-device" && arch == "aarch64" {
-                    let open_end = xml[tpm.range()].find('>').unwrap_or(0);
-                    let open = &xml[tpm.range().start..tpm.range().start + open_end];
-                    edits.push((
-                        tpm.range().start..tpm.range().start + open_end,
-                        open.replacen(model, "tpm-tis-device", 1),
-                    ));
-                }
+            if let Some(model) = tpm.attribute("model")
+                && model != "tpm-tis-device"
+                && arch == "aarch64"
+            {
+                let open_end = xml[tpm.range()].find('>').unwrap_or(0);
+                let open = &xml[tpm.range().start..tpm.range().start + open_end];
+                edits.push((
+                    tpm.range().start..tpm.range().start + open_end,
+                    open.replacen(model, "tpm-tis-device", 1),
+                ));
             }
         }
     }
 
     // Host CPU passthrough and host-model need KVM on the same architecture.
-    if !kvm {
-        if let Some(cpu) = root.children().find(|n| n.has_tag_name("cpu")) {
-            let topology = cpu
-                .children()
-                .find(|n| n.has_tag_name("topology"))
-                .map(|n| xml[n.range()].to_owned())
-                .unwrap_or_default();
-            edits.push((cpu.range(), format!("<cpu mode='maximum' check='none'>{topology}</cpu>")));
-        }
+    if !kvm && let Some(cpu) = root.children().find(|n| n.has_tag_name("cpu")) {
+        let topology = cpu
+            .children()
+            .find(|n| n.has_tag_name("topology"))
+            .map(|n| xml[n.range()].to_owned())
+            .unwrap_or_default();
+        edits.push((cpu.range(), format!("<cpu mode='maximum' check='none'>{topology}</cpu>")));
     }
 
     apply_edits(xml, edits)

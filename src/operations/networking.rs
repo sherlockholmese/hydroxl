@@ -1,4 +1,4 @@
-use super::support::{append_child, attach, editable, esc, replace_child, temporary_xml};
+use super::support::{append_child, attach, editable, esc, replace_child};
 use crate::backend::{self, Connection, Machine};
 use anyhow::{Context, Result, bail};
 
@@ -37,7 +37,7 @@ pub(super) fn apply_port_forward(
         ),
     )?;
     xml.replace_range(range, &network);
-    temporary_xml(&xml, |path| backend::virsh(c, &["define", path]).map(|_| ()))?;
+    backend::define_xml(c, &xml)?;
     Ok(())
 }
 
@@ -73,5 +73,5 @@ pub(super) fn remove_port_forward(c: Connection, machine: &Machine, rule: &str) 
         .map(|n| n.range())
         .context("The rule changed. Refresh and try again.")?;
     xml.replace_range(range, "");
-    temporary_xml(&xml, |path| backend::virsh(c, &["define", path]).map(|_| ()))
+    backend::define_xml(c, &xml)
 }

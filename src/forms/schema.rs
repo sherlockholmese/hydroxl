@@ -140,10 +140,10 @@ pub(super) type Submit = Rc<dyn Fn(&[String]) -> Result<Job>>;
 pub(super) type Derive = Rc<dyn Fn(&[String]) -> Vec<(usize, String)>>;
 /// Validates one wizard step before moving forward.
 pub(super) type Check = Rc<dyn Fn(usize, &[String]) -> Result<()>>;
-/// Choices for a select that depend on other values, e.g. versions of the chosen system.
-/// Returns `None` when the field's choices are static.
 /// Whether a field is shown for the current values.
 pub(super) type Visible = Rc<dyn Fn(usize, &[String]) -> bool>;
+/// Choices for a select that depend on other values, such as OS versions.
+/// Returns `None` when the field's choices are static.
 pub(super) type Options = Rc<dyn Fn(usize, &[String]) -> Option<Vec<(String, String)>>>;
 pub struct FormSpec {
     pub title: String,

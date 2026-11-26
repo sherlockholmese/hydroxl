@@ -1,5 +1,6 @@
 use super::editor::{Control, EditorForm};
 use crate::theme::{CAPTION_SIZE, LABEL_SIZE, Palette};
+use crate::ui::error_line;
 use gpui_kit::assets::IconName as Glyph;
 use gpui_kit::component::{
     button::*,
@@ -13,16 +14,6 @@ use gpui_kit::{prelude::*, *};
 /// Field anatomy shared by every dialog: a quiet label 6px above its control.
 fn field_label(text: &'static str, p: Palette) -> Div {
     div().text_size(px(LABEL_SIZE)).font_weight(FontWeight::MEDIUM).text_color(p.muted).child(text)
-}
-
-/// A validation message in the one error anatomy: danger icon and text.
-fn error_line(text: &str, p: Palette) -> Div {
-    h_flex()
-        .items_start()
-        .gap_2()
-        .text_color(p.danger)
-        .child(Icon::new(Glyph::CircleAlert).size_4().mt(px(2.)).flex_shrink_0())
-        .child(div().flex_1().min_w_0().child(crate::ui::plain_error(text)))
 }
 
 impl EditorForm {

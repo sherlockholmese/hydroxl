@@ -1,4 +1,4 @@
-use super::support::{editable, esc, replace_child, stopped, temporary_xml, valid_name};
+use super::support::{editable, esc, replace_child, stopped, valid_name};
 use crate::backend::{self, Connection, Machine};
 use anyhow::{Context, Result, bail};
 
@@ -15,7 +15,7 @@ pub(super) fn apply_notes(c: Connection, machine: &Machine, notes: String) -> Re
         "description",
         &format!("<description>{}</description>", esc(&notes)),
     )?;
-    temporary_xml(&updated, |path| backend::virsh(c, &["define", path]).map(|_| ()))?;
+    backend::define_xml(c, &updated)?;
     Ok(())
 }
 
@@ -47,7 +47,7 @@ pub(super) fn apply_save_xml(c: Connection, machine: &Machine, xml: String) -> R
     if !doc.root_element().has_tag_name("domain") || uuid != Some(id) {
         bail!("Keep the domain type and this machine's UUID.");
     }
-    temporary_xml(&xml, |path| backend::virsh(c, &["define", path]).map(|_| ()))?;
+    backend::define_xml(c, &xml)?;
     Ok(())
 }
 

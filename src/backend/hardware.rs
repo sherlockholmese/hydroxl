@@ -11,6 +11,8 @@ pub fn nested_host_feature() -> Option<&'static str> {
     })
 }
 
+pub(crate) const MEMORY_MIB: std::ops::RangeInclusive<u64> = 64..=1024 * 1024;
+
 /// Guest CPU layout. The vCPU count is the product of the three.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Topology {
@@ -61,7 +63,7 @@ pub(super) fn configured_xml(
     if topology.is_some_and(|topology| !(1..=256).contains(&topology.vcpus())) {
         bail!("Use 1 to 256 virtual CPUs.");
     }
-    if memory_mib.is_some_and(|memory| !(64..=1024 * 1024).contains(&memory)) {
+    if memory_mib.is_some_and(|memory| !MEMORY_MIB.contains(&memory)) {
         bail!("Use between 64 MiB and 1 TiB of memory.");
     }
     let doc = roxmltree::Document::parse(&xml)?;
@@ -126,9 +128,6 @@ pub(super) fn configured_xml(
         let end = root.range().start + closing;
         edits.push((end..end, additions));
     }
-    edits.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
-    for (range, value) in edits {
-        xml.replace_range(range, &value);
-    }
+    crate::xml::apply_edits(&mut xml, edits)?;
     Ok(xml)
 }

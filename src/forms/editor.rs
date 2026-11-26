@@ -149,7 +149,10 @@ impl EditorForm {
             let values = self.values(cx);
             let proposals = self.derive.as_ref().map(|d| d(&values)).unwrap_or_default();
             for (index, proposal) in proposals {
-                let current = &values[index];
+                let Some(current) = values.get(index) else {
+                    eprintln!("Form proposed a value for an unknown field {index}");
+                    continue;
+                };
                 if *current != self.derived[index] || *current == proposal {
                     continue;
                 }
@@ -250,11 +253,20 @@ impl EditorForm {
         }
     }
 
+    pub(crate) fn job_failed(&mut self, error: String) {
+        self.pending = false;
+        self.error = Some(error);
+        self.error_field = None;
+    }
+
     pub(super) fn is_review(&self) -> bool {
         !self.steps.is_empty() && self.step == self.steps.len()
     }
 
     pub(super) fn next(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.pending || self.unavailable || self.is_review() {
+            return;
+        }
         let values = self.values(cx);
         match self.check.as_ref().map_or(Ok(()), |check| check(self.step, &values)) {
             Ok(()) => {
@@ -282,20 +294,33 @@ impl EditorForm {
         let values = self.values(cx);
         match (self.submit)(&values) {
             Ok(crate::app::Job::Icon(id, key)) => {
-                let _ = self.parent.update(cx, |parent, cx| parent.set_icon(id, key, cx));
-                window.close_dialog(cx);
+                match self.parent.update(cx, |parent, cx| parent.set_icon(id, key, cx)) {
+                    Ok(Ok(())) => window.close_dialog(cx),
+                    Ok(Err(error)) => self.fail(error),
+                    Err(_) => self.fail(anyhow::anyhow!(
+                        "Could not save the icon. Reopen Hydroxl and try again."
+                    )),
+                }
             }
             Ok(job) => {
                 self.error = None;
                 self.error_field = None;
                 let form = cx.entity().downgrade();
-                let started = self
-                    .parent
-                    .update(cx, |parent, cx| parent.begin(job, Some(form), cx))
-                    .unwrap_or(false);
-                self.pending = started;
-                if !started {
-                    self.error = Some("Wait for the current operation to finish.".into());
+                match self.parent.update(cx, |parent, cx| {
+                    if parent.demo {
+                        return Err("Choose a live connection in Preferences to make changes.");
+                    }
+                    if !parent.begin(job, Some(form), cx) {
+                        return Err("Wait for the current operation to finish.");
+                    }
+                    Ok(())
+                }) {
+                    Ok(Ok(())) => self.pending = true,
+                    Ok(Err(error)) => self.job_failed(error.into()),
+                    Err(_) => self.job_failed(
+                        "This workspace is no longer available. Reopen the form and try again."
+                            .into(),
+                    ),
                 }
             }
             Err(error) => self.fail(error),
@@ -304,10 +329,13 @@ impl EditorForm {
     }
 
     pub(super) fn browse(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(picker) = self.fields[index].spec.picker.clone() else {
+        let Some(field) = self.fields.get(index) else {
             return;
         };
-        let Control::Text(state) = &self.fields[index].control else {
+        let Some(picker) = field.spec.picker.clone() else {
+            return;
+        };
+        let Control::Text(state) = &field.control else {
             return;
         };
         let state = state.clone();

@@ -1,6 +1,7 @@
 use super::support::{editable, esc, path_text, stopped};
 use crate::backend::{self, Connection, Machine};
 use anyhow::{Context, Result, bail};
+use std::io::ErrorKind;
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -26,9 +27,12 @@ pub(super) fn apply_export_ova(
 }
 
 pub(super) fn export(c: Connection, machine: &Machine, destination: &Path) -> Result<()> {
-    copy_storage(c, machine, destination, |xml| {
-        fs::write(destination.join("machine.xml"), backend::add_hardware_review(xml)?)?;
-        Ok(())
+    copy_storage(c, machine, destination, |destination, xml| {
+        crate::files::write_atomic(
+            &destination.join("machine.xml"),
+            backend::add_hardware_review(xml)?.as_bytes(),
+        )
+        .context("Could not save the exported machine configuration.")
     })
 }
 
@@ -36,13 +40,21 @@ fn copy_storage<T>(
     c: Connection,
     machine: &Machine,
     destination: &Path,
-    finish: impl FnOnce(&str) -> Result<T>,
+    finish: impl FnOnce(&Path, &str) -> Result<T>,
 ) -> Result<T> {
     stopped(c, &machine.id)?;
-    if destination.exists() {
-        bail!("Choose a new folder for the export.");
+    let name = destination.file_name().context("Enter a name for the export folder.")?;
+    let parent =
+        destination.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    fs::create_dir_all(parent).context("Could not create the parent folder for the export.")?;
+    let destination =
+        parent.canonicalize().context("Could not open the destination folder.")?.join(name);
+    if let Err(error) = fs::create_dir(&destination) {
+        if error.kind() == ErrorKind::AlreadyExists {
+            bail!("Choose a new folder for the export.");
+        }
+        return Err(error).context("Could not create the export folder.");
     }
-    fs::create_dir_all(destination).context("Could not create the export folder.")?;
     // Export is self-contained for file-backed disks. Never silently omit block storage.
     let result = (|| -> Result<T> {
         let mut xml = backend::virsh(c, &["dumpxml", &machine.id, "--inactive"])?;
@@ -60,32 +72,43 @@ fn copy_storage<T>(
             let source =
                 node.attribute("file").context("Export currently requires file-backed storage.")?;
             let new = destination.join(format!("disk-{i}.qcow2"));
-            backend::run("qemu-img", &["convert", "-O", "qcow2", source, path_text(&new)?])?;
+            backend::run("qemu-img", &["convert", "-O", "qcow2", source, path_text(&new)?])
+                .with_context(|| {
+                    format!(
+                        "Could not copy disk {}. Check available space in the destination.",
+                        i + 1
+                    )
+                })?;
             edits.push((node.range(), format!("<source file='{}'/>", esc(path_text(&new)?))));
             if let Some(driver) = disk.children().find(|n| n.has_tag_name("driver")) {
                 edits.push((driver.range(), "<driver name='qemu' type='qcow2'/>".into()));
             }
         }
-        if let Some(nvram) = doc.descendants().find(|n| n.has_tag_name("nvram")) {
-            if let Some(source) = nvram.text().filter(|s| !s.trim().is_empty()) {
-                let target = destination.join("nvram.fd");
-                fs::copy(source.trim(), &target)
-                    .context("Could not copy the UEFI variable store.")?;
-                if let Some(value) = nvram.children().find(|n| n.is_text()) {
-                    edits.push((value.range(), esc(path_text(&target)?)));
-                }
+        if let Some(nvram) = doc.descendants().find(|n| n.has_tag_name("nvram"))
+            && let Some(source) = nvram.text().filter(|s| !s.trim().is_empty())
+        {
+            let target = destination.join("nvram.fd");
+            fs::copy(source.trim(), &target).context("Could not copy the UEFI variable store.")?;
+            if let Some(value) = nvram.children().find(|n| n.is_text()) {
+                edits.push((value.range(), esc(path_text(&target)?)));
             }
         }
-        edits.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
-        for (range, replacement) in edits {
-            xml.replace_range(range, &replacement);
-        }
-        finish(&xml)
+        crate::xml::apply_edits(&mut xml, edits)?;
+        finish(&destination, &xml)
     })();
-    if result.is_err() {
-        let _ = fs::remove_dir_all(destination);
+    match result {
+        Err(error) => match fs::remove_dir_all(&destination) {
+            Ok(()) => Err(error),
+            Err(cleanup) => {
+                eprintln!("Could not clean up {}: {cleanup}", destination.display());
+                Err(error.context(format!(
+                    "Export failed and cleanup could not remove {}.",
+                    destination.display()
+                )))
+            }
+        },
+        Ok(value) => Ok(value),
     }
-    result
 }
 
 pub(super) fn move_storage(c: Connection, machine: &Machine, destination: &Path) -> Result<()> {
@@ -94,12 +117,15 @@ pub(super) fn move_storage(c: Connection, machine: &Machine, destination: &Path)
         bail!("Remove snapshots before moving storage.");
     }
     // Folder export flattens backing chains into independent QCOW2 files.
-    let xml = copy_storage(c, machine, destination, |xml| {
+    let xml = copy_storage(c, machine, destination, |destination, xml| {
         backend::record_owned_storage(destination, xml)?;
         Ok(xml.to_owned())
     })?;
     // Registration can outlive a failed connection. Keep both copies for recovery.
-    backend::define_xml(c, &xml)?;
+    backend::define_xml(c, &xml).with_context(|| format!(
+        "Could not confirm the storage move. Copies remain in {}. Refresh and check the disk paths before retrying.",
+        destination.display()
+    ))?;
     // Keep original files as a recovery copy. They may also be used by other VMs.
     // The VM now uses only the destination disks and NVRAM.
     Ok(())

@@ -1,21 +1,12 @@
 use super::{ImportSpec, archive::extract, manifest::manifest, ovf::parse};
 use crate::backend::{self, Connection};
+use crate::{files::path_text, xml::escape};
 use anyhow::{Context, Result, bail};
 use std::{
     fs,
     path::Path,
     time::{SystemTime, UNIX_EPOCH},
 };
-fn text(path: &Path) -> Result<&str> {
-    path.to_str().context("Use a path with a valid UTF-8 name.")
-}
-fn escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('\'', "&apos;")
-        .replace('"', "&quot;")
-}
 pub fn import(
     c: Connection,
     spec: &ImportSpec,
@@ -31,10 +22,9 @@ pub fn import(
     let stamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     let parent = spec.location.canonicalize().context("Choose an existing destination folder.")?;
     let folder = parent.join(format!("appliance-{stamp}"));
-    fs::create_dir(&folder)?;
-    crate::backend::disable_cow(&folder);
+    fs::create_dir(&folder).context("Could not create a folder for the imported machine.")?;
+    backend::disable_cow(&folder);
     let staging = folder.join("source");
-    fs::create_dir(&staging)?;
     let mut registration_attempted = false;
     let result = (|| -> Result<()> {
         let is_ovf = spec
@@ -45,6 +35,8 @@ pub fn import(
         let descriptor = if is_ovf {
             spec.path.canonicalize()?
         } else {
+            fs::create_dir(&staging)
+                .context("Could not create a folder for the archive contents.")?;
             let files = extract(&spec.path, &staging, progress)?;
             let descriptors: Vec<_> = files
                 .iter()
@@ -110,7 +102,7 @@ pub fn import(
             }
             let target = folder.join(format!("disk-{i}.qcow2"));
             backend::qemu_convert(
-                &["-f", "vmdk", "-O", "qcow2", text(source)?, text(&target)?],
+                &["-f", "vmdk", "-O", "qcow2", path_text(source)?, path_text(&target)?],
                 progress.clone(),
                 format!("Converting disk {} of {}", i + 1, definition.disks.len()),
             )?;
@@ -122,7 +114,7 @@ pub fn import(
                 "sata"
             };
             let device = format!("sd{}", char::from(b'a' + i as u8));
-            disks.push_str(&format!("<disk type='file' device='disk'><driver name='qemu' type='qcow2'/><source file='{}'/><target dev='{device}' bus='{bus}'/></disk>", escape(text(&target)?)));
+            disks.push_str(&format!("<disk type='file' device='disk'><driver name='qemu' type='qcow2'/><source file='{}'/><target dev='{device}' bus='{bus}'/></disk>", escape(path_text(&target)?)));
         }
         let memory = definition.memory_mib.to_string();
         let cpus = backend::Topology::one_socket(definition.cpus).virt_install();

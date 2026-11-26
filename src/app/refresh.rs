@@ -1,9 +1,7 @@
 use crate::app::{ActionSource, Job, JobEvent, Pending, Response, Workspace};
-use crate::appliance;
 use crate::backend;
 use crate::backend::{Action, State};
 use crate::forms::EditorForm;
-use crate::operations;
 use crate::operations::Operation;
 use gpui_kit::component::WindowExt;
 use gpui_kit::component::notification::Notification;
@@ -66,93 +64,33 @@ impl Workspace {
             _ => None,
         };
         let selected = self.selected.clone();
-        let previous_ids: Vec<_> = self.machines.iter().map(|m| m.id.clone()).collect();
-        let importing = matches!(&job, Job::Import(..) | Job::Appliance(_));
-        let need_architectures = self.architectures.is_empty() && !self.demo;
+        let previous = self.machines.clone();
+        let need_architectures = self.architectures.is_empty();
         let (tx, rx) = mpsc::channel();
         if !refresh {
             self.notice = None;
         }
         let reporter = backend::progress::Reporter::default();
         let progress = reporter.clone();
-        std::thread::spawn(move || {
-            let mut select_name = match &job {
-                Job::Create(s) => Some(s.name.trim().to_owned()),
-                Job::Operation(
-                    _,
-                    Operation::Clone(name)
-                    | Operation::CloneConfiguration(name)
-                    | Operation::Rename(name),
-                ) => Some(name.trim().to_owned()),
-                Job::Operation(m, Operation::Disposable) => Some(format!("{} Disposable", m.name)),
-                _ => None,
-            };
-            let open_display = match &job {
-                Job::Action(machine, Action::Start | Action::Resume, source) => {
-                    let mut machine = machine.clone();
-                    machine.state = State::Running;
-                    Some((machine, *source))
-                }
-                _ => None,
-            };
-            let disk_conversion = matches!(job, Job::ConvertDisk { .. });
-            let outcome = match job {
-                Job::Refresh | Job::Icon(..) => Ok(()),
-                Job::Network(net) => backend::network::create(c, &net),
-                Job::Action(m, action, _) => backend::action(c, &m.id, action, m.spice_viewer),
-                Job::Create(spec) => backend::create(c, &spec),
-                Job::Import(path, qemu_build, hardware) => {
-                    backend::import(c, &path, qemu_build, hardware)
-                }
-                Job::ConvertDisk {
-                    source,
-                    destination,
-                    format,
-                } => backend::disk_convert::convert(&source, &destination, &format, &progress),
-                Job::Appliance(spec) => appliance::import(c, &spec, &progress),
-                Job::Operation(m, op) => operations::execute(c, &m, op, &progress),
-            }
-            .map_err(|e| format!("{e:#}"));
-            if outcome.is_ok()
-                && let Some((machine, source)) = open_display
-            {
-                let _ = tx.send(JobEvent::DisplayReady(Box::new(machine), source));
-            }
-            if outcome.is_ok() && !disk_conversion && !refresh {
-                progress.update("Refreshing library", None);
-            }
-            let machines = (!disk_conversion)
-                .then(|| (Instant::now(), backend::machines(c).map_err(|e| format!("{e:#}"))));
-            let list = machines.as_ref().and_then(|(_, machines)| machines.as_ref().ok());
-            if importing && outcome.is_ok() {
-                select_name = list
-                    .and_then(|list| list.iter().find(|m| !previous_ids.contains(&m.id)))
-                    .map(|m| m.name.clone());
-            }
-            let details = list
-                .and_then(|list| {
-                    select_name
-                        .as_ref()
-                        .and_then(|name| list.iter().find(|m| &m.name == name))
-                        .or_else(|| {
-                            selected.as_ref().and_then(|id| list.iter().find(|m| &m.id == id))
-                        })
-                        .or_else(|| list.first())
-                })
-                .map(|machine| {
-                    (
-                        machine.id.clone(),
-                        operations::details(c, &machine.id).map_err(|e| format!("{e:#}")),
-                    )
-                });
-            let _ = tx.send(JobEvent::Complete(Box::new(Response {
-                machines,
-                details,
-                outcome: (!refresh).then_some(outcome),
-                select_name,
-                architectures: need_architectures.then(|| operations::available_architectures(c)),
-            })));
+        let start_failure = tx.clone();
+        let worker = std::thread::Builder::new().name("hydroxl-job".into()).spawn(move || {
+            super::worker::run(job, c, selected, previous, need_architectures, progress, tx);
         });
+        if let Err(error) = worker {
+            eprintln!("Could not start background work ({label}): {error}");
+            let message = if refresh {
+                "Could not refresh the library. Retry in a moment."
+            } else {
+                "Could not start the operation. Retry in a moment."
+            };
+            let _ = start_failure.send(JobEvent::Complete(Box::new(Response {
+                machines: refresh.then(|| (Instant::now(), Err(message.into()))),
+                details: None,
+                outcome: (!refresh).then(|| Err(message.into())),
+                select_name: None,
+                architectures: None,
+            })));
+        }
         self.pending = Some(Pending {
             refresh,
             hardware_save,
@@ -223,26 +161,24 @@ impl Workspace {
             }
             Some(Err(mpsc::TryRecvError::Disconnected)) => {
                 if let Some(pending) = self.pending.take() {
-                    let error = "The operation was interrupted. Refresh and try again.".to_owned();
-                    if let Some(form) = pending.form {
-                        let _ = form.update(cx, |form, cx| {
-                            form.pending = false;
-                            form.error = Some(error.clone());
-                            cx.notify();
-                        });
-                    }
+                    eprintln!(
+                        "{}: background worker stopped before reporting a result",
+                        pending.label
+                    );
                     if pending.refresh {
+                        let error =
+                            "Library refresh stopped unexpectedly. Select Retry to reconnect."
+                                .to_owned();
                         if !self.machines.is_empty() && self.library_error.as_ref() != Some(&error)
                         {
-                            window.push_notification(
-                                Notification::error(crate::ui::plain_error(&error)),
-                                cx,
-                            );
+                            window.push_notification(Notification::error(error.clone()), cx);
                         }
                         self.library_error = Some(error);
                         self.loaded = true;
                     } else {
-                        show_job_error(error, pending.action_source, window, cx);
+                        let error = "The operation stopped before reporting a result. Check the machine and any output files before trying again.".to_owned();
+                        report_failure(&pending, error, window, cx);
+                        self.begin(Job::Refresh, None, cx);
                     }
                     cx.notify();
                 }
@@ -281,20 +217,7 @@ impl Workspace {
                         }
                     }
                 }
-                Err(error) => {
-                    let displayed_in_form = pending.form.is_some_and(|form| {
-                        form.update(cx, |form, cx| {
-                            form.pending = false;
-                            form.error = Some(error.clone());
-                            cx.notify();
-                            form.open
-                        })
-                        .unwrap_or(false)
-                    });
-                    if !displayed_in_form {
-                        show_job_error(error, pending.action_source, window, cx);
-                    }
-                }
+                Err(error) => report_failure(&pending, error, window, cx),
             }
         }
         if let Some(architectures) = response.architectures.filter(|a| !a.is_empty()) {
@@ -303,7 +226,8 @@ impl Workspace {
         let loaded_list = matches!(response.machines, Some((_, Ok(_))));
         let previous_selection = self.selected.clone();
         match response.machines {
-            Some((sampled_at, Ok(mut machines))) => {
+            Some((sampled_at, Ok(list))) => {
+                let mut machines = list.machines;
                 self.last_library_sample = Some(
                     self.last_library_sample
                         .map_or(sampled_at, |previous| previous.max(sampled_at)),
@@ -315,20 +239,24 @@ impl Workspace {
                         statuses.apply(machine);
                     }
                 }
-                self.library_error = None;
+                self.library_error = match list.unavailable {
+                    0 => None,
+                    1 => Some("Could not refresh one machine.".into()),
+                    count => Some(format!("Could not refresh {count} machines.")),
+                };
                 self.machines = machines;
                 self.apply_icons();
-                if let Some(name) = response.select_name {
-                    if let Some(m) = self.machines.iter().find(|m| m.name == name) {
-                        self.selected = Some(m.id.clone());
-                    }
+                if let Some(name) = response.select_name
+                    && let Some(m) = self.machines.iter().find(|m| m.name == name)
+                {
+                    self.selected = Some(m.id.clone());
                 }
                 if !self.machines.iter().any(|m| Some(&m.id) == self.selected.as_ref()) {
                     self.selected = self.machines.first().map(|m| m.id.clone());
                 }
                 if self.preferences.selected != self.selected {
                     self.preferences.selected = self.selected.clone();
-                    self.preferences.save();
+                    self.save_preferences();
                 }
             }
             None => {}
@@ -345,23 +273,25 @@ impl Workspace {
             self.details_for = None;
             self.details_error = None;
             self.hardware_draft = None;
+            self.memory_invalid = false;
             self.saved_hardware_for = None;
         }
-        if let Some((id, details)) = response.details {
-            if self.selected.as_ref() == Some(&id) {
-                self.details_for = Some(id.clone());
-                match details {
-                    Ok(details) => {
-                        self.details = details;
-                        self.details_error = None;
-                        if self.saved_hardware_for.as_ref() == Some(&id) {
-                            self.hardware_draft = None;
-                            self.saved_hardware_for = None;
-                        }
+        if let Some((id, details)) = response.details
+            && self.selected.as_ref() == Some(&id)
+        {
+            self.details_for = Some(id.clone());
+            match details {
+                Ok(details) => {
+                    self.details = details;
+                    self.details_error = None;
+                    if self.saved_hardware_for.as_ref() == Some(&id) {
+                        self.hardware_draft = None;
+                        self.memory_invalid = false;
+                        self.saved_hardware_for = None;
                     }
-                    Err(error) => {
-                        self.details_error = Some(error);
-                    }
+                }
+                Err(error) => {
+                    self.details_error = Some(error);
                 }
             }
         }
@@ -369,6 +299,20 @@ impl Workspace {
             self.begin(Job::Refresh, None, cx);
         }
         cx.notify();
+    }
+}
+
+fn report_failure(pending: &Pending, error: String, window: &mut Window, cx: &mut App) {
+    let displayed_in_form = pending.form.as_ref().is_some_and(|form| {
+        form.update(cx, |form, cx| {
+            form.job_failed(error.clone());
+            cx.notify();
+            form.open
+        })
+        .unwrap_or(false)
+    });
+    if !displayed_in_form {
+        show_job_error(error, pending.action_source, window, cx);
     }
 }
 

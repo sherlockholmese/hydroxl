@@ -1,4 +1,4 @@
-use super::primitives::{caption, item_list, notice, plain_error, section};
+use super::primitives::{caption, error_line, item_list, notice, section};
 use crate::app::Workspace;
 use crate::backend::{Machine, State};
 use crate::theme::{BODY_SIZE, Palette, ROW_HEIGHT};
@@ -98,25 +98,36 @@ impl Workspace {
             })
             .child(
                 section("Snapshots", Some(take))
-                    .when_some(self.details.snapshot_error.clone(), |this, error| {
-                        this.child(
-                            h_flex()
-                                .gap_2()
-                                .text_color(p.danger)
-                                .child(Icon::new(Glyph::CircleAlert).size_4().flex_shrink_0())
-                                .child(div().flex_1().min_w_0().child(plain_error(&error))),
-                        )
-                    })
-                    .when(!has_snapshots, |this| {
-                        this.child(notice(
-                            if loading {
-                                "Loading"
-                            } else {
-                                "No snapshots"
-                            },
-                            p,
-                        ))
-                    })
+                    .when_some(
+                        self.details
+                            .snapshot_error
+                            .as_deref()
+                            .filter(|_| self.details_error.is_none()),
+                        |pane, error| {
+                            pane.child(
+                                v_flex()
+                                    .gap_2()
+                                    .items_start()
+                                    .child(error_line(error, p))
+                                    .child(self.retry_refresh("retry-snapshots", cx)),
+                            )
+                        },
+                    )
+                    .when(
+                        !has_snapshots
+                            && self.details.snapshot_error.is_none()
+                            && self.details_error.is_none(),
+                        |this| {
+                            this.child(notice(
+                                if loading {
+                                    "Loading"
+                                } else {
+                                    "No snapshots"
+                                },
+                                p,
+                            ))
+                        },
+                    )
                     .when(has_snapshots, |this| this.child(item_list(rows, p))),
             )
             .into_any_element()

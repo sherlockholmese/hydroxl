@@ -3,12 +3,12 @@ mod clipboard;
 
 use super::{
     damage::Damage,
+    frame::{Cursor, Framebuffer, MAX_DESKTOP_SIZE},
     graphics_fd::GraphicsFd,
     keys::scancode,
     scanout,
     spice::Input,
     thumbnail,
-    vnc::{Cursor, Framebuffer, MAX_DESKTOP_SIZE},
 };
 use crate::backend::Connection;
 use anyhow::{Context, Result};
@@ -99,20 +99,23 @@ impl Session {
         });
         let (commands, receive) = mpsc::channel();
         let state = frame.clone();
-        std::thread::spawn(move || {
-            InputSink {
-                control,
-                path,
-                keys: BTreeSet::new(),
-                buttons: 0,
-                previous: None,
-            }
-            .run(receive, &state);
-            let _ = listener.close();
-            let mut frame = state.lock().unwrap_or_else(|error| error.into_inner());
-            frame.closed = Some("The QEMU display disconnected.".into());
-            frame.generation += 1;
-        });
+        std::thread::Builder::new()
+            .name("dbus-display".into())
+            .spawn(move || {
+                InputSink {
+                    control,
+                    path,
+                    keys: BTreeSet::new(),
+                    buttons: 0,
+                    previous: None,
+                }
+                .run(receive, &state);
+                let _ = listener.close();
+                let mut frame = state.lock().unwrap_or_else(|error| error.into_inner());
+                frame.closed = Some("The QEMU display disconnected.".into());
+                frame.generation = frame.generation.wrapping_add(1);
+            })
+            .context("Could not start the QEMU display client.")?;
         Ok(Self {
             frame,
             commands,
@@ -147,15 +150,18 @@ impl Session {
         let (connection, id, lock) =
             self.usb.clone().context("The guest needs a USB controller.")?;
         let (send, receive) = mpsc::channel();
-        std::thread::spawn(move || {
-            let _guard = lock.lock().unwrap_or_else(|error| error.into_inner());
-            let _ = send.send(crate::operations::toggle_live_usb(
-                connection,
-                &id,
-                u16::from(bus),
-                u16::from(address),
-            ));
-        });
+        std::thread::Builder::new()
+            .name("display-usb".into())
+            .spawn(move || {
+                let _guard = lock.lock().unwrap_or_else(|error| error.into_inner());
+                let _ = send.send(crate::operations::toggle_live_usb(
+                    connection,
+                    &id,
+                    u16::from(bus),
+                    u16::from(address),
+                ));
+            })
+            .context("Could not start the USB device change.")?;
         Ok(receive)
     }
 
@@ -357,6 +363,8 @@ impl Listener {
         self.software_scanout((0, 0, width, height), stride, pixman_format, &data, true)
     }
 
+    // QEMU's Display1 D-Bus signature fixes the number and order of these arguments.
+    #[allow(clippy::too_many_arguments)]
     fn update(
         &self,
         x: i32,
@@ -577,7 +585,7 @@ impl Listener {
             let target = ((y as usize + row) * frame_width + x as usize) * 4;
             let pixels = &mut frame.pixels[target..target + bytes];
             pixels.copy_from_slice(&data[source..source + bytes]);
-            for pixel in pixels.chunks_exact_mut(4) {
+            for pixel in pixels.as_chunks_mut::<4>().0 {
                 pixel[3] = 255;
             }
         }
@@ -718,7 +726,7 @@ mod tests {
                 if let Some(error) = &frame.closed {
                     anyhow::bail!("{error}");
                 }
-                if frame.pixels.chunks_exact(4).any(|pixel| pixel[..3] != [0; 3]) {
+                if frame.pixels.as_chunks::<4>().0.iter().any(|pixel| pixel[..3] != [0; 3]) {
                     eprintln!(
                         "Received visible pixels from a {}×{} D-Bus frame.",
                         frame.width, frame.height

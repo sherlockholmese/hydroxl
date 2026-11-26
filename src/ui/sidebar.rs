@@ -14,6 +14,13 @@ impl Workspace {
         let Some(pending) = self.pending.as_ref().filter(|pending| !pending.refresh) else {
             // Quiet while normal: only a preview library or the non-default system
             // connection is worth naming here.
+            if self.library_error.is_some() && !self.machines.is_empty() {
+                return div()
+                    .text_color(p.attention)
+                    .truncate()
+                    .child("Library out of date")
+                    .into_any_element();
+            }
             let label = if self.demo {
                 Some("Preview")
             } else if self.preferences.connection == crate::backend::Connection::System {
@@ -223,7 +230,7 @@ impl Workspace {
                             .icon(Icon::new(Glyph::RefreshCw))
                             .accessibility_label("Refresh")
                             .tooltip("Refresh  F5")
-                            .disabled(self.busy() || self.demo)
+                            .disabled(self.pending.is_some() || self.demo)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.begin(Job::Refresh, None, cx);
                             })),

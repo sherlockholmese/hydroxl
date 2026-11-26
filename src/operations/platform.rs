@@ -1,6 +1,6 @@
 //! Platform devices UTM exposes as settings: TPM, USB, tablet, balloon, RNG,
 //! Hyper-V enlightenments, clock, network cards, disk interfaces and serial ports.
-use super::support::{attach, editable, esc, temporary_xml};
+use super::support::{attach, editable, esc};
 use crate::backend::{self, Connection, Machine};
 use anyhow::{Context, Result, bail};
 use std::ops::Range;
@@ -39,17 +39,6 @@ pub(crate) const HYPERV: &str = "<hyperv mode='custom'><relaxed state='on'/><vap
 const WINDOWS_TIMERS: &str = "<timer name='rtc' tickpolicy='catchup'/>\
     <timer name='pit' tickpolicy='delay'/><timer name='hpet' present='no'/>\
     <timer name='hypervclock' present='yes'/>";
-
-fn define(c: Connection, xml: &str) -> Result<()> {
-    temporary_xml(xml, |path| backend::virsh(c, &["define", path]).map(|_| ()))
-}
-
-fn apply(xml: &mut String, mut edits: Vec<(Range<usize>, String)>) {
-    edits.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
-    for (range, text) in edits {
-        xml.replace_range(range, &text);
-    }
-}
 
 /// Range just before the closing tag of the first `parent` element.
 fn before_close(xml: &str, doc: &roxmltree::Document, parent: &str) -> Option<Range<usize>> {
@@ -165,8 +154,8 @@ pub(super) fn apply_platform(c: Connection, machine: &Machine, p: Platform) -> R
         }
     }
     drop(doc);
-    apply(&mut xml, edits);
-    define(c, &xml)
+    crate::xml::apply_edits(&mut xml, edits)?;
+    backend::define_xml(c, &xml)
 }
 
 fn valid_mac(mac: &str) -> bool {
@@ -233,8 +222,8 @@ pub(super) fn apply_nic(c: Connection, machine: &Machine, nic: NicChange) -> Res
     );
     let range = iface.range();
     drop(doc);
-    apply(&mut xml, vec![(range, replacement)]);
-    define(c, &xml)
+    xml.replace_range(range, &replacement);
+    backend::define_xml(c, &xml)
 }
 
 /// Adds a serial port: a pseudo-terminal, or a TCP server bound to localhost.
@@ -268,16 +257,10 @@ pub fn open_path(path: &std::path::Path) -> Result<()> {
     if !path.exists() {
         bail!("{} does not exist.", path.display());
     }
-    let mut child = std::process::Command::new("xdg-open")
-        .arg(path)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .context("Could not open the file manager.")?;
-    // Reap xdg-open so it does not linger as a zombie.
-    std::thread::spawn(move || child.wait());
-    Ok(())
+    let mut command = std::process::Command::new("xdg-open");
+    command.arg(path).stdin(std::process::Stdio::null());
+    backend::launch_desktop(command)
+        .context("Could not open the path. Check the default desktop application.")
 }
 
 pub(super) fn apply_show_files(machine: &Machine) -> Result<()> {
@@ -313,17 +296,18 @@ pub fn read_log(c: Connection, machine: &Machine, limit: u64) -> Result<String> 
         std::io::ErrorKind::PermissionDenied => anyhow::anyhow!("Hydroxl cannot read this log."),
         _ => anyhow::anyhow!("Could not read the log."),
     })?;
-    let length = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let length = file.metadata().context("Could not read the size of the machine log.")?.len();
     let start = length.saturating_sub(limit);
-    file.seek(SeekFrom::Start(start))?;
+    file.seek(SeekFrom::Start(start)).context("Could not seek to the end of the machine log.")?;
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
-    let text = String::from_utf8_lossy(&bytes).into_owned();
-    Ok(if start > 0 {
-        text.split_once('\n').map_or(text.clone(), |(_, rest)| rest.to_owned())
+    file.take(limit).read_to_end(&mut bytes).context("Could not read the machine log.")?;
+    let text = String::from_utf8_lossy(&bytes);
+    let shown = if start > 0 {
+        text.split_once('\n').map_or(text.as_ref(), |(_, rest)| rest)
     } else {
-        text
-    })
+        &text
+    };
+    Ok(shown.to_owned())
 }
 
 pub(super) fn apply_open_log(c: Connection, machine: &Machine) -> Result<()> {

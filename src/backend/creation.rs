@@ -1,6 +1,5 @@
 use super::{Connection, NewMachine, run, virsh};
 use anyhow::{Context, Result, bail};
-use std::io::Write as _;
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -34,9 +33,10 @@ pub fn machines_dir() -> PathBuf {
 }
 
 pub(crate) fn define_xml(connection: Connection, xml: &str) -> Result<()> {
-    let mut file = tempfile::Builder::new().suffix(".xml").tempfile()?;
-    file.write_all(xml.as_bytes())?;
-    virsh(connection, &["define", file.path().to_str().context("Invalid configuration path.")?])?;
+    let file = crate::xml::temporary(xml)?;
+    virsh(connection, &["define", crate::files::path_text(file.path())?]).context(
+        "Libvirt could not confirm the machine configuration. Refresh the library before retrying.",
+    )?;
     Ok(())
 }
 
@@ -74,17 +74,10 @@ pub(crate) fn record_owned_storage(folder: &Path, xml: &str) -> Result<()> {
             uuid: uuid.into(),
             disks,
         };
-        fs::write(folder.join(STORAGE_RECORD), serde_json::to_vec(&record)?)?;
+        crate::files::write_atomic(&folder.join(STORAGE_RECORD), &serde_json::to_vec(&record)?)
+            .context("Could not record which disks belong to the machine.")?;
     }
     Ok(())
-}
-
-fn disk_format(path: &Path) -> Result<String> {
-    let info =
-        run("qemu-img", &["info", "--output=json", path.to_str().context("Invalid disk path.")?])?;
-    let json: serde_json::Value =
-        serde_json::from_str(&info).context("Could not read the disk image.")?;
-    Ok(json["format"].as_str().unwrap_or("raw").to_owned())
 }
 
 pub fn create(connection: Connection, spec: &NewMachine) -> Result<()> {
@@ -137,7 +130,7 @@ pub fn create(connection: Connection, spec: &NewMachine) -> Result<()> {
     let mut registration_attempted = false;
     let result = (|| -> Result<()> {
         let format = if spec.existing_disk.is_some() {
-            disk_format(&disk)?
+            super::qemu::disk_info(crate::files::path_text(&disk)?)?.format
         } else {
             run(
                 "qemu-img",
@@ -151,7 +144,9 @@ pub fn create(connection: Connection, spec: &NewMachine) -> Result<()> {
             )?;
             "qcow2".to_owned()
         };
-        let disk_arg = format!("path={},format={format}", disk.display());
+        // virt-install parses the option value with shlex, even when passed as one argument.
+        let disk_path = disk.to_str().context("Choose a disk path with a valid UTF-8 name.")?;
+        let disk_arg = format!("path='{}',format={format}", disk_path.replace('\'', "'\\''"));
         let memory = (spec.memory_gib * 1024).to_string();
         let cpus = super::Topology::one_socket(spec.cpus).virt_install();
         let mut args = vec![
@@ -289,14 +284,8 @@ pub(crate) fn add_hardware_review(xml: &str) -> Result<String> {
     let tag = format!("<hydroxl:{IMPORT_TAG} xmlns:hydroxl='{IMPORT_NAMESPACE}'/>");
     let mut updated = xml.to_owned();
     if let Some(metadata) = root.children().find(|node| node.has_tag_name("metadata")) {
-        let range = metadata.range();
-        let source = &xml[range.clone()];
-        if let Some(open) = source.strip_suffix("/>") {
-            updated.replace_range(range, &format!("{open}>{tag}</metadata>"));
-        } else {
-            let closing = source.rfind("</metadata").context("Invalid metadata section.")?;
-            updated.insert_str(range.start + closing, &format!("  {tag}\n  "));
-        }
+        let (range, replacement) = crate::xml::append_child(xml, metadata, &tag)?;
+        updated.replace_range(range, &replacement);
     } else {
         let open_end = xml[root.range()].find('>').context("Invalid domain element.")?;
         updated.insert_str(
@@ -325,13 +314,17 @@ pub fn import(
         .and_then(|n| n.text())
         .context("The XML needs a machine name.")?;
     // Refuse to redefine an existing machine through the import flow.
-    if virsh(connection, &["domuuid", name]).is_ok() {
+    let names = virsh(connection, &["list", "--all", "--name"])
+        .context("Could not check the library for a machine with this name.")?;
+    if names.lines().any(|existing| existing == name) {
         bail!("A machine with this name already exists. Rename it in the XML first.");
     }
     if let Some(uuid) =
         doc.root_element().children().find(|n| n.has_tag_name("uuid")).and_then(|n| n.text())
     {
-        if virsh(connection, &["domname", uuid]).is_ok() {
+        let ids = virsh(connection, &["list", "--all", "--uuid"])
+            .context("Could not check the library for this machine's UUID.")?;
+        if ids.split_whitespace().any(|id| id.eq_ignore_ascii_case(uuid.trim())) {
             bail!("This machine is already in the library.");
         }
     }

@@ -1,6 +1,5 @@
 //! The private QEMU installation shared by Hydroxl's VM and image workflows.
 use anyhow::{Context, Result, ensure};
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 const INSTALL_ROOT: &str = "/usr/lib/hydroxl/neptune";
@@ -80,6 +79,20 @@ fn binary(name: &str) -> Result<PathBuf> {
     let path = root()?.join("bin").join(name);
     ensure!(path.is_file(), "{MISSING} Missing {}.", path.display());
     Ok(path)
+}
+
+#[derive(serde::Deserialize)]
+pub(crate) struct DiskInfo {
+    pub(crate) format: String,
+    #[serde(rename = "virtual-size")]
+    pub(crate) virtual_size: u64,
+}
+
+pub(crate) fn disk_info(path: &str) -> Result<DiskInfo> {
+    let output = super::run("qemu-img", &["info", "--output=json", path]).with_context(|| {
+        format!("Could not read disk image {path}. Check that it is accessible.")
+    })?;
+    serde_json::from_str(&output).context("QEMU returned invalid disk image information.")
 }
 
 pub fn image_tool() -> Result<PathBuf> {
@@ -223,14 +236,13 @@ fn with_emulator(
     if domain_emulator(domain) == Some(path) {
         return Ok(None);
     }
-    let path = path.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+    let path = crate::xml::escape(path);
     let element = format!("<emulator>{path}</emulator>");
     let mut updated = xml.to_owned();
     let Some(devices) = domain.children().find(|n| n.has_tag_name("devices")) else {
-        let closing = "</domain>";
-        let range = domain.range();
-        ensure!(xml[range.clone()].ends_with(closing), "This machine has no devices section.");
-        updated.insert_str(range.end - closing.len(), &format!("<devices>{element}</devices>"));
+        let (range, replacement) =
+            crate::xml::append_child(xml, domain, &format!("<devices>{element}</devices>"))?;
+        updated.replace_range(range, &replacement);
         return Ok(Some(updated));
     };
     if let Some(emulator) = devices.children().find(|n| n.has_tag_name("emulator")) {
@@ -251,13 +263,9 @@ pub(crate) fn switch_to_bundled(connection: super::Connection, id: &str) -> Resu
     super::ensure_stopped(connection, id, true)?;
     let xml = super::virsh(connection, &["dumpxml", id, "--inactive"])?;
     if let Some(updated) = QemuBuild::Bundled.configure_xml(&xml)? {
-        let mut file = tempfile::Builder::new().suffix(".xml").tempfile()?;
-        file.write_all(updated.as_bytes())?;
-        super::virsh(
-            connection,
-            &["define", file.path().to_str().context("Invalid machine configuration path.")?],
-        )
-        .context("Could not switch this machine to bundled QEMU. Check the machine type and emulator permissions.")?;
+        super::define_xml(connection, &updated).context(
+            "Could not switch this machine to bundled QEMU. Check the machine type and emulator permissions.",
+        )?;
     }
     Ok(())
 }

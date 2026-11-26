@@ -1,5 +1,5 @@
 //! Bounded framebuffer damage, independent of GPUI and transport details.
-use super::vnc::Framebuffer;
+use super::frame::Framebuffer;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Damage {

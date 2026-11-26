@@ -1,9 +1,13 @@
 use crate::backend::Connection;
 use crate::display::geometry::Scaling;
+use anyhow::{Context, Result};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::PathBuf,
+    fmt::Write as _,
+    io::ErrorKind,
+    path::{Path, PathBuf},
 };
+#[derive(Clone)]
 pub(crate) struct Preferences {
     pub(crate) dark: bool,
     pub(crate) connection: Connection,
@@ -19,10 +23,17 @@ pub(crate) struct Preferences {
     pub(crate) capture_on_click: bool,
     pub(crate) vm_location: Option<PathBuf>,
 }
+impl Default for Preferences {
+    fn default() -> Self {
+        Self::parse("")
+    }
+}
+
 impl Preferences {
     pub(crate) fn path() -> Option<PathBuf> {
         std::env::var_os("XDG_CONFIG_HOME")
             .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
             .or_else(|| std::env::var_os("HOME").map(|p| PathBuf::from(p).join(".config")))
             .map(|p| p.join("hydroxl/preferences"))
     }
@@ -34,9 +45,20 @@ impl Preferences {
         self.vm_scaling.get(id).copied().unwrap_or(self.display_scaling)
     }
 
-    pub(crate) fn load() -> Self {
-        let text = Self::path().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
-        Self::parse(&text)
+    pub(crate) fn load() -> Result<Self> {
+        let Some(path) = Self::path() else {
+            return Ok(Self::default());
+        };
+        match std::fs::read_to_string(&path) {
+            Ok(text) => Ok(Self::parse(&text)),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(Self::default()),
+            Err(error) => Err(error).with_context(|| {
+                format!(
+                    "Could not read preferences from {}. Check that the file is readable.",
+                    path.display()
+                )
+            }),
+        }
     }
 
     fn parse(text: &str) -> Self {
@@ -66,7 +88,9 @@ impl Preferences {
             // Capture when the pointer enters is the default; click is opt-in. Earlier builds
             // wrote a `capture=` line for everyone, so only the newer key is read.
             capture_on_click: text.lines().any(|line| line == "input-capture=click"),
-            selected: text.lines().find_map(|l| l.strip_prefix("selected=").map(str::to_owned)),
+            selected: text.lines().find_map(|l| {
+                l.strip_prefix("selected=").filter(|id| !id.is_empty()).map(str::to_owned)
+            }),
             icons: text
                 .lines()
                 .filter_map(|l| l.strip_prefix("icon=")?.split_once(' '))
@@ -79,62 +103,123 @@ impl Preferences {
                 .collect(),
         }
     }
-    pub(crate) fn save(&self) {
-        if let Some(path) = Self::path() {
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let value = format!(
-                "{}\n{}\nselected={}\ndisplay-scaling={}\nfullscreen-toolbar={}\ninput-capture={}\n",
-                if self.dark {
-                    "dark"
-                } else {
-                    "light"
-                },
-                if self.connection == Connection::Session {
-                    "session"
-                } else {
-                    "system"
-                },
-                self.selected.as_deref().unwrap_or(""),
-                self.display_scaling.key(),
-                if self.toolbar_pinned {
-                    "pinned"
-                } else {
-                    "auto"
-                },
-                if self.capture_on_click {
-                    "click"
-                } else {
-                    "pointer"
-                }
-            ) + &self
-                .icons
-                .iter()
-                .map(|(id, key)| format!("icon={id} {key}\n"))
-                .collect::<String>()
-                + &self.vnc.iter().map(|id| format!("viewer=vnc {id}\n")).collect::<String>()
-                + &self
-                    .vm_scaling
-                    .iter()
-                    .map(|(id, mode)| format!("vm-scaling={} {id}\n", mode.key()))
-                    .collect::<String>()
-                + &self
-                    .vm_location
-                    .as_ref()
-                    .and_then(|path| serde_json::to_string(path).ok())
-                    .map(|path| format!("vm-location={path}\n"))
-                    .unwrap_or_default();
-            if let Err(error) = std::fs::write(path, value) {
-                eprintln!("Could not save preferences: {error}");
-            }
+    pub(crate) fn save(&self) -> Result<()> {
+        let path = Self::path()
+            .context("Could not save preferences. Set XDG_CONFIG_HOME to a writable folder.")?;
+        self.write(&path).with_context(|| {
+            format!(
+                "Could not save preferences to {}. Check that the folder is writable.",
+                path.display()
+            )
+        })
+    }
+
+    fn write(&self, path: &Path) -> Result<()> {
+        // Preferences can be symlinked into a user's dotfiles. Replace the target atomically.
+        let target = match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => Some(
+                path.canonicalize()
+                    .context("The preferences link does not point to a readable file.")?,
+            ),
+            Ok(_) => None,
+            Err(error) if error.kind() == ErrorKind::NotFound => None,
+            Err(error) => return Err(error).context("Could not inspect the existing preferences."),
+        };
+        let path = target.as_deref().unwrap_or(path);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
         }
+        match std::fs::read_to_string(path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("The existing preferences could not be read."),
+        }
+        let location = self
+            .vm_location
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .context("Choose a VM folder with a valid UTF-8 name.")?;
+        let mut value = format!(
+            "{}\n{}\nselected={}\ndisplay-scaling={}\nfullscreen-toolbar={}\ninput-capture={}\n",
+            if self.dark {
+                "dark"
+            } else {
+                "light"
+            },
+            if self.connection == Connection::Session {
+                "session"
+            } else {
+                "system"
+            },
+            self.selected.as_deref().unwrap_or(""),
+            self.display_scaling.key(),
+            if self.toolbar_pinned {
+                "pinned"
+            } else {
+                "auto"
+            },
+            if self.capture_on_click {
+                "click"
+            } else {
+                "pointer"
+            },
+        );
+        for (id, key) in &self.icons {
+            writeln!(value, "icon={id} {key}")?;
+        }
+        for id in &self.vnc {
+            writeln!(value, "viewer=vnc {id}")?;
+        }
+        for (id, mode) in &self.vm_scaling {
+            writeln!(value, "vm-scaling={} {id}", mode.key())?;
+        }
+        if let Some(location) = location {
+            writeln!(value, "vm-location={location}")?;
+        }
+        crate::files::write_atomic(path, value.as_bytes())?;
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::Preferences;
+
+    #[test]
+    fn saves_preferences_and_preserves_an_unreadable_existing_file() -> anyhow::Result<()> {
+        let folder = tempfile::tempdir()?;
+        let path = folder.path().join("preferences");
+        let original = b"dark\nsession\n\xff";
+        std::fs::write(&path, original)?;
+        let prefs = Preferences {
+            dark: false,
+            ..Preferences::default()
+        };
+        assert!(prefs.write(&path).is_err());
+        assert_eq!(std::fs::read(&path)?, original);
+        std::fs::write(&path, "dark\nsession\n")?;
+        prefs.write(&path)?;
+        assert!(!Preferences::parse(&std::fs::read_to_string(path)?).dark);
+        Ok(())
+    }
+
+    #[test]
+    fn preserves_a_preferences_symlink() -> anyhow::Result<()> {
+        let folder = tempfile::tempdir()?;
+        let path = folder.path().join("preferences");
+        let target = folder.path().join("dotfiles-preferences");
+        std::fs::write(&target, "dark\nsession\n")?;
+        std::os::unix::fs::symlink(&target, &path)?;
+        let prefs = Preferences {
+            dark: false,
+            ..Preferences::default()
+        };
+        prefs.write(&path)?;
+        assert!(std::fs::symlink_metadata(path)?.is_symlink());
+        assert!(!Preferences::parse(&std::fs::read_to_string(target)?).dark);
+        Ok(())
+    }
 
     #[test]
     fn only_explicit_vnc_overrides_the_spice_default() {

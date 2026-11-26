@@ -279,7 +279,7 @@ pub const VIDEO_MEMORY: &[(&str, &str)] = &[
 ];
 
 fn platform(doc: &roxmltree::Document) -> crate::operations::Platform {
-    let has = |pick: &dyn Fn(roxmltree::Node) -> bool| doc.descendants().any(|n| pick(n));
+    let has = |pick: &dyn Fn(roxmltree::Node) -> bool| doc.descendants().any(pick);
     crate::operations::Platform {
         tpm: has(&|n| n.has_tag_name("tpm")),
         tablet: has(&|n| n.has_tag_name("input") && n.attribute("type") == Some("tablet")),

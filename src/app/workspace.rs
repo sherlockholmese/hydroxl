@@ -14,10 +14,11 @@ impl Workspace {
     pub(crate) fn new(
         demo: bool,
         initial: Option<PathBuf>,
+        preferences: Preferences,
+        preference_error: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let preferences = Preferences::load();
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search machines"));
         cx.subscribe(&search, |_, _, _: &input::InputEvent, cx| cx.notify()).detach();
         let memory_input = cx.new(|cx| InputState::new(window, cx));
@@ -42,9 +43,10 @@ impl Workspace {
             details_for: None,
             search,
             memory_input,
+            memory_invalid: false,
             pending: None,
             library_error: None,
-            error: None,
+            error: preference_error,
             notice: None,
             loaded: demo,
             demo,
@@ -67,6 +69,7 @@ impl Workspace {
             },
             focus: cx.focus_handle(),
         };
+        this.focus.focus(window, cx);
         this.apply_icons();
         if demo {
             this.selected = this.machines.first().map(|m| m.id.clone());
@@ -178,18 +181,68 @@ impl Workspace {
         } else {
             self.preferences.vnc.insert(id);
         }
-        self.preferences.save();
+        self.save_preferences();
         self.apply_icons();
         cx.notify();
     }
 
-    pub(crate) fn set_icon(&mut self, id: String, key: String, cx: &mut Context<Self>) {
-        self.preferences.icons.retain(|(existing, _)| *existing != id);
+    pub(crate) fn set_icon(
+        &mut self,
+        id: String,
+        key: String,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<()> {
+        let mut preferences = self.preferences.clone();
+        preferences.icons.retain(|(existing, _)| *existing != id);
         if key != "auto" {
-            self.preferences.icons.push((id, key));
+            preferences.icons.push((id, key));
         }
-        self.preferences.save();
+        preferences.save()?;
+        self.preferences = preferences;
         self.apply_icons();
+        cx.notify();
+        Ok(())
+    }
+
+    pub(crate) fn save_preferences(&mut self) {
+        if let Err(error) = self.preferences.save() {
+            let message = format!("{error:#}");
+            eprintln!("{message}");
+            self.error = Some(message);
+        }
+    }
+
+    pub(crate) fn switch_connection(
+        &mut self,
+        connection: backend::Connection,
+        cx: &mut Context<Self>,
+    ) {
+        if self.busy() || (!self.demo && self.preferences.connection == connection) {
+            return;
+        }
+        if std::mem::replace(&mut self.demo, false) {
+            self.watch_machine_statuses(cx);
+        }
+        self.preferences.connection = connection;
+        self.save_preferences();
+        self.machines.clear();
+        self.machine_statuses = None;
+        self.last_library_sample = Some(std::time::Instant::now());
+        self.selected = None;
+        self.details = Details::default();
+        if let Some((_, preview)) = self.live_preview.take() {
+            cx.defer(move |cx| cx.drop_image(preview, None));
+        }
+        self.details_for = None;
+        self.details_error = None;
+        self.hardware_draft = None;
+        self.memory_invalid = false;
+        self.saved_hardware_for = None;
+        self.pending = None;
+        self.architectures.clear();
+        self.library_error = None;
+        self.loaded = false;
+        self.begin(Job::Refresh, None, cx);
         cx.notify();
     }
 
@@ -207,13 +260,14 @@ impl Workspace {
             };
             self.details_for = None;
             self.hardware_draft = None;
+            self.memory_invalid = false;
             self.saved_hardware_for = None;
             self.details_error = None;
             self.share_os = None;
             // A different machine is a new view, not navigation: nothing slides.
             self.hardware_section.settle();
             self.preferences.selected = self.selected.clone();
-            self.preferences.save();
+            self.save_preferences();
             if !self.demo {
                 self.begin(Job::Refresh, None, cx);
             }

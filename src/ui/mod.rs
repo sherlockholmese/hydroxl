@@ -12,4 +12,4 @@ mod shell;
 mod sidebar;
 mod snapshots;
 
-pub(crate) use primitives::{fact, plain_error, tabular};
+pub(crate) use primitives::{error_line, fact, plain_error, tabular};

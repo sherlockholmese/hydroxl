@@ -1,6 +1,4 @@
-use super::support::{
-    attach, editable, esc, path_text, stamp, stopped, temporary_xml, valid_target,
-};
+use super::support::{attach, editable, esc, path_text, stamp, stopped, valid_target};
 use super::{Operation, execute};
 use crate::backend::{self, Connection, Machine};
 use anyhow::{Context, Result, bail};
@@ -38,7 +36,7 @@ pub(super) fn apply_disk_interface(
     editable(c, id)?;
     let xml = backend::virsh(c, &["dumpxml", id, "--inactive"])?;
     if let Some(updated) = update_disk_interface(xml, target, new_target, bus)? {
-        temporary_xml(&updated, |path| backend::virsh(c, &["define", path]).map(|_| ()))?;
+        backend::define_xml(c, &updated)?;
     }
     Ok(())
 }
@@ -61,7 +59,7 @@ fn update_disk_interface(
         .clone()
         .find(|n| n.attribute("dev") == Some(target))
         .context("The drive no longer exists. Refresh the machine and try again.")?;
-    let disk = old.parent().unwrap();
+    let disk = old.parent().context("The drive target has no disk configuration.")?;
     let old_bus = old.attribute("bus").unwrap_or("");
     if bus == old_bus && new_target == target {
         return Ok(None);
@@ -89,10 +87,7 @@ fn update_disk_interface(
     if let Some(address) = disk.children().find(|n| n.has_tag_name("address")) {
         edits.push((address.range(), String::new()));
     }
-    edits.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
-    for (range, value) in edits {
-        xml.replace_range(range, &value);
-    }
+    crate::xml::apply_edits(&mut xml, edits)?;
     Ok(Some(xml))
 }
 
@@ -111,12 +106,10 @@ pub(super) fn apply_attach_disk(
     if !["virtio", "sata", "scsi", "ide", "usb"].contains(&bus.as_str()) {
         bail!("Choose a supported disk interface.");
     }
-    let info = backend::run("qemu-img", &["info", "--output=json", path_text(&path)?])?;
-    let value: serde_json::Value = serde_json::from_str(&info)?;
-    let format = value["format"].as_str().context("Could not identify the disk format.")?;
+    let info = backend::qemu::disk_info(path_text(&path)?)?;
     let xml = format!(
         "<disk type='file' device='disk'><driver name='qemu' type='{}'/><source file='{}'/><target dev='{}' bus='{}'/></disk>",
-        esc(format),
+        esc(&info.format),
         esc(path_text(&path)?),
         esc(&target),
         esc(&bus)
@@ -133,8 +126,9 @@ pub(super) fn apply_new_disk(
     bus: String,
 ) -> Result<()> {
     let id = machine.id.as_str();
-    stopped(c, id)?;
+    super::support::editable(c, id)?;
     valid_target(&target)?;
+    validate_disk_target(&bus, &target)?;
     if !(1..=16384).contains(&size_gib) {
         bail!("Use a disk size between 1 and 16384 GiB.");
     }
@@ -159,8 +153,10 @@ pub(super) fn apply_new_disk(
         &Default::default(),
     );
     // A failed connection does not prove that attachment failed; keep the new disk.
-    result?;
-    Ok(())
+    result.with_context(|| format!(
+        "The new disk is at {}. Refresh the machine and check whether it was attached before retrying.",
+        path.display()
+    ))
 }
 
 pub(super) fn apply_detach_disk(c: Connection, machine: &Machine, target: String) -> Result<()> {

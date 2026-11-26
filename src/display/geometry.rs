@@ -1,5 +1,5 @@
 //! Shared bounds for guest drawing, cursor rendering, and coordinate mapping.
-use super::vnc::MAX_DESKTOP_SIZE;
+use super::frame::MAX_DESKTOP_SIZE;
 use gpui_kit::{Bounds, Pixels, point, px, size};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

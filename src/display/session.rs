@@ -1,8 +1,8 @@
-use super::vnc::{self, Framebuffer};
 use super::{
     dbus,
     spice::{self, Input},
 };
+use super::{frame::Framebuffer, vnc};
 use crate::backend::{Connection, SpiceOptions};
 use anyhow::Result;
 use std::sync::{Arc, Mutex, mpsc};

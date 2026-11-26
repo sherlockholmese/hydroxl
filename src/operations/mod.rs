@@ -42,7 +42,18 @@ pub fn execute(
             if steps.iter().any(|step| matches!(step, Operation::NestedVirtualization(true))) {
                 nesting::host_feature(machine)?;
             }
-            steps.into_iter().try_for_each(|step| execute(c, machine, step, progress))
+            let total = steps.len();
+            for (index, step) in steps.into_iter().enumerate() {
+                if let Err(error) = execute(c, machine, step, progress) {
+                    if index == 0 {
+                        return Err(error);
+                    }
+                    return Err(error.context(format!(
+                        "Saved {index} of {total} hardware changes. Review the remaining changes before retrying."
+                    )));
+                }
+            }
+            Ok(())
         }
         Operation::NestedVirtualization(enabled) => nesting::apply(c, machine, enabled),
         Operation::Resources {

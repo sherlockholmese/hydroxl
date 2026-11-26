@@ -1,7 +1,6 @@
 use crate::PreferencesAction;
-use crate::app::{Job, Workspace};
+use crate::app::Workspace;
 use crate::backend::Connection;
-use crate::operations::Details;
 use crate::theme::{self, Palette};
 use gpui_kit::component::button::{Button, ButtonVariants};
 use gpui_kit::component::*;
@@ -38,7 +37,7 @@ impl Workspace {
                         let value = i == 1;
                         let _ = weak.update(cx, |this, cx| {
                             this.preferences.dark = value;
-                            this.preferences.save();
+                            this.save_preferences();
                             theme::apply(value, cx);
                             cx.notify();
                         });
@@ -59,32 +58,7 @@ impl Workspace {
                             return;
                         };
                         let _ = weak.update(cx, |this, cx| {
-                            if this.busy() || (!this.demo && this.preferences.connection == value) {
-                                return;
-                            }
-                            if std::mem::replace(&mut this.demo, false) {
-                                this.watch_machine_statuses(cx);
-                            }
-                            this.preferences.connection = value;
-                            this.preferences.save();
-                            this.machines.clear();
-                            this.machine_statuses = None;
-                            this.last_library_sample = Some(std::time::Instant::now());
-                            this.selected = None;
-                            this.details = Details::default();
-                            if let Some((_, preview)) = this.live_preview.take() {
-                                cx.defer(move |cx| cx.drop_image(preview, None));
-                            }
-                            this.details_for = None;
-                            this.details_error = None;
-                            this.hardware_draft = None;
-                            this.saved_hardware_for = None;
-                            this.pending = None;
-                            this.error = None;
-                            this.library_error = None;
-                            this.loaded = false;
-                            this.begin(Job::Refresh, None, cx);
-                            cx.notify();
+                            this.switch_connection(value, cx);
                         });
                     }
                 },
@@ -108,7 +82,7 @@ impl Workspace {
                                 let path = folder.path().to_owned();
                                 let _ = weak.update(cx, |this, cx| {
                                     this.preferences.vm_location = Some(path);
-                                    this.preferences.save();
+                                    this.save_preferences();
                                     cx.notify();
                                 });
                             }
@@ -133,7 +107,7 @@ impl Workspace {
                             .on_click(move |_, _, cx| {
                                 let _ = weak.update(cx, |this, cx| {
                                     this.preferences.vm_location = None;
-                                    this.preferences.save();
+                                    this.save_preferences();
                                     cx.notify();
                                 });
                             }),

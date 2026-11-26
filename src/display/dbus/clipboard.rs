@@ -48,9 +48,11 @@ impl Clipboard {
     pub(super) fn connect(self, control: &Peer) -> Result<mpsc::Sender<Command>> {
         control.call_method(None::<&str>, PATH, Some(INTERFACE), "Register", &())?;
         self.frame.lock().unwrap_or_else(|error| error.into_inner()).dbus_clipboard = true;
-        let control = control.clone();
+        let frame = self.frame.clone();
+        let worker_control = control.clone();
         let (send, receive) = mpsc::channel();
-        std::thread::spawn(move || {
+        let worker = std::thread::Builder::new().name("dbus-clipboard".into()).spawn(move || {
+            let control = worker_control;
             loop {
                 match receive.recv_timeout(Duration::from_secs(1)) {
                     Ok(Command::Offer(text)) => {
@@ -70,6 +72,11 @@ impl Clipboard {
             }
             let _ = control.call_method(None::<&str>, PATH, Some(INTERFACE), "Unregister", &());
         });
+        if let Err(error) = worker {
+            frame.lock().unwrap_or_else(|error| error.into_inner()).dbus_clipboard = false;
+            let _ = control.call_method(None::<&str>, PATH, Some(INTERFACE), "Unregister", &());
+            return Err(error).context("Could not start the QEMU clipboard client.");
+        }
         Ok(send)
     }
 

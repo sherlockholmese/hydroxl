@@ -1,7 +1,9 @@
 mod commands;
+mod hardware;
 mod jobs;
 mod preferences;
 mod refresh;
+mod worker;
 mod workspace;
 use crate::{backend::Machine, operations::Details};
 use gpui_kit::component::input::InputState;
@@ -18,6 +20,7 @@ pub struct Workspace {
     pub(crate) details_for: Option<String>,
     pub(crate) search: Entity<InputState>,
     pub(crate) memory_input: Entity<InputState>,
+    pub(crate) memory_invalid: bool,
     pub(crate) preferences: Preferences,
     pub(crate) pending: Option<Pending>,
     pub(crate) library_error: Option<String>,

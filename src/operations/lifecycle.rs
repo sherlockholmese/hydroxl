@@ -29,24 +29,27 @@ pub(super) fn apply_reboot(c: Connection, machine: &Machine) -> Result<()> {
     // off instead of restarting. Watch in the background and start them again, so the
     // action still returns at once and the app never waits on the guest.
     let (id, prefer_spice) = (id.to_owned(), machine.spice_viewer);
-    std::thread::spawn(move || {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
-        while std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_secs(2));
-            match backend::virsh(c, &["domstate", &id]).as_deref().map(str::trim) {
-                Ok("shut off") => {
-                    if let Err(error) =
-                        backend::action(c, &id, crate::backend::Action::Start, prefer_spice)
-                    {
-                        eprintln!("Could not start the machine after restart: {error:#}");
+    std::thread::Builder::new()
+        .name("guest-restart".into())
+        .spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+            while std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                match backend::virsh(c, &["domstate", &id]).as_deref().map(str::trim) {
+                    Ok("shut off") => {
+                        if let Err(error) =
+                            backend::action(c, &id, crate::backend::Action::Start, prefer_spice)
+                        {
+                            eprintln!("Could not start the machine after restart: {error:#}");
+                        }
+                        return;
                     }
-                    return;
+                    Ok("running" | "paused" | "in shutdown" | "pmsuspended") => {}
+                    _ => return,
                 }
-                Ok("running" | "paused" | "in shutdown" | "pmsuspended") => {}
-                _ => return,
             }
-        }
-    });
+        })
+        .context("Restart was requested. If the machine powers off, start it from the library.")?;
     Ok(())
 }
 
@@ -76,12 +79,10 @@ pub(super) fn apply_disposable(c: Connection, machine: &Machine) -> Result<()> {
 pub(super) fn apply_console(c: Connection, machine: &Machine) -> Result<()> {
     let id = machine.id.as_str();
     let terminal = std::env::var("TERMINAL").unwrap_or_else(|_| "xterm".into());
-    Command::new(terminal)
-        .args(["-e", "virsh", "--connect", c.uri(), "console", id])
-        .stdin(Stdio::null())
-        .spawn()
-        .context("Set TERMINAL to your terminal executable, or install xterm.")?;
-    Ok(())
+    let mut command = Command::new(terminal);
+    command.args(["-e", "virsh", "--connect", c.uri(), "console", id]).stdin(Stdio::null());
+    backend::launch_desktop(command)
+        .context("Set TERMINAL to your terminal executable, or install xterm.")
 }
 
 pub(super) fn disposable(c: Connection, machine: &Machine) -> Result<()> {
@@ -93,6 +94,7 @@ pub(super) fn disposable(c: Connection, machine: &Machine) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&folder, fs::Permissions::from_mode(0o700))?;
     }
+    let mut launch_attempted = false;
     let result = (|| -> Result<()> {
         let mut xml = backend::virsh(c, &["dumpxml", &machine.id, "--inactive"])?;
         let doc = roxmltree::Document::parse(&xml)?;
@@ -137,13 +139,11 @@ pub(super) fn disposable(c: Connection, machine: &Machine) -> Result<()> {
                 .context("A disk has no source.")?;
             let file =
                 source.attribute("file").context("Disposable mode needs file-backed storage.")?;
-            let info: serde_json::Value =
-                serde_json::from_str(&backend::run("qemu-img", &["info", "--output=json", file])?)?;
-            let format = info["format"].as_str().context("Could not identify a disk format.")?;
+            let info = backend::qemu::disk_info(file)?;
             let overlay = folder.join(format!("disk-{i}.qcow2"));
             backend::run(
                 "qemu-img",
-                &["create", "-f", "qcow2", "-F", format, "-b", file, path_text(&overlay)?],
+                &["create", "-f", "qcow2", "-F", &info.format, "-b", file, path_text(&overlay)?],
             )?;
             edits.push((source.range(), format!("<source file='{}'/>", esc(path_text(&overlay)?))));
             if let Some(driver) = disk.children().find(|n| n.has_tag_name("driver")) {
@@ -151,15 +151,21 @@ pub(super) fn disposable(c: Connection, machine: &Machine) -> Result<()> {
             }
         }
         // Keep the original stopped machine untouched and launch a separate transient guest.
-        edits.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
-        for (range, replacement) in edits {
-            xml.replace_range(range, &replacement);
-        }
-        temporary_xml(&xml, |path| backend::virsh(c, &["create", path]).map(|_| ()))?;
+        crate::xml::apply_edits(&mut xml, edits)?;
+        temporary_xml(&xml, |path| {
+            launch_attempted = true;
+            backend::virsh(c, &["create", path]).map(|_| ()).with_context(|| format!(
+                "Could not confirm the disposable machine started. Refresh the library. Its disks are in {}.",
+                folder.display()
+            ))
+        })?;
         Ok(())
     })();
-    if result.is_err() {
-        let _ = fs::remove_dir_all(&folder);
+    if result.is_err()
+        && !launch_attempted
+        && let Err(error) = fs::remove_dir_all(&folder)
+    {
+        eprintln!("Could not clean up disposable storage at {}: {error}", folder.display());
     }
     // Overlay files are retained under /tmp while QEMU holds them. They can be
     // removed after the transient guest exits; they are never merged into a base image.

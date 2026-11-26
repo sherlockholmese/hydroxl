@@ -39,11 +39,11 @@ pub(crate) fn run(args: &[OsString]) -> Result<ExitCode> {
     }
     let mut child = command.spawn()?;
     let pid = child.id();
-    let mut stderr = child.stderr.take().expect("child stderr is piped");
+    let mut stderr = child.stderr.take().context("Could not capture Hydroxl diagnostics.")?;
     let log = Arc::new(Mutex::new(VecDeque::with_capacity(LOG_LIMIT)));
     let reader_log = log.clone();
     let (drained, reader_done) = mpsc::channel();
-    std::thread::spawn(move || {
+    let worker = std::thread::Builder::new().name("crash-reporter".into()).spawn(move || {
         let mut buffer = [0u8; 8192];
         while let Ok(count @ 1..) = stderr.read(&mut buffer) {
             let bytes = &buffer[..count];
@@ -57,6 +57,10 @@ pub(crate) fn run(args: &[OsString]) -> Result<ExitCode> {
         }
         let _ = drained.send(());
     });
+    if let Err(error) = worker {
+        // Dropping the diagnostic pipe also prevents the child from blocking on writes.
+        eprintln!("Could not start the diagnostic reader: {error}");
+    }
     let status = child.wait()?;
     // A terminal or other descendant can keep the pipe open after Hydroxl exits.
     let _ = reader_done.recv_timeout(Duration::from_millis(200));
@@ -79,7 +83,7 @@ pub(crate) fn run(args: &[OsString]) -> Result<ExitCode> {
 fn crashed(status: ExitStatus) -> bool {
     match status.signal() {
         Some(libc::SIGINT | libc::SIGTERM | libc::SIGKILL | libc::SIGHUP) => false,
-        _ => !status.success(),
+        _ => !status.success() && status.code() != Some(1),
     }
 }
 
@@ -168,9 +172,10 @@ impl Report {
     }
 
     fn save(&self, path: &Path) -> Result<bool> {
-        let folder = path.parent().context("The destination has no parent folder")?;
-        // Stage the archive privately and replace the selected file only after a complete write.
-        let mut file = tempfile::NamedTempFile::new_in(folder)?;
+        let mut file = crate::files::stage(path)
+            .context("Could not create the crash report in the chosen folder.")?;
+        let folder =
+            file.path().parent().context("The destination has no parent folder")?.to_owned();
         let mut archive =
             tar::Builder::new(GzEncoder::new(file.as_file_mut(), Compression::fast()));
         let mut summary = format!(

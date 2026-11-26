@@ -25,10 +25,8 @@ pub(crate) fn convert(
         path.to_str().map(str::to_owned).context("Choose a path with a valid UTF-8 name.")
     };
     let source = text(&source)?;
-    let info: serde_json::Value =
-        serde_json::from_str(&run("qemu-img", &["info", "--output=json", &source])?)?;
-    let source_format =
-        info["format"].as_str().context("Could not identify the source disk format.")?;
+    let info = super::qemu::disk_info(&source)?;
+    let source_format = info.format.as_str();
     ensure!(
         FORMATS.iter().any(|(key, _)| *key == source_format),
         "Choose a VMDK, QCOW2, or VDI source disk."

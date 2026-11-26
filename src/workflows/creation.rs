@@ -152,10 +152,12 @@ fn new_machine_job(v: &[String]) -> Result<Job> {
 /// Readable machine name: the catalog name when the system is known
 /// ("Ubuntu 24.04 LTS"), otherwise the image name without build tokens.
 fn suggested_name(stem: &str, os: &str) -> String {
-    if (stem.is_empty() || os.starts_with("win")) && os != "generic" && !os.is_empty() {
-        if let Some(entry) = crate::backend::os_catalog().iter().find(|e| e.id == os) {
-            return entry.name.trim_start_matches("Microsoft ").to_owned();
-        }
+    if (stem.is_empty() || os.starts_with("win"))
+        && os != "generic"
+        && !os.is_empty()
+        && let Some(entry) = crate::backend::os_catalog().iter().find(|e| e.id == os)
+    {
+        return entry.name.trim_start_matches("Microsoft ").to_owned();
     }
     const STOP: &[&str] = &[
         "desktop", "live", "amd64", "x86", "x64", "arm64", "aarch64", "i386", "i686", "dvd",

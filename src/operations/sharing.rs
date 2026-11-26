@@ -1,5 +1,5 @@
 use super::ShareDriver;
-use super::support::{append_child, attach, editable, esc, path_text, temporary_xml, valid_name};
+use super::support::{append_child, attach, editable, esc, path_text, valid_name};
 use crate::backend::{self, Connection, Machine};
 use anyhow::{Result, bail};
 use std::path::PathBuf;
@@ -53,9 +53,7 @@ fn shared_memory(c: Connection, id: &str) -> Result<()> {
     editable(c, id)?;
     let xml = backend::virsh(c, &["dumpxml", id, "--inactive"])?;
     match with_shared_memory(&xml)? {
-        Some(updated) => {
-            temporary_xml(&updated, |path| backend::virsh(c, &["define", path]).map(|_| ()))
-        }
+        Some(updated) => backend::define_xml(c, &updated),
         None => Ok(()),
     }
 }

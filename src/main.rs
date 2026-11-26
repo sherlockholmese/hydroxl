@@ -4,11 +4,13 @@ mod appliance;
 mod backend;
 mod crash_report;
 mod display;
+mod files;
 mod forms;
 mod operations;
 mod theme;
 mod ui;
 mod workflows;
+mod xml;
 use app::{Preferences, Workspace};
 use gpui_kit::*;
 use std::{path::PathBuf, process::ExitCode};
@@ -33,11 +35,17 @@ fn main() -> ExitCode {
     }
     let demo = args.iter().any(|a| a == "--demo");
     let initial = args.iter().find(|a| !a.to_string_lossy().starts_with('-')).map(PathBuf::from);
+    let exit = std::rc::Rc::new(std::cell::Cell::new(ExitCode::SUCCESS));
+    let startup_exit = exit.clone();
     gpui_kit::application().with_assets(gpui_kit::assets::AllAssets).run(move |cx| {
         theme::load_fonts(cx);
         cx.set_reduce_motion(theme::reduce_motion_preference());
         gpui_kit::init(cx);
-        theme::apply(Preferences::load().dark, cx);
+        let (preferences, preference_error) = match Preferences::load() {
+            Ok(preferences) => (preferences, None),
+            Err(error) => (Preferences::default(), Some(format!("{error:#}"))),
+        };
+        theme::apply(preferences.dark, cx);
         cx.bind_keys([
             KeyBinding::new("ctrl-n", NewMachineAction, Some("Hydroxl")),
             KeyBinding::new("f5", RefreshAction, Some("Hydroxl")),
@@ -59,7 +67,7 @@ fn main() -> ExitCode {
             ..Default::default()
         };
         match gpui_kit::open_window(options, cx, |window, cx| {
-            cx.new(|cx| Workspace::new(demo, initial.clone(), window, cx))
+            cx.new(|cx| Workspace::new(demo, initial, preferences, preference_error, window, cx))
         }) {
             Ok((_, view)) => {
                 cx.activate(true);
@@ -67,6 +75,7 @@ fn main() -> ExitCode {
             }
             Err(error) => {
                 eprintln!("Could not open Hydroxl: {error}");
+                startup_exit.set(ExitCode::FAILURE);
                 cx.quit();
             }
         }
@@ -77,5 +86,5 @@ fn main() -> ExitCode {
         })
         .detach();
     });
-    ExitCode::SUCCESS
+    exit.get()
 }

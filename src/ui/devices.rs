@@ -84,6 +84,8 @@ fn glyph(kind: &str) -> Glyph {
     }
 }
 
+type ExtraDeviceForm = (&'static str, fn() -> FormSpec);
+
 impl Workspace {
     /// "Add" menu for one hardware section. Each entry opens its focused form.
     pub(crate) fn add_device_menu(
@@ -91,7 +93,7 @@ impl Workspace {
         id: &'static str,
         machine: &Machine,
         actions: &'static [DeviceAction],
-        extra: &'static [(&'static str, fn() -> FormSpec)],
+        extra: &'static [ExtraDeviceForm],
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let weak = cx.entity().downgrade();

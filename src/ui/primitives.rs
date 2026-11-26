@@ -323,35 +323,70 @@ pub(crate) fn item_list(rows: Vec<AnyElement>, p: Palette) -> Div {
     list
 }
 
-/// An error as the user reads it: what happened and what to do, without command chains,
-/// socket paths or libvirt prefixes. Known causes get their recovery; anything else keeps
-/// only its leading sentence, which the backend already writes for people.
+/// Shared inline failure state for the machine pane and forms.
+pub(crate) fn error_line(text: &str, p: Palette) -> Div {
+    h_flex()
+        .items_start()
+        .gap_2()
+        .text_color(p.danger)
+        .child(glyph("circle-alert").size_4().mt(px(2.)).flex_shrink_0())
+        .child(div().flex_1().min_w_0().child(plain_error(text)))
+}
+
+/// Keeps the user-facing message short. Callers retain the full diagnostic in the log.
 pub(crate) fn plain_error(raw: &str) -> String {
     let lower = raw.to_ascii_lowercase();
-    if lower.contains("failed to connect socket")
-        || lower.contains("failed to connect to the hypervisor")
-    {
-        return if lower.contains("permission denied") {
-            "No permission for the system connection. Add your user to the libvirt group, then sign in again."
-        } else {
-            "Libvirt is not running. Start the libvirt service, then retry."
-        }
-        .into();
-    }
-    let line = raw
+    let summary = raw.split_once(".: ").map(|(summary, _)| summary);
+    let line = summary
+        .unwrap_or(raw)
         .lines()
         .map(str::trim)
         .map(|line| line.strip_prefix("error: ").unwrap_or(line))
         .find(|line| !line.is_empty())
-        .unwrap_or("The operation failed. Retry, or open the machine log.");
-    let mut text: String = match line.chars().next() {
-        Some(first) => first.to_uppercase().chain(line.chars().skip(1)).collect(),
-        None => String::new(),
+        .unwrap_or("The operation failed. Check the machine state and try again.");
+    // A partial-success message must survive even if the underlying cause is familiar.
+    let partial_success = line.starts_with("The snapshot was ")
+        || line.starts_with("The replacement was ")
+        || line.starts_with("The bridge was ")
+        || line.starts_with("The network was ")
+        || line.starts_with("The machine was ")
+        || line.starts_with("The new disk is at ")
+        || line.starts_with("Saved ")
+        || line.starts_with("Could not confirm the storage move");
+    let connection = lower.contains("failed to connect socket")
+        || lower.contains("failed to connect to the hypervisor")
+        || lower.contains("could not connect to libvirt");
+    let text = if !partial_success && connection && lower.contains("permission denied") {
+        if lower.contains("qemu:///session") || lower.contains("/run/user/") {
+            "The user session cannot access Libvirt. Check the permissions for your session's libvirt socket."
+        } else {
+            "No permission to connect to Libvirt. Check that your account has access to the selected connection."
+        }
+    } else if !partial_success
+        && connection
+        && (lower.contains("no such file") || lower.contains("connection refused"))
+    {
+        "Libvirt is unavailable. Start the libvirt service for the selected connection, then retry."
+    } else if !partial_success && lower.contains("domain not found") {
+        "This machine is no longer available. Refresh the library and check the selected connection."
+    } else if !partial_success && lower.contains("no space left on device") {
+        "The destination is out of space. Free up space before trying again."
+    } else if !partial_success && lower.contains("read-only file system") {
+        "The destination is read-only. Choose a writable location."
+    } else {
+        line.strip_prefix("Requested operation is not valid: ").unwrap_or(line)
     };
-    if !text.ends_with(['.', '?', '!']) {
-        text.push('.');
+    let mut chars = text.chars();
+    let mut summary = chars
+        .next()
+        .map(|first| {
+            first.to_uppercase().chain(chars).filter(|ch| !ch.is_control()).collect::<String>()
+        })
+        .unwrap_or_default();
+    if !summary.ends_with(['.', '?', '!']) {
+        summary.push('.');
     }
-    text
+    summary
 }
 
 #[cfg(test)]
@@ -363,7 +398,19 @@ mod tests {
         let raw = "failed to connect to the hypervisor\nFailed to connect socket to '/run/libvirt/virtqemud-sock': Permission denied";
         assert!(plain_error(raw).starts_with("No permission"));
         let raw = "failed to connect to the hypervisor\nFailed to connect socket to '/run/user/1000/libvirt/virtqemud-sock': No such file or directory";
-        assert!(plain_error(raw).starts_with("Libvirt is not running"));
+        assert!(plain_error(raw).starts_with("Libvirt is unavailable"));
+    }
+
+    #[test]
+    fn preserves_partial_success_and_names_recoverable_causes() {
+        let partial =
+            "The snapshot was saved as backup. Rename it in Snapshots.: No space left on device";
+        assert!(plain_error(partial).starts_with("The snapshot was saved"));
+        assert!(plain_error("qemu-img: No space left on device").contains("Free up space"));
+        assert!(
+            plain_error("error: Requested operation is not valid: refresh the machine")
+                .starts_with("Refresh")
+        );
     }
 
     #[test]

@@ -1,9 +1,11 @@
 mod catalog;
 mod creation;
 pub(crate) mod disk_convert;
+mod display;
 mod gpu;
 mod hardware;
 mod library;
+mod lifecycle;
 mod model;
 pub mod network;
 mod process;
@@ -18,17 +20,19 @@ pub(crate) use creation::{
     import_hardware, record_owned_storage,
 };
 pub use creation::{create, disable_cow, import};
+pub use display::ensure_live_tablet;
+pub(crate) use display::{DisplayTarget, SpiceOptions, display_target, is_peer_dbus};
 pub use gpu::{
     HOSTMEM_BYTES, NEPTUNE_HOST_MISSING, TRITON_ARCH_UNSUPPORTED, gpu_features, triton_arch,
 };
+pub(crate) use hardware::MEMORY_MIB;
 pub use hardware::{Topology, configure, nested_host_feature};
-pub(crate) use library::{
-    DisplayTarget, MachineStatuses, SpiceOptions, display_target, is_peer_dbus,
-};
-pub use library::{action, demo_machines, ensure_live_tablet, machines, virsh};
+pub(crate) use library::{MachineList, MachineStatuses, machines};
+pub use library::{demo_machines, virsh};
+pub use lifecycle::action;
 pub use model::{ARCHITECTURES, Action, Connection, Machine, NewMachine, State};
 pub(crate) use process::{
-    SnapshotNotFound, qemu_convert, run, run_with_input, virsh_with_progress,
+    SnapshotNotFound, launch_desktop, qemu_convert, run, run_with_input, virsh_with_progress,
 };
 pub use qemu::{QemuBackend, QemuBuild};
 pub(crate) use spice::{
@@ -36,4 +40,4 @@ pub(crate) use spice::{
     route_agent_clipboard,
 };
 
-pub(crate) use library::ensure_stopped;
+pub(crate) use lifecycle::ensure_stopped;

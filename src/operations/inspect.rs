@@ -3,11 +3,12 @@ use super::snapshots::snapshot_labels;
 use super::support::stamp;
 use super::{Details, Device, Snapshot};
 use crate::backend::{self, Connection, State};
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 pub fn details(c: Connection, id: &str) -> Result<Details> {
     let xml = backend::virsh(c, &["dumpxml", id])?;
-    let doc = roxmltree::Document::parse(&xml)?;
+    let doc = roxmltree::Document::parse(&xml)
+        .context("Could not read the machine configuration XML.")?;
     let mut devices = Vec::new();
     for n in doc.descendants().filter(|n| n.has_tag_name("disk")) {
         let kind = n.attribute("device").unwrap_or("disk");
@@ -102,21 +103,38 @@ pub fn details(c: Connection, id: &str) -> Result<Details> {
             xml: xml[node.range()].into(),
         });
     }
-    let snapshot_result = backend::virsh(c, &["snapshot-list", id, "--name"]);
-    let snapshot_error = snapshot_result
-        .as_ref()
-        .err()
-        .map(|_| "Snapshots are unavailable for this machine.".to_owned());
-    let snapshot_names = snapshot_result.unwrap_or_default();
-    let labels = snapshot_labels(id);
+    let mut snapshot_error = None;
+    let labels = snapshot_labels(id).unwrap_or_else(|error| {
+        eprintln!("Could not load snapshot names for {id}: {error:#}");
+        snapshot_error =
+            Some("Custom snapshot names could not be loaded. The original names are shown.".into());
+        Default::default()
+    });
+    let snapshot_names =
+        backend::virsh(c, &["snapshot-list", id, "--name"]).unwrap_or_else(|error| {
+            eprintln!("Could not list snapshots for {id}: {error:#}");
+            snapshot_error = Some("Could not load snapshots.".into());
+            String::new()
+        });
     let mut snapshots = Vec::new();
     for name in snapshot_names.lines().filter(|s| !s.is_empty()) {
         let snapshot_xml = match backend::virsh(c, &["snapshot-dumpxml", id, name]) {
             Ok(xml) => xml,
             Err(error) if error.is::<backend::SnapshotNotFound>() => continue,
-            Err(error) => return Err(error),
+            Err(error) => {
+                eprintln!("Could not read snapshot {name}: {error:#}");
+                snapshot_error = Some("Some snapshots could not be loaded.".into());
+                continue;
+            }
         };
-        let doc = roxmltree::Document::parse(&snapshot_xml)?;
+        let doc = match roxmltree::Document::parse(&snapshot_xml) {
+            Ok(doc) => doc,
+            Err(error) => {
+                eprintln!("Could not parse snapshot {name}: {error}");
+                snapshot_error = Some("Some snapshots could not be loaded.".into());
+                continue;
+            }
+        };
         let state = doc
             .descendants()
             .find(|n| n.has_tag_name("state"))
@@ -136,7 +154,8 @@ pub fn details(c: Connection, id: &str) -> Result<Details> {
             parent,
         });
     }
-    let running = State::from_virsh(&backend::virsh(c, &["domstate", id])?) == State::Running;
+    let running = backend::virsh(c, &["domstate", id])
+        .is_ok_and(|state| State::from_virsh(&state) == State::Running);
     let disk_sizes = devices
         .iter()
         .filter(|d| d.kind == "disk" && !d.target.is_empty())

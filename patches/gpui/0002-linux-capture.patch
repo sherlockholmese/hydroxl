@@ -456,7 +456,45 @@
      serial_tracker: SerialTracker,
      globals: Globals,
      pub gpu_context: GpuContext,
-@@ -805,6 +816,7 @@
+@@ -409,6 +420,7 @@
+     cursor_style: Option<CursorStyle>,
+     cursor_hidden_window: Option<WaylandWindowStatePtr>,
+     clipboard: Clipboard,
++    pending_clipboard: Option<gpui::ClipboardItem>,
+     data_offers: Vec<DataOffer<WlDataOffer>>,
+     primary_data_offer: Option<DataOffer<ZwpPrimarySelectionOfferV1>>,
+     cursor: Cursor,
+@@ -560,6 +572,29 @@
+ }
+
+ impl WaylandClientState {
++    fn publish_clipboard(&mut self) {
++        let (Some(manager), Some(device), Some(serial)) = (
++            &self.globals.data_device_manager,
++            &self.data_device,
++            self.serial_tracker.selection_serial(),
++        ) else {
++            return;
++        };
++        if self.keyboard_focused_window.is_none() {
++            return;
++        }
++        let Some(item) = self.pending_clipboard.take() else {
++            return;
++        };
++        self.clipboard.set(item);
++        let source = manager.create_data_source(&self.globals.qh, DataSourceKind::Clipboard);
++        for mime in TEXT_MIME_TYPES {
++            source.offer(mime.to_string());
++        }
++        source.offer(self.clipboard.self_mime());
++        device.set_selection(Some(&source), serial.as_raw());
++    }
++
+     fn consume_startup_activation_token(&mut self, surface: &wl_surface::WlSurface) {
+         let Some(startup_activation_token) = self.startup_activation_token.take() else {
+             return;
+@@ -805,6 +840,7 @@
      pub fn drop_window(&self, surface_id: &ObjectId) {
          let client = self.get_client();
          let mut state = client.borrow_mut();
@@ -464,7 +502,7 @@
          let closed_window = state.windows.remove(surface_id).unwrap();
          if let Some(window) = state.mouse_focused_window.take()
              && !window.ptr_eq(&closed_window)
-@@ -843,6 +855,9 @@
+@@ -843,6 +879,9 @@
      }
  
      fn restore_cursor_after_hide(&mut self) {
@@ -474,7 +512,7 @@
          if self.cursor_hidden_window.take().is_none() {
              return;
          }
-@@ -1070,6 +1085,8 @@
+@@ -1070,6 +1109,8 @@
              compositor_gpu,
              wl_seat: seat,
              wl_pointer: None,
@@ -483,7 +521,15 @@
              wl_keyboard: None,
              pinch_gesture: None,
              pinch_scale: 1.0,
-@@ -1369,7 +1386,7 @@
+@@ -1132,6 +1173,7 @@
+             cursor_style: None,
+             cursor_hidden_window: None,
+             clipboard: Clipboard::new(conn.clone(), handle.clone()),
++            pending_clipboard: None,
+             data_offers: Vec::new(),
+             primary_data_offer: None,
+             cursor,
+@@ -1369,7 +1411,7 @@
          state.cursor_style = Some(style);
  
          // Don't clobber the invisible cursor; restore reads back from `cursor_style`.
@@ -492,7 +538,48 @@
              return;
          }
  
-@@ -1613,6 +1630,7 @@
+@@ -1461,28 +1503,8 @@
+
+     pub(crate) fn write_to_clipboard(&self, item: gpui::ClipboardItem) {
+         let mut state = self.0.borrow_mut();
+-        let (Some(data_device_manager), Some(data_device)) = (
+-            state.globals.data_device_manager.clone(),
+-            state.data_device.clone(),
+-        ) else {
+-            return;
+-        };
+-        if state.mouse_focused_window.is_some() || state.keyboard_focused_window.is_some() {
+-            state.clipboard.set(item);
+-            let Some(serial) = state.serial_tracker.selection_serial() else {
+-                log::warn!(
+-                    "Skipping Wayland clipboard ownership request because no keyboard or pointer press serial has been received"
+-                );
+-                return;
+-            };
+-            let data_source = data_device_manager
+-                .create_data_source(&state.globals.qh, DataSourceKind::Clipboard);
+-            for mime_type in TEXT_MIME_TYPES {
+-                data_source.offer(mime_type.to_string());
+-            }
+-            data_source.offer(state.clipboard.self_mime());
+-            data_device.set_selection(Some(&data_source), serial.as_raw());
+-        }
++        state.pending_clipboard = Some(item);
++        state.publish_clipboard();
+     }
+
+     pub(crate) fn read_from_primary(&self) -> Option<gpui::ClipboardItem> {
+@@ -1490,7 +1512,8 @@
+     }
+
+     pub(crate) fn read_from_clipboard(&self) -> Option<gpui::ClipboardItem> {
+-        self.0.borrow_mut().clipboard.read()
++        let mut state = self.0.borrow_mut();
++        state.pending_clipboard.clone().or_else(|| state.clipboard.read())
+     }
+
+     pub(crate) fn active_window(&self) -> Option<AnyWindowHandle> {
+@@ -1613,6 +1636,7 @@
                          log::error!("ignoring wl_seat below the required version");
                          return;
                      };
@@ -500,7 +587,7 @@
                      if let Some(wl_pointer) = state.wl_pointer.take() {
                          wl_pointer.release();
                      }
-@@ -1993,6 +2011,8 @@
+@@ -1993,6 +2017,8 @@
          {
              let client = state.get_client();
              let mut state = client.borrow_mut();
@@ -509,7 +596,7 @@
              if capabilities.contains(wl_seat::Capability::Keyboard) {
                  let keyboard = seat.get_keyboard(qh, ());
  
-@@ -2105,6 +2125,7 @@
+@@ -2105,6 +2131,7 @@
              }
              wl_keyboard::Event::Leave { surface, .. } => {
                  let keyboard_focused_window = get_window(&mut state, &surface.id());
@@ -517,7 +604,15 @@
                  state.keyboard_focused_window = None;
                  state.enter_token.take();
                  // Prevent keyboard events from repeating after opening e.g. a file chooser and closing it quickly
-@@ -2423,7 +2444,10 @@
+@@ -2168,6 +2195,7 @@
+                         serial,
+                         focused_surface,
+                     );
++                    state.publish_clipboard();
+                 }
+
+                 let focused_window = state.keyboard_focused_window.clone();
+@@ -2423,7 +2451,10 @@
                          state.enter_token = None;
                      }
                      state.restore_cursor_after_hide();
@@ -529,6 +624,59 @@
                          if let Some(cursor_shape_device) = &state.cursor_shape_device {
                              cursor_shape_device.set_shape(serial, to_shape(style));
                          } else {
+@@ -2536,6 +2567,7 @@
+                         serial,
+                         focused_surface,
+                     );
++                    state.publish_clipboard();
+                 }
+                 let button = linux_button_to_gpui(button);
+                 let Some(button) = button else { return };
+--- a/src/linux/wayland/clipboard.rs
++++ b/src/linux/wayland/clipboard.rs
+@@ -17,9 +17,6 @@
+ pub(crate) const TEXT_MIME_TYPES: [&str; 3] =
+     ["text/plain;charset=utf-8", "UTF8_STRING", "text/plain"];
+ pub(crate) const FILE_LIST_MIME_TYPE: &str = "text/uri-list";
+-
+-/// Text mime types that we'll accept from other programs.
+-pub(crate) const ALLOWED_TEXT_MIME_TYPES: [&str; 2] = ["text/plain;charset=utf-8", "UTF8_STRING"];
+
+ pub(crate) struct Clipboard {
+     connection: Connection,
+@@ -96,11 +93,7 @@
+     }
+
+     fn read_text(&self, connection: &Connection) -> Option<ClipboardItem> {
+-        let mime_type = self.mime_types.iter().find(|&mime_type| {
+-            ALLOWED_TEXT_MIME_TYPES
+-                .iter()
+-                .any(|&allowed| allowed == mime_type)
+-        })?;
++        let mime_type = TEXT_MIME_TYPES.iter().find(|&&mime| self.has_mime_type(mime))?;
+         let bytes = self.read_bytes(connection, mime_type)?;
+         let text_content = match String::from_utf8(bytes) {
+             Ok(content) => content,
+@@ -153,6 +146,7 @@
+     }
+
+     pub fn set(&mut self, item: ClipboardItem) {
++        self.cached_read = Some(item.clone());
+         self.contents = Some(item);
+     }
+
+@@ -191,10 +185,10 @@
+     }
+
+     pub fn read(&mut self) -> Option<ClipboardItem> {
+-        let offer = self.current_offer.as_ref()?;
+         if let Some(cached) = self.cached_read.clone() {
+             return Some(cached);
+         }
++        let offer = self.current_offer.as_ref()?;
+
+         if offer.has_mime_type(&self.self_mime) {
+             return self.contents.clone();
 --- a/src/linux/wayland/window.rs
 +++ b/src/linux/wayland/window.rs
 @@ -776,6 +776,8 @@

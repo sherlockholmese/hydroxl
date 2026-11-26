@@ -3,6 +3,7 @@ pub mod vnc;
 
 mod damage;
 mod dbus;
+pub(crate) mod frame;
 pub(crate) mod frame_stats;
 pub mod geometry;
 mod graphics_fd;

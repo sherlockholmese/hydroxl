@@ -1,4 +1,4 @@
-use super::support::{editable, path_text, stamp, valid_target};
+use super::support::{editable, path_text, valid_target};
 use crate::backend::{self, Connection, Machine};
 use anyhow::{Context, Result, bail};
 use std::{fs, path::Path};
@@ -36,9 +36,8 @@ pub(super) fn apply_resize_disk(
         .find(|n| n.has_tag_name("source"))
         .and_then(|n| n.attribute("file"))
         .context("Only file-backed disks can be resized here.")?;
-    let info: serde_json::Value =
-        serde_json::from_str(&backend::run("qemu-img", &["info", "--output=json", path])?)?;
-    if size_gib * 1024 * 1024 * 1024 <= info["virtual-size"].as_u64().unwrap_or(u64::MAX) {
+    let info = backend::qemu::disk_info(path)?;
+    if size_gib * 1024 * 1024 * 1024 <= info.virtual_size {
         bail!("Choose a size larger than the current disk.");
     }
     backend::run("qemu-img", &["resize", path, &format!("{size_gib}G")])?;
@@ -66,33 +65,26 @@ pub(super) fn compact_disk(c: Connection, machine: &Machine, target: &str) -> Re
         .find(|n| n.has_tag_name("source"))
         .and_then(|n| n.attribute("file"))
         .context("Compaction requires a file-backed disk.")?;
-    let info: serde_json::Value =
-        serde_json::from_str(&backend::run("qemu-img", &["info", "--output=json", source])?)?;
-    if info["format"] != "qcow2" {
+    if backend::qemu::disk_info(source)?.format != "qcow2" {
         bail!("Compaction requires a QCOW2 disk.");
     }
     let original = Path::new(source);
     if fs::symlink_metadata(original)?.file_type().is_symlink() {
         bail!("Use the disk's actual file path before compacting it.");
     }
-    let temporary = original.with_file_name(format!(".hydroxl-compact-{}.qcow2", stamp()));
-    let result = (|| -> Result<()> {
-        backend::run(
-            "qemu-img",
-            &["convert", "-c", "-O", "qcow2", source, path_text(&temporary)?],
-        )?;
-        // A runtime integrity check precedes replacing a guest's only disk copy.
-        backend::run(
-            "qemu-img",
-            &["compare", "-f", "qcow2", "-F", "qcow2", source, path_text(&temporary)?],
-        )?;
-        fs::set_permissions(&temporary, fs::metadata(original)?.permissions())?;
-        fs::rename(&temporary, original)
-            .context("Could not replace the disk. The original was kept.")?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(temporary);
-    }
-    result
+    let staged = crate::files::stage(original)
+        .context("Could not create a temporary disk beside the original.")?;
+    let temporary = path_text(staged.path())?;
+    backend::run("qemu-img", &["convert", "-c", "-O", "qcow2", source, temporary])
+        .context("Could not compact the disk. Check available space beside the original.")?;
+    backend::run("qemu-img", &["compare", "-f", "qcow2", "-F", "qcow2", source, temporary])
+        .context("Could not verify the compacted disk. The original disk was kept.")?;
+    fs::set_permissions(staged.path(), fs::metadata(original)?.permissions())
+        .context("Could not preserve the disk's permissions.")?;
+    fs::File::open(staged.path())?
+        .sync_all()
+        .context("Could not finish writing the compacted disk.")?;
+    editable(c, &machine.id)?;
+    staged.persist(original).context("Could not replace the disk. The original disk was kept.")?;
+    Ok(())
 }

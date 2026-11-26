@@ -1,13 +1,22 @@
 //! The SPICE GLib client runs on one thread. GPUI only sees owned frame data and commands.
 mod api;
+mod clipboard;
+mod gpu;
+mod software;
 
-use super::damage::Damage;
+use clipboard::{
+    ClipboardRequest, on_clipboard_data, on_clipboard_grab, on_clipboard_release,
+    on_clipboard_request,
+};
+use gpu::{PendingDraw, ReadbackProfile, ScanoutLayout, on_gl_draw, on_scanout_change};
+use software::{SoftwareDisplay, on_create, on_damage, on_display_mark, on_primary_destroy};
+
+use super::frame::{Cursor, Framebuffer};
 use super::graphics_fd::GraphicsFd;
-use super::vnc::{Cursor, Framebuffer, MAX_DESKTOP_SIZE};
 use super::{keys, scanout};
 use crate::backend::{Connection, SpiceOptions};
 use anyhow::{Context, Result, ensure};
-use api::{Api, GlibError, Object, Primary};
+use api::{Api, GlibError, Object};
 use std::{
     cell::{Cell, RefCell},
     collections::{BTreeSet, HashMap},
@@ -15,7 +24,7 @@ use std::{
     os::fd::{AsRawFd, IntoRawFd},
     ptr::null_mut,
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
         mpsc,
     },
@@ -57,6 +66,7 @@ enum Message {
 }
 
 struct Worker {
+    thread: std::thread::JoinHandle<()>,
     sender: mpsc::Sender<Message>,
     api: &'static Api,
 }
@@ -94,7 +104,7 @@ pub(super) enum Input {
 pub(crate) struct Session {
     id: u64,
     pub frame: Frame,
-    worker: &'static Worker,
+    worker: Arc<Worker>,
 }
 
 impl Session {
@@ -104,17 +114,28 @@ impl Session {
         options: SpiceOptions,
         gpu: bool,
     ) -> Result<Self> {
-        static WORKER: OnceLock<Worker> = OnceLock::new();
+        static WORKER: Mutex<Option<Arc<Worker>>> = Mutex::new(None);
         static NEXT_ID: AtomicU64 = AtomicU64::new(1);
         let api = api::api()?;
-        let worker = WORKER.get_or_init(|| {
-            let (tx, rx) = mpsc::channel();
-            std::thread::spawn(move || work(api, rx));
-            Worker {
-                sender: tx,
-                api,
-            }
-        });
+        let mut shared = WORKER.lock().unwrap_or_else(|error| error.into_inner());
+        let worker =
+            if let Some(worker) = shared.as_ref().filter(|worker| !worker.thread.is_finished()) {
+                worker.clone()
+            } else {
+                let (tx, rx) = mpsc::channel();
+                let thread = std::thread::Builder::new()
+                    .name("spice-display".into())
+                    .spawn(move || work(api, rx))
+                    .context("Could not start the SPICE display client.")?;
+                let worker = Arc::new(Worker {
+                    thread,
+                    sender: tx,
+                    api,
+                });
+                *shared = Some(worker.clone());
+                worker
+            };
+        drop(shared);
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let frame = Frame::default();
         let (result, ready) = mpsc::sync_channel(1);
@@ -134,18 +155,33 @@ impl Session {
             frame,
             worker,
         };
-        ready
-            .recv_timeout(Duration::from_secs(10))
-            .context("The SPICE connection timed out.")??;
+        match ready.recv_timeout(Duration::from_secs(10)) {
+            Ok(result) => result?,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                anyhow::bail!("The SPICE display did not become ready in time.")
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                anyhow::bail!("The SPICE display client stopped before connecting.")
+            }
+        }
         Ok(session)
     }
 
     pub(super) fn send(&self, input: Input) {
-        let _ = self.worker.send(Message::Input(self.id, input));
+        self.send_active(Message::Input(self.id, input));
     }
 
     pub(super) fn request_frame(&self) {
-        let _ = self.worker.send(Message::Frame(self.id));
+        self.send_active(Message::Frame(self.id));
+    }
+
+    fn send_active(&self, message: Message) {
+        if self.worker.send(message).is_err() {
+            let mut frame = self.frame.lock().unwrap_or_else(|error| error.into_inner());
+            frame.closed.get_or_insert_with(|| {
+                "The SPICE display client stopped. Reconnect to the display.".into()
+            });
+        }
     }
 
     pub(super) fn close(&self) {
@@ -227,114 +263,6 @@ fn work(api: &'static Api, rx: mpsc::Receiver<Message>) {
     }
 }
 
-#[derive(Default)]
-struct SoftwareDisplay {
-    // Valid only on the SPICE thread, from primary-create until primary-destroy.
-    primary: Option<Primary>,
-    damage: Vec<Damage>,
-    marked: bool,
-    requested: bool,
-}
-
-impl SoftwareDisplay {
-    fn create(&mut self, primary: Primary) {
-        let (width, height) = (primary.width, primary.height);
-        self.marked = primary.marked != 0;
-        self.primary = Some(primary);
-        self.damage.clear();
-        self.invalidate(0, 0, width, height);
-    }
-
-    fn destroy(&mut self) {
-        self.primary = None;
-        self.damage.clear();
-        self.marked = false;
-    }
-
-    fn invalidate(&mut self, x: i32, y: i32, w: i32, h: i32) {
-        let Some(primary) = &self.primary else {
-            return;
-        };
-        if !(1..=MAX_DESKTOP_SIZE as i32).contains(&primary.width)
-            || !(1..=MAX_DESKTOP_SIZE as i32).contains(&primary.height)
-        {
-            return;
-        }
-        let x = x.clamp(0, primary.width) as u32;
-        let y = y.clamp(0, primary.height) as u32;
-        let w = (w.max(0) as u32).min(primary.width as u32 - x);
-        let h = (h.max(0) as u32).min(primary.height as u32 - y);
-        if w == 0 || h == 0 {
-            return;
-        }
-        let mut rect = Damage {
-            x,
-            y,
-            width: w,
-            height: h,
-        };
-        // Merge only when the union costs no more pixels than separate copies.
-        // Adjacent strips collapse; distant damage does not copy the gap.
-        let mut index = 0;
-        while index < self.damage.len() {
-            let previous = self.damage[index];
-            let left = previous.x.min(rect.x);
-            let top = previous.y.min(rect.y);
-            let right = (previous.x + previous.width).max(rect.x + rect.width);
-            let bottom = (previous.y + previous.height).max(rect.y + rect.height);
-            if u64::from(right - left) * u64::from(bottom - top)
-                <= u64::from(previous.width) * u64::from(previous.height)
-                    + u64::from(rect.width) * u64::from(rect.height)
-            {
-                self.damage.swap_remove(index);
-                rect = Damage {
-                    x: left,
-                    y: top,
-                    width: right - left,
-                    height: bottom - top,
-                };
-                index = 0;
-            } else {
-                index += 1;
-            }
-        }
-        // Bound fragmented updates just as the shared framebuffer does.
-        if self.damage.len() >= 128 {
-            self.damage.clear();
-            rect = Damage::new(0, 0, primary.width as usize, primary.height as usize);
-        }
-        self.damage.push(rect);
-    }
-
-    /// The primary must still be alive and may only be read on its owner thread.
-    unsafe fn publish(&mut self, frame: &mut Framebuffer) {
-        if !self.requested || !self.marked {
-            return;
-        }
-        self.requested = false;
-        let Some(primary) = &self.primary else {
-            return;
-        };
-        let mut updated = false;
-        for rect in self.damage.drain(..) {
-            updated |= unsafe {
-                update_frame(
-                    frame,
-                    primary,
-                    rect.x as i32,
-                    rect.y as i32,
-                    rect.width as i32,
-                    rect.height as i32,
-                )
-            };
-        }
-        if updated {
-            frame.display_error = None;
-            frame.generation += 1;
-        }
-    }
-}
-
 struct Client {
     api: &'static Api,
     attachment: GraphicsFd,
@@ -361,38 +289,8 @@ struct Client {
     readback_pixels: RefCell<Vec<u8>>,
     profile: RefCell<Option<ReadbackProfile>>,
     /// Last scanout layout described in the debug log.
-    logged_scanout: Cell<Option<(u32, u32, u32, u64, u32)>>,
+    logged_scanout: Cell<Option<ScanoutLayout>>,
     logged_scanout_visible: Cell<Option<bool>>,
-}
-
-struct ClipboardRequest {
-    revision: u64,
-    started: Instant,
-    result: mpsc::Sender<Result<String>>,
-}
-
-#[derive(Default)]
-struct ReadbackProfile {
-    milliseconds: Vec<f32>,
-    pixels: u64,
-}
-
-impl ReadbackProfile {
-    fn record(&mut self, elapsed: Duration, rect: Damage) {
-        self.milliseconds.push(elapsed.as_secs_f32() * 1000.);
-        self.pixels += u64::from(rect.width) * u64::from(rect.height);
-        if self.milliseconds.len() == 120 {
-            let mean = self.milliseconds.iter().sum::<f32>() / 120.;
-            self.milliseconds.sort_unstable_by(f32::total_cmp);
-            eprintln!(
-                "SPICE GL readback: mean {mean:.2} ms, p95 {:.2} ms, {:.2} MiB/frame (120 frames)",
-                self.milliseconds[113],
-                self.pixels as f64 * 4. / (120. * 1024. * 1024.)
-            );
-            self.milliseconds.clear();
-            self.pixels = 0;
-        }
-    }
 }
 
 impl Client {
@@ -876,282 +774,6 @@ unsafe extern "C" fn on_channel(_: Object, channel: Object, data: Object) {
     }
 }
 
-unsafe extern "C" fn on_scanout_change(_: Object, _: Object, data: Object) {
-    let client = unsafe { &*data.cast::<Client>() };
-    client.scanout.take();
-}
-
-unsafe extern "C" fn on_gl_draw(
-    channel: Object,
-    x: u32,
-    y: u32,
-    width: u32,
-    height: u32,
-    data: Object,
-) {
-    let client = unsafe { &*data.cast::<Client>() };
-    // GL draws own their publication/acknowledgment path; don't later overwrite
-    // their pixels with a pending software snapshot.
-    client.software.borrow_mut().damage.clear();
-    let debug = std::env::var_os("HYDROXL_DEBUG_DISPLAY").is_some();
-    if debug {
-        eprintln!("gl-draw {x},{y} {width}x{height}");
-    }
-    let Some(scanout) = (unsafe { client.api.scanout(channel) }) else {
-        if debug {
-            eprintln!("gl-draw without a scanout");
-        }
-        unsafe { (client.api.spice_display_channel_gl_draw_done)(channel) };
-        return;
-    };
-    let described =
-        (scanout.width, scanout.height, scanout.format, scanout.modifier, scanout.planes);
-    let first = debug && client.logged_scanout.get() != Some(described);
-    if first {
-        client.logged_scanout.set(Some(described));
-        eprintln!(
-            "SPICE GL scanout: {}x{} format {:?} modifier {:#x} planes {} stride {} offset {} top-down {} direct import {}",
-            scanout.width,
-            scanout.height,
-            String::from_utf8_lossy(&scanout.format.to_le_bytes()),
-            scanout.modifier,
-            scanout.planes,
-            scanout.strides[0],
-            scanout.offsets[0],
-            scanout.rows_are_top_down(),
-            client.gpu.get(),
-        );
-    }
-    let rect = [x, y, width, height];
-    if client.gpu.get() {
-        // Like UTM: return to GLib at once so input, cursor and audio keep flowing.
-        // The worker loop acknowledges once the producer's fence signals and the
-        // UI's GPU copy completes.
-        *client.pending.borrow_mut() = Some(PendingDraw {
-            channel,
-            scanout,
-            rect,
-            stage: Stage::Fence,
-            since: Instant::now(),
-        });
-        unsafe {
-            (client.api.g_unix_fd_add_full)(
-                0,
-                scanout.fds[0],
-                1, // G_IO_IN: the DMA-BUF's write fences have signaled.
-                wake_on_fd,
-                null_mut(),
-                None,
-            );
-        }
-        client.wake_after(DRAW_TIMEOUT);
-        client.advance_gpu_draw();
-        return;
-    }
-    client.read_back(channel, scanout, rect, false, first);
-}
-
-/// How long a GPU draw may wait on the producer's fence or the UI before it falls back.
-const DRAW_TIMEOUT: Duration = Duration::from_millis(100);
-
-struct PendingDraw {
-    channel: Object,
-    scanout: scanout::Scanout,
-    rect: [u32; 4],
-    stage: Stage,
-    since: Instant,
-}
-
-enum Stage {
-    /// The guest's GPU is still writing the buffer.
-    Fence,
-    /// Offered to the UI's next frame; the outcome reports the copy.
-    Copy(scanout::DrawOutcome),
-}
-
-unsafe extern "C" fn wake_on_fd(_: c_int, _: u32, _: Object) -> c_int {
-    0
-}
-
-impl Client {
-    fn wake_after(&self, delay: Duration) {
-        unsafe {
-            (self.api.g_timeout_add_full)(
-                0,
-                delay.as_millis() as u32 + 1,
-                wake_worker,
-                null_mut(),
-                None,
-            );
-        }
-    }
-
-    /// Moves a pending GPU draw forward without blocking the SPICE thread.
-    fn advance_gpu_draw(&self) {
-        let mut slot = self.pending.borrow_mut();
-        let Some(pending) = slot.as_mut() else {
-            return;
-        };
-        let expired = pending.since.elapsed() >= DRAW_TIMEOUT;
-        let outcome = match &pending.stage {
-            Stage::Fence => {
-                if !scanout::writes_finished(pending.scanout.fds[0]) && !expired {
-                    return;
-                }
-                let api = self.api;
-                let wake: Box<dyn Fn() + Send> = Box::new(move || unsafe {
-                    (api.g_idle_add_full)(0, wake_worker, null_mut(), None);
-                });
-                let [x, y, width, height] = pending.rect.map(|value| value as usize);
-                let damage = Damage::new(x, y, width, height);
-                match scanout::offer_scanout(&self.frame, pending.scanout, Some(damage), Some(wake))
-                {
-                    Some(reply) => {
-                        pending.stage = Stage::Copy(reply);
-                        pending.since = Instant::now();
-                        drop(slot);
-                        self.wake_after(DRAW_TIMEOUT);
-                        return;
-                    }
-                    // This layout cannot be copied on the GPU; stay on readback.
-                    None => Some(false),
-                }
-            }
-            Stage::Copy(outcome) => match outcome.try_take() {
-                Some(copied) => Some(copied),
-                None if expired => {
-                    // The UI is not drawing (hidden or minimized). Withdraw the offer and
-                    // read this frame back; once the UI owns the copy, wait for its reply.
-                    if scanout::withdraw_scanout(&self.frame) {
-                        None
-                    } else {
-                        return;
-                    }
-                }
-                None => return,
-            },
-        };
-        let Some(pending) = slot.take() else {
-            return;
-        };
-        drop(slot);
-        match outcome {
-            Some(true) => {
-                scanout::scanout_copied(&self.frame, pending.scanout);
-                if std::mem::take(&mut self.frame().preview_requested) {
-                    self.read_back(pending.channel, pending.scanout, pending.rect, true, false);
-                } else {
-                    unsafe { (self.api.spice_display_channel_gl_draw_done)(pending.channel) };
-                }
-            }
-            Some(false) => {
-                if std::env::var_os("HYDROXL_DEBUG_DISPLAY").is_some() {
-                    eprintln!("SPICE GL: direct import declined; using EGL readback.");
-                }
-                self.gpu.set(false);
-                self.read_back(pending.channel, pending.scanout, pending.rect, false, false);
-            }
-            None => self.read_back(pending.channel, pending.scanout, pending.rect, false, false),
-        }
-    }
-
-    /// Reads the scanout through EGL, publishes it (or only a thumbnail when the GPU
-    /// already copied it), then acknowledges the draw.
-    fn read_back(
-        &self,
-        channel: Object,
-        scanout: scanout::Scanout,
-        [x, y, width, height]: [u32; 4],
-        gpu_copied: bool,
-        first: bool,
-    ) {
-        let debug = first || std::env::var_os("HYDROXL_DEBUG_DISPLAY").is_some();
-        let result = (|| -> Result<()> {
-            let renderer = scanout::renderer()?;
-            let mut cache = self.scanout.borrow_mut();
-            let new_scanout = cache.as_ref().is_none_or(|(previous, _)| *previous != scanout);
-            if new_scanout {
-                *cache = Some((scanout, renderer.import(scanout)?));
-            }
-            let Some((_, imported)) = cache.as_ref() else {
-                return Ok(());
-            };
-            let (w, h) = (imported.width, imported.height);
-            let resized = {
-                let frame = self.frame();
-                frame.pixels.is_empty() || (frame.width as usize, frame.height as usize) != (w, h)
-            };
-            let (x, y) = (x as usize, y as usize);
-            let (width, height) = (width as usize, height as usize);
-            let fits = x < w && y < h && width > 0 && height > 0;
-            let rect = if gpu_copied || new_scanout || resized || !fits {
-                Damage::new(0, 0, w, h)
-            } else {
-                Damage::new(x, y, width.min(w - x), height.min(h - y))
-            };
-            let mut pixels = self.readback_pixels.borrow_mut();
-            let mut profile = self.profile.borrow_mut();
-            let started = profile.as_ref().map(|_| Instant::now());
-            // QEMU can announce the buffer before the producer finishes drawing.
-            scanout::wait_for_writes(scanout.fds[0], 100);
-            imported.read(rect, &mut pixels)?;
-
-            let full_frame =
-                rect.x == 0 && rect.y == 0 && rect.width as usize == w && rect.height as usize == h;
-            if debug && full_frame {
-                let lit = pixels.chunks_exact(4).filter(|p| p[0] | p[1] | p[2] != 0).count();
-                if self.logged_scanout_visible.replace(Some(lit > 0)) != Some(lit > 0) || first {
-                    eprintln!(
-                        "SPICE GL readback: {} of {} pixels non-black",
-                        lit,
-                        pixels.len() / 4
-                    );
-                }
-            }
-            if let Some((profile, started)) = profile.as_mut().zip(started) {
-                profile.record(started.elapsed(), rect);
-            }
-
-            let mut frame = self.frame();
-            frame.display_error = None;
-            if gpu_copied {
-                frame.thumbnail = super::thumbnail::sample(w as u32, h as u32, &pixels);
-                return Ok(());
-            }
-            if resized {
-                frame.width = w as u32;
-                frame.height = h as u32;
-                frame.discard_damage();
-            }
-            if full_frame {
-                std::mem::swap(&mut frame.pixels, &mut *pixels);
-            } else {
-                let stride = rect.width as usize * 4;
-                for (offset, row) in pixels.chunks_exact(stride).enumerate() {
-                    let start = ((rect.y as usize + offset) * w + rect.x as usize) * 4;
-                    frame.pixels[start..start + stride].copy_from_slice(row);
-                }
-            }
-            frame.mark_damage(rect);
-            frame.generation += 1;
-            Ok(())
-        })();
-        // ReadPixels completes the copy before SPICE lets QEMU reuse the producer buffer.
-        unsafe { (self.api.spice_display_channel_gl_draw_done)(channel) };
-        if let Err(error) = result
-            && !gpu_copied
-        {
-            let mut frame = self.frame();
-            if frame.display_error.is_none() {
-                let message = format!("Could not draw the SPICE GPU buffer. {error:#}");
-                eprintln!("{message}");
-                frame.display_error = Some(message);
-                frame.generation += 1;
-            }
-        }
-    }
-}
-
 unsafe extern "C" fn on_channel_destroy(_: Object, channel: Object, data: Object) {
     let client = unsafe { &*data.cast::<Client>() };
     if client.display.get() == channel {
@@ -1273,221 +895,6 @@ unsafe extern "C" fn on_main_update(channel: Object, data: Object) {
     frame.generation += 1;
 }
 
-unsafe extern "C" fn on_clipboard_request(
-    channel: Object,
-    selection: u32,
-    kind: u32,
-    data: Object,
-) -> c_int {
-    let client = unsafe { &*data.cast::<Client>() };
-    if selection != CLIPBOARD || kind != UTF8_TEXT {
-        return 0;
-    }
-    let offer = client.clipboard_offer.borrow();
-    let Some(text) = offer.as_ref() else {
-        return 0;
-    };
-    unsafe {
-        (client.api.spice_main_channel_clipboard_selection_notify)(
-            channel,
-            CLIPBOARD,
-            UTF8_TEXT,
-            text.as_ptr(),
-            text.len(),
-        )
-    };
-    1
-}
-
-/// The guest copied something. Text is fetched on demand by the display view.
-unsafe extern "C" fn on_clipboard_grab(
-    _: Object,
-    selection: u32,
-    types: *const u32,
-    ntypes: u32,
-    data: Object,
-) -> c_int {
-    let client = unsafe { &*data.cast::<Client>() };
-    if selection != CLIPBOARD || !client.options.clipboard {
-        return 0;
-    }
-    let has_text = !types.is_null()
-        && unsafe { std::slice::from_raw_parts(types, ntypes as usize) }.contains(&UTF8_TEXT);
-    client.clipboard_offer.take();
-    client.frame().guest_clipboard_changed(has_text);
-    1
-}
-
-unsafe extern "C" fn on_clipboard_release(_: Object, selection: u32, data: Object) {
-    let client = unsafe { &*data.cast::<Client>() };
-    if selection == CLIPBOARD
-        && client.options.clipboard
-        && client.clipboard_offer.borrow().is_none()
-    {
-        client.frame().guest_clipboard_changed(false);
-    }
-}
-
-unsafe extern "C" fn on_clipboard_data(
-    _: Object,
-    selection: u32,
-    kind: u32,
-    bytes: *const u8,
-    len: u32,
-    data: Object,
-) {
-    if selection != CLIPBOARD {
-        return;
-    }
-    let client = unsafe { &*data.cast::<Client>() };
-    if let Some(request) = client.clipboard_request.take() {
-        let text = if request.revision != client.frame().guest_clipboard {
-            Err(anyhow::anyhow!("The clipboard changed during the request."))
-        } else if kind != UTF8_TEXT
-            || (bytes.is_null() && len != 0)
-            || len as usize > MAX_CLIPBOARD_BYTES
-        {
-            Err(anyhow::anyhow!("The guest clipboard did not provide text."))
-        } else if len == 0 {
-            Ok(String::new())
-        } else {
-            let bytes = unsafe { std::slice::from_raw_parts(bytes, len as usize) };
-            std::str::from_utf8(bytes).map(str::to_owned).map_err(Into::into)
-        };
-        if let Ok(text) = &text {
-            client.frame().received_clipboard(text.clone());
-        }
-        let _ = request.result.send(text);
-    }
-}
-
-unsafe extern "C" fn on_create(
-    channel: Object,
-    format: c_int,
-    width: c_int,
-    height: c_int,
-    stride: c_int,
-    shmid: c_int,
-    pixels: Object,
-    data: Object,
-) {
-    let client = unsafe { &*data.cast::<Client>() };
-    let mut primary = Primary {
-        format,
-        width,
-        height,
-        stride,
-        shmid,
-        data: pixels.cast(),
-        marked: 0,
-    };
-    // Read the channel's actual readiness: it can stay marked across a resize
-    // without another display-mark signal, unlike the initial connection.
-    if unsafe { (client.api.spice_display_channel_get_primary)(channel, 0, &mut primary) } == 0 {
-        return;
-    }
-    client.software.borrow_mut().create(primary);
-}
-
-unsafe extern "C" fn on_primary_destroy(_: Object, data: Object) {
-    let client = unsafe { &*data.cast::<Client>() };
-    client.software.borrow_mut().destroy();
-}
-
-unsafe extern "C" fn on_damage(
-    _: Object,
-    x: c_int,
-    y: c_int,
-    width: c_int,
-    height: c_int,
-    data: Object,
-) {
-    let client = unsafe { &*data.cast::<Client>() };
-    if std::env::var_os("HYDROXL_DEBUG_DISPLAY").is_some() {
-        eprintln!("invalidate {x},{y} {width}x{height}");
-    }
-    client.software.borrow_mut().invalidate(x, y, width, height);
-}
-
-unsafe extern "C" fn on_display_mark(_: Object, marked: c_int, data: Object) {
-    let client = unsafe { &*data.cast::<Client>() };
-    client.software.borrow_mut().marked = marked != 0;
-}
-
-// The primary data must be valid for its dimensions and stride for this call.
-unsafe fn update_frame(
-    frame: &mut Framebuffer,
-    primary: &Primary,
-    x: i32,
-    y: i32,
-    w: i32,
-    h: i32,
-) -> bool {
-    let (width, height) = (primary.width as usize, primary.height as usize);
-    let bytes_per_pixel = match primary.format {
-        16 | 80 => 2,
-        32 | 96 => 4,
-        _ => return false,
-    };
-    if width == 0
-        || height == 0
-        || width > MAX_DESKTOP_SIZE
-        || height > MAX_DESKTOP_SIZE
-        || primary.data.is_null()
-        || (primary.stride.unsigned_abs() as usize) < width * bytes_per_pixel
-    {
-        return false;
-    }
-    let x = x.clamp(0, primary.width) as usize;
-    let y = y.clamp(0, primary.height) as usize;
-    let w = (w.max(0) as usize).min(width - x);
-    let h = (h.max(0) as usize).min(height - y);
-    let (x, y, w, h) = if frame.pixels.is_empty()
-        || (frame.width, frame.height) != (width as u32, height as u32)
-    {
-        frame.width = width as u32;
-        frame.height = height as u32;
-        frame.pixels.resize(width * height * 4, 0);
-        frame.discard_damage();
-        (0, 0, width, height)
-    } else {
-        (x, y, w, h)
-    };
-    for row in y..y + h {
-        // libspice owns the primary until primary-destroy. The decoding thread
-        // reads it here without dispatching callbacks or yielding to GLib.
-        let offset = row as isize * primary.stride as isize + (x * bytes_per_pixel) as isize;
-        let source =
-            unsafe { std::slice::from_raw_parts(primary.data.offset(offset), w * bytes_per_pixel) };
-        let start = (row * width + x) * 4;
-        let dest = &mut frame.pixels[start..start + w * 4];
-        if bytes_per_pixel == 4 {
-            dest.copy_from_slice(source);
-            for pixel in dest.chunks_exact_mut(4) {
-                pixel[3] = 255;
-            }
-        } else {
-            let green_bits = if primary.format == 80 {
-                6
-            } else {
-                5
-            };
-            let green_mask = (1 << green_bits) - 1;
-            for (source, pixel) in source.chunks_exact(2).zip(dest.chunks_exact_mut(4)) {
-                let value = u16::from_le_bytes([source[0], source[1]]);
-                pixel.copy_from_slice(&[
-                    ((value & 31) * 255 / 31) as u8,
-                    (((value >> 5) & green_mask) * 255 / green_mask) as u8,
-                    (((value >> (5 + green_bits)) & 31) * 255 / 31) as u8,
-                    255,
-                ]);
-            }
-        }
-    }
-    frame.mark_damage(Damage::new(x, y, w, h));
-    true
-}
-
 unsafe extern "C" fn on_cursor(
     _: Object,
     w: i32,
@@ -1502,7 +909,7 @@ unsafe extern "C" fn on_cursor(
     }
     let client = unsafe { &*data.cast::<Client>() };
     let mut rgba = unsafe { std::slice::from_raw_parts(pixels, (w * h * 4) as usize) }.to_vec();
-    for pixel in rgba.chunks_exact_mut(4) {
+    for pixel in rgba.as_chunks_mut::<4>().0 {
         pixel.swap(0, 2);
     }
     let mut frame = client.frame();
@@ -1568,7 +975,13 @@ mod tests {
             }
             if frame.generation != last && !frame.pixels.is_empty() {
                 last = frame.generation;
-                let lit = frame.pixels.chunks_exact(4).filter(|p| p[0] | p[1] | p[2] != 0).count();
+                let lit = frame
+                    .pixels
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .filter(|p| p[0] | p[1] | p[2] != 0)
+                    .count();
                 eprintln!(
                     "frame {}x{} generation {} lit {}/{}",
                     frame.width,
@@ -1580,125 +993,6 @@ mod tests {
             }
         }
         session.close();
-    }
-
-    #[test]
-    fn software_snapshots_coalesce_and_follow_primary_lifetime() {
-        let (width, height) = (3840usize, 3usize);
-        let mut canvas = [3, 5, 7, 0].repeat(width * height);
-        let mut software = SoftwareDisplay::default();
-        software.create(Primary {
-            format: 32,
-            width: width as i32,
-            height: height as i32,
-            stride: width as i32 * 4,
-            shmid: -1,
-            data: canvas.as_ptr(),
-            marked: 0,
-        });
-        let mut frame = Framebuffer::default();
-        software.requested = true;
-        unsafe { software.publish(&mut frame) };
-        assert!(frame.pixels.is_empty(), "primary-create is not display readiness");
-        software.marked = true;
-        unsafe { software.publish(&mut frame) };
-        let original = [3, 5, 7, 255].repeat(width * height);
-        assert_eq!(frame.pixels, original);
-        frame.discard_damage();
-        let generation = frame.generation;
-
-        // Model a 4K-wide refresh as 120 strips. No intermediate canvas state
-        // should become visible before the consumer requests another snapshot.
-        for strip in 0..120 {
-            for x in strip * 32..(strip + 1) * 32 {
-                let start = (width + x) * 4;
-                canvas[start..start + 4].copy_from_slice(&[strip as u8, 11, 19, 0]);
-            }
-            software.invalidate(strip as i32 * 32, 1, 32, 1);
-            unsafe { software.publish(&mut frame) };
-        }
-        assert_eq!(frame.pixels, original);
-        assert_eq!(frame.generation, generation);
-        // Read the live canvas at publication, not bytes captured when damaged.
-        canvas[width * 4..width * 4 + 4].copy_from_slice(&[251, 13, 17, 0]);
-        software.requested = true;
-        unsafe { software.publish(&mut frame) };
-        let mut expected = original;
-        for x in 0..width {
-            let pixel = if x == 0 {
-                [251, 13, 17, 255]
-            } else {
-                [(x / 32) as u8, 11, 19, 255]
-            };
-            expected[(width + x) * 4..(width + x + 1) * 4].copy_from_slice(&pixel);
-        }
-        assert_eq!(frame.pixels, expected);
-        assert_eq!(frame.generation, generation + 1);
-        let patches = frame.take_damage();
-        assert_eq!(patches.len(), 1);
-        assert_eq!(patches[0].0, Damage::new(0, 1, width, 1));
-        assert_eq!(patches[0].1, expected[width * 4..width * 8]);
-
-        // Distant changes must not turn into a full-frame copy. The unannounced
-        // pixel between them makes a bounding-box implementation visibly wrong.
-        canvas[0..4].copy_from_slice(&[67, 71, 73, 0]);
-        canvas[4..8].copy_from_slice(&[99, 101, 103, 0]);
-        let last = (width * height - 1) * 4;
-        canvas[last..last + 4].copy_from_slice(&[79, 83, 89, 0]);
-        software.invalidate(0, 0, 1, 1);
-        software.invalidate(width as i32 - 1, height as i32 - 1, 1, 1);
-        software.requested = true;
-        unsafe { software.publish(&mut frame) };
-        expected[0..4].copy_from_slice(&[67, 71, 73, 255]);
-        expected[last..last + 4].copy_from_slice(&[79, 83, 89, 255]);
-        assert_eq!(frame.pixels, expected);
-        assert_eq!(frame.generation, generation + 2);
-        let mut patches = frame.take_damage();
-        patches.sort_by_key(|(rect, _)| (rect.y, rect.x));
-        assert_eq!(patches.len(), 2);
-        assert_eq!(patches[0], (Damage::new(0, 0, 1, 1), vec![67, 71, 73, 255]));
-        assert_eq!(patches[1], (Damage::new(width - 1, height - 1, 1, 1), vec![79, 83, 89, 255]));
-
-        software.destroy();
-        drop(canvas); // Publishing after primary-destroy must not read this address.
-        software.requested = true;
-        unsafe { software.publish(&mut frame) };
-        assert_eq!(frame.pixels, expected);
-        assert_eq!(frame.generation, generation + 2);
-        assert!(frame.take_damage().is_empty());
-
-        let resized = [41, 43, 47, 0, 53, 59, 61, 0];
-        // The channel can retain its mark across a resolution change without
-        // emitting another display-mark signal.
-        software.create(Primary {
-            format: 32,
-            width: 1,
-            height: 2,
-            stride: 4,
-            shmid: -1,
-            data: resized.as_ptr(),
-            marked: 1,
-        });
-        unsafe { software.publish(&mut frame) };
-        assert_eq!((frame.width, frame.height), (1, 2));
-        assert_eq!(frame.pixels, [41, 43, 47, 255, 53, 59, 61, 255]);
-    }
-
-    #[test]
-    fn accepts_padded_and_bottom_up_spice_frames() {
-        let rgb565 = [0x00, 0xf8, 0, 0, 0x1f, 0, 0, 0];
-        let primary = Primary {
-            format: 80,
-            width: 1,
-            height: 2,
-            stride: -4,
-            shmid: -1,
-            data: rgb565[4..].as_ptr(),
-            marked: 1,
-        };
-        let mut frame = Framebuffer::default();
-        unsafe { update_frame(&mut frame, &primary, 0, 0, 1, 2) };
-        assert_eq!(frame.pixels, [255, 0, 0, 255, 0, 0, 255, 255]);
     }
 
     #[test]

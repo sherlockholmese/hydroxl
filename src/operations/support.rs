@@ -1,25 +1,10 @@
 use crate::backend::{self, Connection};
+pub(super) use crate::{files::path_text, xml::escape as esc};
 use anyhow::{Context, Result, bail};
-use std::{
-    fs,
-    path::Path,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub(super) fn stamp() -> u128 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or_default()
-}
-
-pub(super) fn esc(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
-}
-
-pub(super) fn path_text(path: &Path) -> Result<&str> {
-    path.to_str().context("Choose a path with a valid UTF-8 name.")
 }
 
 pub(super) fn stopped(c: Connection, id: &str) -> Result<()> {
@@ -27,11 +12,8 @@ pub(super) fn stopped(c: Connection, id: &str) -> Result<()> {
 }
 
 pub(super) fn temporary_xml<T>(xml: &str, f: impl FnOnce(&str) -> Result<T>) -> Result<T> {
-    let path = std::env::temp_dir().join(format!("hydroxl-{}-{}.xml", std::process::id(), stamp()));
-    fs::write(&path, xml).context("Could not write the configuration.")?;
-    let result = f(path_text(&path)?);
-    let _ = fs::remove_file(path);
-    result
+    let file = crate::xml::temporary(xml)?;
+    f(path_text(file.path())?)
 }
 
 pub(super) fn attach(c: Connection, id: &str, xml: &str) -> Result<()> {
@@ -62,11 +44,12 @@ pub(super) fn replace_child(
     tag: &str,
     replacement: &str,
 ) -> Result<String> {
-    let doc = roxmltree::Document::parse(xml)?;
+    let doc =
+        roxmltree::Document::parse(xml).context("Could not read the machine configuration XML.")?;
     let node = doc
         .descendants()
         .find(|n| n.has_tag_name(parent))
-        .context("The configuration section is missing.")?;
+        .with_context(|| format!("The machine configuration is missing its {parent} section."))?;
     if let Some(child) = node.children().find(|n| n.has_tag_name(tag)) {
         let mut result = xml.to_owned();
         result.replace_range(child.range(), replacement);
@@ -79,24 +62,15 @@ pub(super) fn replace_child(
 }
 
 pub(super) fn append_child(xml: &str, parent: &str, child: &str) -> Result<String> {
-    let doc = roxmltree::Document::parse(xml)?;
+    let doc =
+        roxmltree::Document::parse(xml).context("Could not read the machine configuration XML.")?;
     let node = doc
         .descendants()
         .find(|n| n.has_tag_name(parent))
-        .context("The configuration section is missing.")?;
-    let text = &xml[node.range()];
+        .with_context(|| format!("The machine configuration is missing its {parent} section."))?;
     let mut result = xml.to_owned();
-    if text.ends_with("/>") {
-        let start = node.range().start;
-        let end = node.range().end;
-        result.replace_range(
-            start..end,
-            &format!("{}>{}</{}>", &text[..text.len() - 2], child, parent),
-        );
-    } else {
-        let at = node.range().end - parent.len() - 3;
-        result.insert_str(at, child);
-    }
+    let (range, replacement) = crate::xml::append_child(xml, node, child)?;
+    result.replace_range(range, &replacement);
     Ok(result)
 }
 

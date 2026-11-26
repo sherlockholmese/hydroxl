@@ -1,8 +1,7 @@
 //! Host networking a guest can attach to: libvirt virtual networks and host bridges.
-use super::{Connection, run, virsh};
+use super::{Connection, run, run_with_input, virsh};
 use anyhow::{Context, Result, bail};
-use std::io::Write;
-use std::process::{Command, Stdio};
+use std::io::ErrorKind;
 
 #[derive(Clone, Debug)]
 pub enum HostNetwork {
@@ -87,14 +86,19 @@ pub fn create(connection: Connection, network: &HostNetwork) -> Result<()> {
                 "<network><name>{name}</name>{forward}<bridge stp='on' delay='0'/>\
                  <ip address='{gateway}' netmask='{netmask}'><dhcp><range start='{start}' end='{end}'/></dhcp></ip></network>"
             );
-            let path = std::env::temp_dir().join(format!("hydroxl-net-{}.xml", std::process::id()));
-            std::fs::write(&path, xml)?;
-            let defined =
-                virsh(connection, &["net-define", path.to_str().context("Invalid path.")?]);
-            let _ = std::fs::remove_file(&path);
-            defined?;
-            virsh(connection, &["net-start", name])?;
-            virsh(connection, &["net-autostart", name])?;
+            let existing = virsh(connection, &["net-list", "--all", "--name"])
+                .context("Could not check for existing virtual networks.")?;
+            if existing.lines().any(|existing| existing == name) {
+                bail!("A virtual network with this name already exists. Choose another name.");
+            }
+            let file = crate::xml::temporary(&xml)?;
+            let path = crate::files::path_text(file.path())?;
+            virsh(connection, &["net-define", path])
+                .context("Could not define the virtual network. Check its name and subnet.")?;
+            virsh(connection, &["net-start", name])
+                .context("The network was created. Check its state and subnet in Libvirt before trying to start it again.")?;
+            virsh(connection, &["net-autostart", name])
+                .context("The network was started. Libvirt could not enable automatic startup.")?;
             Ok(())
         }
         HostNetwork::Bridge {
@@ -141,10 +145,12 @@ pub fn create(connection: Connection, network: &HostNetwork) -> Result<()> {
                     "con-name",
                     &port,
                 ],
-            )?;
-            run("nmcli", &["connection", "up", name])?;
+            )
+            .context("The bridge was created. NetworkManager could not add the wired interface. Check the bridge before retrying.")?;
+            run("nmcli", &["connection", "up", name])
+                .context("The bridge was created. NetworkManager could not activate it. Check its state before retrying.")?;
             if connection == Connection::Session {
-                allow_session_bridge(name)?;
+                allow_session_bridge(name).context("The bridge was created. To use it in the user session, authorize it in the QEMU bridge configuration.")?;
             }
             Ok(())
         }
@@ -155,23 +161,18 @@ pub fn create(connection: Connection, network: &HostNetwork) -> Result<()> {
 /// listed in /etc/qemu/bridge.conf. Appends one line through polkit's pkexec.
 fn allow_session_bridge(name: &str) -> Result<()> {
     let line = format!("allow {name}");
-    let current = std::fs::read_to_string("/etc/qemu/bridge.conf").unwrap_or_default();
+    let current = match std::fs::read_to_string("/etc/qemu/bridge.conf") {
+        Ok(current) => current,
+        // A root-only or missing file can still be updated after polkit authorizes tee.
+        Err(error) if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::PermissionDenied) => {
+            String::new()
+        }
+        Err(error) => return Err(error).context("Could not read the QEMU bridge configuration."),
+    };
     if current.lines().any(|l| l.trim() == line) {
         return Ok(());
     }
-    let mut child = Command::new("pkexec")
-        .args(["tee", "-a", "/etc/qemu/bridge.conf"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .spawn()
-        .context("Install polkit to allow the bridge for user-session machines.")?;
-    child
-        .stdin
-        .take()
-        .context("pkexec input unavailable.")?
-        .write_all(format!("{line}\n").as_bytes())?;
-    if !child.wait()?.success() {
-        bail!("The bridge was created, but allowing it for user-session machines was cancelled.");
-    }
+    run_with_input("pkexec", &["tee", "-a", "/etc/qemu/bridge.conf"], format!("{line}\n"))
+        .context("Could not authorize the bridge through polkit.")?;
     Ok(())
 }

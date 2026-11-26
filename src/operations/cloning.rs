@@ -1,4 +1,4 @@
-use super::support::{editable, esc, path_text, stamp, stopped, temporary_xml, valid_name};
+use super::support::{editable, esc, path_text, stamp, stopped, valid_name};
 use crate::backend::{self, Connection, Machine};
 use anyhow::{Context, Result, bail};
 use std::fs;
@@ -63,10 +63,7 @@ pub(super) fn clone_configuration(c: Connection, machine: &Machine, name: &str) 
             let file = source
                 .attribute("file")
                 .context("Configuration cloning requires file-backed disks.")?;
-            let info: serde_json::Value =
-                serde_json::from_str(&backend::run("qemu-img", &["info", "--output=json", file])?)?;
-            let size =
-                info["virtual-size"].as_u64().context("Could not read a disk size.")?.to_string();
+            let size = backend::qemu::disk_info(file)?.virtual_size.to_string();
             let new = folder.join(format!("disk-{i}.qcow2"));
             backend::run("qemu-img", &["create", "-f", "qcow2", path_text(&new)?, &size])?;
             edits.push((source.range(), format!("<source file='{}'/>", esc(path_text(&new)?))));
@@ -74,12 +71,9 @@ pub(super) fn clone_configuration(c: Connection, machine: &Machine, name: &str) 
                 edits.push((driver.range(), "<driver name='qemu' type='qcow2'/>".into()));
             }
         }
-        edits.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
-        for (range, replacement) in edits {
-            xml.replace_range(range, &replacement);
-        }
+        crate::xml::apply_edits(&mut xml, edits)?;
         registration_attempted = true;
-        temporary_xml(&xml, |path| backend::virsh(c, &["define", path]).map(|_| ()))?;
+        backend::define_xml(c, &xml)?;
         Ok(())
     })();
     if result.is_err() && !registration_attempted {

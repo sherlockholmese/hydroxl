@@ -34,13 +34,13 @@ pub fn open(spec: FormSpec, parent: WeakEntity<Workspace>, window: &mut Window, 
     let closing = form.downgrade();
     let first = Cell::new(true);
     window.open_dialog(cx, move |dialog, window, cx| {
-        if first.replace(false) {
-            if let Some(field) = form.read(cx).fields.first() {
-                match &field.control {
-                    Control::Text(state) => state.focus_handle(cx).focus(window, cx),
-                    Control::Multiline(state) => state.focus_handle(cx).focus(window, cx),
-                    Control::Select(_) | Control::Checkbox(_) => {}
-                }
+        if first.replace(false)
+            && let Some(field) = form.read(cx).fields.first()
+        {
+            match &field.control {
+                Control::Text(state) => state.focus_handle(cx).focus(window, cx),
+                Control::Multiline(state) => state.focus_handle(cx).focus(window, cx),
+                Control::Select(_) | Control::Checkbox(_) => {}
             }
         }
         frame(dialog, title.clone(), width)

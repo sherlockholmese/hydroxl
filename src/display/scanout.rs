@@ -1,7 +1,7 @@
 //! EGL readback for SPICE's local GL scanouts. All EGL resources stay on the SPICE worker.
 use super::{
     damage::Damage,
-    vnc::{Framebuffer, MAX_DESKTOP_SIZE},
+    frame::{Framebuffer, MAX_DESKTOP_SIZE},
 };
 use anyhow::{Context, Result, ensure};
 use gpui_kit::{Bounds, DevicePixels, DmaBufFrame, point, size};
@@ -310,7 +310,7 @@ impl Imported {
             );
             ensure!((egl.glGetError)() == 0, "Could not read the SPICE GPU buffer.");
         }
-        for rgba in pixels.chunks_exact_mut(4) {
+        for rgba in pixels.as_chunks_mut::<4>().0 {
             rgba.swap(0, 2);
             rgba[3] = 255;
         }

@@ -1,4 +1,4 @@
-use super::support::{append_child, editable, esc, replace_child, temporary_xml};
+use super::support::{append_child, editable, esc, replace_child};
 use super::{DisplaySettings, GuestOs, sharing::with_shared_memory};
 use crate::backend::{self, Connection, Machine};
 use anyhow::{Context, Result, bail};
@@ -147,7 +147,7 @@ pub(super) fn apply_display(
             xml = updated;
         }
     }
-    temporary_xml(&xml, |path| backend::virsh(c, &["define", path]).map(|_| ()))
+    backend::define_xml(c, &xml)
 }
 
 fn display_settings(
@@ -176,11 +176,11 @@ fn display_settings(
     }
     let windows = GuestOs::of(machine) == GuestOs::Windows;
     let doc = roxmltree::Document::parse(&xml)?;
-    let caps = accel3d
-        .then(|| {
-            backend::gpu_features(&machine.arch, backend::qemu::domain_emulator(doc.root_element()))
-        })
-        .unwrap_or_default();
+    let caps = if accel3d {
+        backend::gpu_features(&machine.arch, backend::qemu::domain_emulator(doc.root_element()))
+    } else {
+        Default::default()
+    };
     let neptune = accel3d && windows;
     if neptune && !backend::triton_arch(&machine.arch) {
         bail!(backend::TRITON_ARCH_UNSUPPORTED);

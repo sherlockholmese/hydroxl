@@ -2,18 +2,13 @@
 //! keep their settings. USB devices are redirected only when selected in the viewer.
 use super::{Connection, virsh};
 use anyhow::{Context, Result};
-use std::io::Write;
 
 pub(super) fn prepare(connection: Connection, id: &str) -> Result<()> {
     let xml = virsh(connection, &["dumpxml", id, "--inactive"])?;
     let Some(updated) = prepare_xml(&xml)? else {
         return Ok(());
     };
-    let mut file = tempfile::Builder::new().suffix(".xml").tempfile()?;
-    file.write_all(updated.as_bytes())?;
-    let path = file.path().to_str().context("Invalid configuration path.")?;
-    virsh(connection, &["define", path])?;
-    Ok(())
+    super::define_xml(connection, &updated)
 }
 
 fn prepare_xml(xml: &str) -> Result<Option<String>> {
@@ -21,7 +16,7 @@ fn prepare_xml(xml: &str) -> Result<Option<String>> {
     let compatible = remove_vnc_for_spice_gl(xml)?;
     let xml = compatible.as_deref().unwrap_or(xml);
     let doc = roxmltree::Document::parse(xml)?;
-    if doc.descendants().any(super::library::is_peer_dbus) {
+    if doc.descendants().any(super::is_peer_dbus) {
         return Ok(None);
     }
     let devices = doc
@@ -79,13 +74,14 @@ fn prepare_xml(xml: &str) -> Result<Option<String>> {
             .push_str("<redirdev bus='usb' type='spicevmc'/><redirdev bus='usb' type='spicevmc'/>");
     }
     let mut edited = xml.to_owned();
-    let range = devices.range();
-    if xml[range.clone()].ends_with("/>") {
-        edited
-            .replace_range(range.end - 2..range.end, &format!(">{new_spice}{additions}</devices>"));
+    let (closing, addition) = crate::xml::append_child(xml, devices, &additions)?;
+    if !closing.is_empty() {
+        let (range, replacement) =
+            crate::xml::append_child(xml, devices, &format!("{new_spice}{additions}"))?;
+        edited.replace_range(range, &replacement);
     } else {
-        let end = range.end - "</devices>".len();
-        edited.insert_str(end, &additions);
+        let end = closing.start;
+        edited.insert_str(end, &addition);
         match (first_graphics, spice) {
             (Some(first), Some(spice)) if first != spice => {
                 let definition = &xml[spice.range()];
@@ -166,21 +162,11 @@ fn local_encoding(xml: &str) -> Result<Option<String>> {
     if edits.is_empty() && missing.is_empty() {
         return Ok(None);
     }
-    let text = &xml[spice.range()];
     if !missing.is_empty() {
-        if text.ends_with("/>") {
-            edits
-                .push((spice.range(), format!("{}>{missing}</graphics>", &text[..text.len() - 2])));
-        } else {
-            let at = spice.range().end - "</graphics>".len();
-            edits.push((at..at, missing));
-        }
+        edits.push(crate::xml::append_child(xml, spice, &missing)?);
     }
     let mut edited = xml.to_owned();
-    edits.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
-    for (range, text) in edits {
-        edited.replace_range(range, &text);
-    }
+    crate::xml::apply_edits(&mut edited, edits)?;
     Ok(Some(edited))
 }
 
@@ -211,18 +197,14 @@ fn enable_gl_scanout(xml: &str) -> Result<Option<String>> {
     else {
         return Ok(None);
     };
-    let text = &xml[spice.range()];
     let mut edited = xml.to_owned();
-    if text.ends_with("/>") {
-        edited.replace_range(
-            spice.range(),
-            &format!("{}><gl enable='yes'/></graphics>", &text[..text.len() - 2]),
-        );
-    } else if let Some(gl) = spice.children().find(|c| c.has_tag_name("gl")) {
-        edited.replace_range(gl.range(), "<gl enable='yes'/>");
+    let new_gl = "<gl enable='yes'/>";
+    let (range, replacement) = if let Some(gl) = spice.children().find(|c| c.has_tag_name("gl")) {
+        (gl.range(), new_gl.to_owned())
     } else {
-        edited.insert_str(spice.range().end - "</graphics>".len(), "<gl enable='yes'/>");
-    }
+        crate::xml::append_child(xml, spice, new_gl)?
+    };
+    edited.replace_range(range, &replacement);
     Ok(Some(remove_vnc_for_spice_gl(&edited)?.unwrap_or(edited)))
 }
 
@@ -246,7 +228,10 @@ pub(crate) fn route_audio(xml: &str, backend: &str) -> Result<Option<String>> {
             edited.replace_range(audio.range(), &element);
         }
         Some(_) => return Ok(None),
-        None => edited.insert_str(devices.range().end - "</devices>".len(), &element),
+        None => {
+            let (range, replacement) = crate::xml::append_child(xml, devices, &element)?;
+            edited.replace_range(range, &replacement);
+        }
     }
     Ok(Some(edited))
 }

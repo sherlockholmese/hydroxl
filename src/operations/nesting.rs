@@ -1,5 +1,5 @@
 //! Expose the host's virtualization extensions to an x86 KVM guest.
-use super::support::{append_child, editable, temporary_xml};
+use super::support::{append_child, editable};
 use crate::backend::{self, Connection, Machine};
 use anyhow::{Context, Result, ensure};
 
@@ -58,7 +58,7 @@ pub(super) fn apply(c: Connection, machine: &Machine, enabled: bool) -> Result<(
         }
     }
     if result != xml {
-        temporary_xml(&result, |path| backend::virsh(c, &["define", path]).map(|_| ()))?;
+        backend::define_xml(c, &result)?;
     }
     Ok(())
 }

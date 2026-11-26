@@ -1,4 +1,4 @@
-use super::primitives::{logo_tile, plain_error, segmented, status_color};
+use super::primitives::{error_line, logo_tile, plain_error, segmented, status_color};
 use crate::NewMachineAction;
 use crate::app::Workspace;
 use crate::backend::{Action, State};
@@ -112,7 +112,7 @@ impl Workspace {
             );
 
         let content = match self.tab {
-            1 => self.hardware(machine, cx),
+            1 => self.hardware(machine, narrow, cx),
             2 => self.snapshots(machine, cx),
             _ => self.overview(machine, narrow, cx),
         };
@@ -194,27 +194,15 @@ impl Workspace {
                                 .mx_auto()
                                 .w_full()
                                 .gap_6()
-                                .when_some(
-                                    self.details_error.clone().filter(|_| self.tab != 0),
-                                    |this, error| {
-                                        this.child(
-                                            h_flex()
-                                                .gap_2()
-                                                .text_color(p.danger)
-                                                .child(
-                                                    Icon::new(Glyph::CircleAlert)
-                                                        .size_4()
-                                                        .flex_shrink_0(),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .min_w_0()
-                                                        .flex_1()
-                                                        .child(plain_error(&error)),
-                                                ),
-                                        )
-                                    },
-                                )
+                                .when_some(self.details_error.as_deref(), |pane, error| {
+                                    pane.child(
+                                        v_flex()
+                                            .gap_2()
+                                            .items_start()
+                                            .child(error_line(error, p))
+                                            .child(self.retry_refresh("retry-machine-details", cx)),
+                                    )
+                                })
                                 .child(
                                     // A new tab or machine settles in place: one plane, one
                                     // short fade with a few pixels of travel.
@@ -269,7 +257,11 @@ impl Workspace {
                                                 .as_ref()
                                                 .is_some_and(|job| job.hardware_save.is_some()),
                                         )
-                                        .disabled(busy || leaving)
+                                        .disabled(
+                                            busy || leaving
+                                                || self.details_error.is_some()
+                                                || self.memory_error().is_some(),
+                                        )
                                         .on_click(
                                             cx.listener(|this, _, _, cx| this.save_hardware(cx)),
                                         ),
@@ -290,6 +282,14 @@ impl Workspace {
                 )
             })
             .into_any_element()
+    }
+
+    pub(super) fn retry_refresh(&self, id: &'static str, cx: &mut Context<Self>) -> Button {
+        Button::new(id).outline().small().label("Retry").disabled(self.pending.is_some()).on_click(
+            cx.listener(|this, _, _, cx| {
+                this.begin(crate::app::Job::Refresh, None, cx);
+            }),
+        )
     }
 
     /// Main pane before a machine exists or while the library connects.
@@ -323,11 +323,7 @@ impl Workspace {
                         .text_color(p.muted)
                         .child(plain_error(error)),
                 )
-                .child(Button::new("retry-connection").outline().label("Retry").on_click(
-                    cx.listener(|this, _, _, cx| {
-                        this.begin(crate::app::Job::Refresh, None, cx);
-                    }),
-                ))
+                .child(self.retry_refresh("retry-connection", cx))
                 .into_any_element();
         }
         center
