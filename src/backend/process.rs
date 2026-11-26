@@ -1,11 +1,31 @@
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 use std::{
+    cell::Cell,
     io::{self, BufReader, Read, Write},
     os::unix::process::CommandExt,
     process::{Command, ExitStatus, Stdio},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
+
+thread_local! {
+    static COMMAND_DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };
+}
+
+/// Share one deadline across the commands in a read or best-effort setup.
+pub(crate) fn with_command_deadline<T>(deadline: Instant, run: impl FnOnce() -> T) -> T {
+    struct RestoreDeadline(Option<Instant>);
+    impl Drop for RestoreDeadline {
+        fn drop(&mut self) {
+            COMMAND_DEADLINE.set(self.0);
+        }
+    }
+    let previous = COMMAND_DEADLINE.get();
+    let _restore = RestoreDeadline(previous);
+    COMMAND_DEADLINE.set(Some(previous.map_or(deadline, |previous| previous.min(deadline))));
+    run()
+}
+
 pub(crate) fn run(program: &str, args: &[&str]) -> Result<String> {
     run_inner(program, args, None, None)
 }
@@ -31,7 +51,9 @@ pub(crate) fn launch_desktop(mut command: Command) -> Result<()> {
             }
         })
         .context("Could not start the desktop application launcher.")?;
-    ready.recv().context("The desktop application launcher stopped unexpectedly.")??;
+    ready
+        .recv_timeout(Duration::from_secs(10))
+        .context("The desktop application launcher did not report a result.")??;
     Ok(())
 }
 
@@ -183,6 +205,7 @@ fn qemu_percent(chunk: &str) -> Option<u8> {
 fn command_label(program: &str, args: &[&str]) -> String {
     match args {
         ["--connect", _, command, ..] if program == "virsh" => format!("Libvirt ({command})"),
+        [command, ..] if program == "qemu-img" => format!("qemu-img {command}"),
         _ => program.to_owned(),
     }
 }
@@ -193,11 +216,16 @@ fn run_inner(
     progress: Option<Meter>,
     input: Option<String>,
 ) -> Result<String> {
-    run_with_timeout(program, args, progress, input, command_timeout(program, args))
+    let mut timeout = command_timeout(program, args);
+    if let Some(deadline) = COMMAND_DEADLINE.get() {
+        timeout = timeout.min(deadline.saturating_duration_since(Instant::now()));
+    }
+    run_with_timeout(program, args, progress, input, timeout)
 }
 
 fn command_timeout(program: &str, args: &[&str]) -> Duration {
-    let long_operation = matches!(program, "curl" | "qemu-img" | "virt-clone")
+    let long_operation = matches!(program, "curl" | "virt-clone")
+        || (program == "qemu-img" && !matches!(args, ["create" | "info", ..]))
         || matches!(
             args,
             ["--connect", _, "dump" | "managedsave" | "snapshot-create-as" | "snapshot-revert", ..]
@@ -218,6 +246,10 @@ fn run_with_timeout(
     input: Option<String>,
     timeout: Duration,
 ) -> Result<String> {
+    if timeout.is_zero() {
+        return Err(timeout_error(program, args, timeout));
+    }
+    let start = Instant::now();
     let executable = if program == "qemu-img" {
         super::qemu::image_tool()?
     } else {
@@ -269,7 +301,6 @@ fn run_with_timeout(
         } else {
             None
         };
-        let start = Instant::now();
         loop {
             // Hold the child PID until the pipes close or cleanup is needed.
             // Reaping it sooner would allow its process-group ID to be reused.
@@ -283,13 +314,7 @@ fn run_with_timeout(
                 return Ok((status, out, err, writer));
             }
             if start.elapsed() >= timeout {
-                let label = command_label(program, args);
-                if program == "virsh" {
-                    bail!(
-                        "{label} timed out. Refresh the library to check the result before trying again."
-                    );
-                }
-                bail!("{label} timed out after {} seconds.", timeout.as_secs_f64());
+                return Err(timeout_error(program, args, timeout));
             }
             thread::sleep(Duration::from_millis(40));
         }
@@ -334,6 +359,28 @@ fn run_with_timeout(
     output
 }
 
+#[derive(Debug)]
+pub(crate) struct CommandTimedOut(String);
+
+impl std::fmt::Display for CommandTimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for CommandTimedOut {}
+
+fn timeout_error(program: &str, args: &[&str], timeout: Duration) -> anyhow::Error {
+    let label = command_label(program, args);
+    let message = if program == "virsh" {
+        format!("{label} timed out. Refresh the library to check the result before trying again.")
+    } else if timeout.is_zero() {
+        format!("The command deadline expired before {label} could run.")
+    } else {
+        format!("{label} timed out after {:.1} seconds.", timeout.as_secs_f64())
+    };
+    CommandTimedOut(message).into()
+}
 fn empty_diagnostic(program: &str, args: &[&str], status: ExitStatus) -> anyhow::Error {
     anyhow!("{} failed ({status}) without a diagnostic.", command_label(program, args))
 }
@@ -428,6 +475,29 @@ mod tests {
         .unwrap_err();
         assert!(error.to_string().contains("timed out"));
         assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn bounds_disk_preparation_separately_from_long_image_operations() {
+        for command in ["create", "info"] {
+            assert_eq!(command_timeout("qemu-img", &[command]), Duration::from_secs(30));
+        }
+        for command in ["convert", "compare", "resize"] {
+            assert_eq!(command_timeout("qemu-img", &[command]), Duration::from_secs(3600));
+        }
+    }
+
+    #[test]
+    fn command_deadline_is_shared_and_never_extended_by_nested_scopes() {
+        let deadline = Instant::now() + Duration::from_millis(150);
+        with_command_deadline(deadline, || {
+            let timed_out = with_command_deadline(deadline + Duration::from_secs(10), || {
+                run("sh", &["-c", "sleep 5"])
+            });
+            assert!(timed_out.unwrap_err().is::<CommandTimedOut>());
+            assert!(run("sh", &["-c", "exit 0"]).unwrap_err().is::<CommandTimedOut>());
+        });
+        assert_eq!(run("sh", &["-c", "printf ready"]).unwrap(), "ready");
     }
 
     #[test]

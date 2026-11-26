@@ -1,4 +1,4 @@
-use super::{DisplayView, toolbar::TOOLBAR_HEIGHT};
+use super::{CAPTURED_KEY_CONTEXT, DisplayView, toolbar::TOOLBAR_HEIGHT};
 use crate::backend::State;
 use crate::display::{geometry::GuestViewport, vnc};
 use crate::theme::Palette;
@@ -25,6 +25,7 @@ impl Render for DisplayView {
             .overflow_hidden()
             .bg(gpui_kit::black())
             .track_focus(&self.focus)
+            .when(self.captured, |surface| surface.key_context(CAPTURED_KEY_CONTEXT))
             .child(canvas(move |b, _, _| bounds.set(b), |_, _, _, _| {}).absolute().size_full())
             .when_some(self.image, |this, image| {
                 this.child(

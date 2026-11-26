@@ -33,7 +33,11 @@ impl ShareDriver {
     }
 
     pub fn from_xml(xml: &str) -> Self {
-        if xml.contains("virtiofs") {
+        if roxmltree::Document::parse(xml).is_ok_and(|doc| {
+            doc.root_element().children().any(|node| {
+                node.has_tag_name("driver") && node.attribute("type") == Some("virtiofs")
+            })
+        }) {
             Self::Virtiofs
         } else {
             Self::NineP

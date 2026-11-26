@@ -40,7 +40,11 @@ impl DeviceAction {
     }
 }
 
-pub fn device_form(action: DeviceAction, m: &Machine) -> Option<FormSpec> {
+pub fn device_form(
+    action: DeviceAction,
+    m: &Machine,
+    connection: crate::backend::Connection,
+) -> Option<FormSpec> {
     let machine = m.clone();
     let label = action.label();
     Some(match action {
@@ -107,45 +111,7 @@ pub fn device_form(action: DeviceAction, m: &Machine) -> Option<FormSpec> {
                 ))
             },
         ),
-        DeviceAction::Share => {
-            // Windows reads only virtio-fs. Linux reads both; virtio-fs is faster when the
-            // host has virtiofsd.
-            let windows = crate::operations::GuestOs::of(m) == crate::operations::GuestOs::Windows;
-            let virtiofs = crate::operations::ShareDriver::virtiofs_available();
-            let default = if virtiofs || windows {
-                "virtiofs"
-            } else {
-                "9p"
-            };
-            let mut fields = vec![
-                F::path("Folder", Picker::Folder),
-                F::choice("Access", &[("rw", "Read and write"), ("ro", "Read only")], "rw"),
-                F::text("Mount tag", "share").advanced(),
-            ];
-            if !windows {
-                fields.push(
-                    F::choice("Driver", &[("virtiofs", "virtio-fs"), ("9p", "9p")], default)
-                        .advanced(),
-                );
-            }
-            FormSpec::new(label, "Share", fields, move |v| {
-                let driver = if v.get(3).map_or(default, String::as_str) == "9p" {
-                    crate::operations::ShareDriver::NineP
-                } else {
-                    crate::operations::ShareDriver::Virtiofs
-                };
-                Ok(operation(
-                    machine.clone(),
-                    Op::Share {
-                        path: v[0].clone().into(),
-                        tag: name(v, 2)?,
-                        readonly: v[1] == "ro",
-                        driver,
-                    },
-                ))
-            })
-            .derive(|v| vec![(2, mount_tag(&v[0]))])
-        }
+        DeviceAction::Share => share_form(m, connection, None),
         DeviceAction::Usb => {
             let devices = crate::operations::host_usb();
             if devices.is_empty() {
@@ -279,64 +245,163 @@ pub fn mount_tag(path: &str) -> String {
         })
         .take(31)
         .collect();
+    let tag = tag.trim_start_matches('-');
     if tag.trim_matches('_').is_empty() {
         "share".into()
     } else {
-        tag
+        tag.to_owned()
     }
 }
 
-/// Edits a shared folder: the old share is removed and the edited one added in one save.
-pub fn edit_share(m: &Machine, device: &crate::operations::Device) -> FormSpec {
-    use crate::operations::ShareDriver;
+pub fn edit_share(
+    m: &Machine,
+    device: &crate::operations::Device,
+    connection: crate::backend::Connection,
+) -> FormSpec {
+    share_form(m, connection, Some(device))
+}
+
+fn share_form(
+    m: &Machine,
+    connection: crate::backend::Connection,
+    device: Option<&crate::operations::Device>,
+) -> FormSpec {
+    use crate::backend::Connection;
+    use crate::operations::{GuestOs, ShareConfig, ShareDriver, ShareOwnership};
+    const DRIVER: usize = 3;
+    const OWNERSHIP: usize = 4;
+    const UID: usize = 5;
+    const GID: usize = 6;
+
     let machine = m.clone();
-    let old = device.xml.clone();
-    let driver = ShareDriver::from_xml(&device.xml);
-    let readonly = device.xml.contains("<readonly");
-    let mut folder = F::path("Folder", Picker::Folder);
-    folder.value = device.source.clone();
-    FormSpec::new(
-        "Edit shared folder",
-        "Save",
-        vec![
-            folder,
-            F::choice(
-                "Access",
-                &[("rw", "Read and write"), ("ro", "Read only")],
-                if readonly {
-                    "ro"
-                } else {
-                    "rw"
-                },
-            ),
-            F::text("Mount tag", device.target.clone()),
-            F::choice(
-                "Driver",
-                &[("virtiofs", "virtio-fs"), ("9p", "9p")],
-                if driver == ShareDriver::NineP {
-                    "9p"
-                } else {
-                    "virtiofs"
-                },
-            ),
-        ],
+    let editing = device.is_some();
+    let windows = GuestOs::of(m) == GuestOs::Windows;
+    let can_map_ids = !windows && connection == Connection::Session;
+    let driver = device.map_or_else(
+        || {
+            if windows || ShareDriver::virtiofs_available() {
+                ShareDriver::Virtiofs
+            } else {
+                ShareDriver::NineP
+            }
+        },
+        |device| ShareDriver::from_xml(&device.xml),
+    );
+    let show_driver = !windows || driver == ShareDriver::NineP;
+    let folder = device.map(|device| device.source.clone()).unwrap_or_default();
+    let replace = device.map(|device| device.target.clone());
+    let readonly = device.is_some_and(|device| device.xml.contains("<readonly"));
+    let existing_mapping = device.is_some_and(|device| {
+        roxmltree::Document::parse(&device.xml)
+            .is_ok_and(|doc| doc.root_element().children().any(|node| node.has_tag_name("idmap")))
+    });
+    let mut ownership_choices =
+        vec![("account", "Linux guest account"), ("default", "Libvirt default")];
+    if existing_mapping {
+        ownership_choices.insert(0, ("keep", "Keep current mapping"));
+    }
+    let mut fields = vec![
+        F {
+            value: folder,
+            ..F::path("Folder", Picker::Folder)
+        },
+        F::choice(
+            "Access",
+            &[("rw", "Read and write"), ("ro", "Read only")],
+            if readonly {
+                "ro"
+            } else {
+                "rw"
+            },
+        ),
+        F::text("Mount tag", replace.as_deref().unwrap_or("share")),
+        F::choice(
+            "Driver",
+            &[("virtiofs", "virtio-fs"), ("9p", "9p")],
+            if driver == ShareDriver::NineP {
+                "9p"
+            } else {
+                "virtiofs"
+            },
+        ),
+        F::choice(
+            "File ownership",
+            &ownership_choices,
+            if existing_mapping {
+                "keep"
+            } else {
+                "account"
+            },
+        ),
+        F::text("Guest UID", "1000").row(1),
+        F::text("Guest GID", "1000").row(1),
+    ];
+    if !editing {
+        for field in &mut fields[2..] {
+            field.advanced = true;
+        }
+    }
+    let form = FormSpec::new(
+        if editing {
+            "Edit shared folder"
+        } else {
+            "Shared folder"
+        },
+        if editing {
+            "Save"
+        } else {
+            "Share"
+        },
+        fields,
         move |v| {
+            let driver = if v[DRIVER] == "9p" {
+                ShareDriver::NineP
+            } else {
+                ShareDriver::Virtiofs
+            };
+            let ownership = if driver == ShareDriver::Virtiofs && can_map_ids {
+                match v[OWNERSHIP].as_str() {
+                    "account" => ShareOwnership::Guest {
+                        uid: number(v, UID, "guest UID")?,
+                        gid: number(v, GID, "guest GID")?,
+                    },
+                    "keep" => ShareOwnership::Preserve,
+                    _ => ShareOwnership::Default,
+                }
+            } else if editing {
+                ShareOwnership::Preserve
+            } else {
+                ShareOwnership::Default
+            };
             Ok(operation(
                 machine.clone(),
-                Op::Sequence(vec![
-                    Op::DetachDevice(old.clone()),
-                    Op::Share {
-                        path: v[0].trim().into(),
-                        tag: name(v, 2)?,
-                        readonly: v[1] == "ro",
-                        driver: if v[3] == "9p" {
-                            ShareDriver::NineP
-                        } else {
-                            ShareDriver::Virtiofs
-                        },
-                    },
-                ]),
+                Op::Share(ShareConfig {
+                    path: v[0].trim().into(),
+                    tag: name(v, 2)?,
+                    readonly: v[1] == "ro",
+                    driver,
+                    ownership,
+                    replace: replace.clone(),
+                }),
             ))
         },
     )
+    .visible(move |index, v| match index {
+        DRIVER => show_driver,
+        OWNERSHIP => can_map_ids && v[DRIVER] == "virtiofs",
+        UID | GID => can_map_ids && v[DRIVER] == "virtiofs" && v[OWNERSHIP] == "account",
+        _ => true,
+    });
+    let form = if can_map_ids {
+        form.note(
+            "For a Linux guest account, use the UID and GID from id -u and id -g in the guest.",
+        )
+    } else {
+        form
+    };
+    if editing {
+        form
+    } else {
+        form.derive(|v| vec![(2, mount_tag(&v[0]))])
+    }
 }

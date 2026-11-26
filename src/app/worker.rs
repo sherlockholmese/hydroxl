@@ -1,5 +1,8 @@
 //! Hosts blocking work. The worker receives owned inputs and has no access to UI state.
-use super::{Job, JobEvent, Response};
+use super::{
+    Job, JobEvent,
+    jobs::{LibraryUpdate, REFRESH_BUDGET},
+};
 use crate::{
     appliance,
     backend::{self, Action, Connection, Machine, State},
@@ -11,7 +14,7 @@ pub(super) fn run(
     job: Job,
     c: Connection,
     selected: Option<String>,
-    previous: Vec<Machine>,
+    mut previous: Vec<Machine>,
     need_architectures: bool,
     progress: backend::progress::Reporter,
     tx: mpsc::Sender<JobEvent>,
@@ -32,6 +35,7 @@ pub(super) fn run(
         Job::Action(machine, Action::Start | Action::Resume, source) => {
             let mut machine = machine.clone();
             machine.state = State::Running;
+            machine.saved_state = false;
             Some((machine, *source))
         }
         _ => None,
@@ -41,7 +45,7 @@ pub(super) fn run(
         Job::Refresh | Job::Icon(..) => Ok(()),
         Job::Network(net) => backend::network::create(c, &net),
         Job::Action(m, action, _) => backend::action(c, &m.id, action, m.spice_viewer),
-        Job::Create(spec) => backend::create(c, &spec),
+        Job::Create(spec) => backend::create(c, &spec, &progress),
         Job::Import(path, qemu_build, hardware) => backend::import(c, &path, qemu_build, hardware),
         Job::ConvertDisk {
             source,
@@ -55,49 +59,72 @@ pub(super) fn run(
         eprintln!("{label}: {error:#}");
         format!("{error:#}")
     });
-    if outcome.is_ok()
-        && let Some((machine, source)) = open_display
-    {
-        let _ = tx.send(JobEvent::DisplayReady(Box::new(machine), source));
-    }
-    if outcome.is_ok() && !disk_conversion && !refresh {
-        progress.update("Refreshing library", None);
-    }
-    let machines = (!disk_conversion)
-        .then(|| (Instant::now(), backend::machines(c, &previous).map_err(|e| format!("{e:#}"))));
-    let list = machines
-        .as_ref()
-        .and_then(|(_, result)| result.as_ref().ok())
-        .map(|list| list.machines.as_slice());
-    if outcome.is_err() {
-        select_name = None;
-    } else if importing {
-        select_name = list
-            .and_then(|list| list.iter().find(|m| !previous.iter().any(|cached| cached.id == m.id)))
-            .map(|m| m.name.clone());
-    }
-    let details = list
-        .and_then(|list| {
-            select_name
-                .as_ref()
-                .and_then(|name| list.iter().find(|m| &m.name == name))
-                .or_else(|| selected.as_ref().and_then(|id| list.iter().find(|m| &m.id == id)))
-                .or_else(|| list.first())
-        })
-        .map(|machine| {
-            (
-                machine.id.clone(),
-                operations::details(c, &machine.id).map_err(|error| {
-                    eprintln!("Could not load details for {}: {error:#}", machine.name);
-                    format!("{error:#}")
-                }),
-            )
+    let succeeded = outcome.is_ok();
+    if !refresh {
+        let display = open_display.filter(|_| succeeded).map(|(machine, source)| {
+            if let Some(cached) = previous.iter_mut().find(|cached| cached.id == machine.id) {
+                cached.state = machine.state;
+                cached.saved_state = false;
+            }
+            Box::new((machine, source, Instant::now()))
         });
-    let _ = tx.send(JobEvent::Complete(Box::new(Response {
-        machines,
-        details,
-        outcome: (!refresh).then_some(outcome),
-        select_name,
-        architectures: need_architectures.then(|| operations::available_architectures(c)),
-    })));
+        if tx
+            .send(JobEvent::OperationFinished {
+                outcome,
+                display,
+            })
+            .is_err()
+        {
+            return;
+        }
+    }
+    if disk_conversion {
+        let _ = tx.send(JobEvent::RefreshFinished(None));
+        return;
+    }
+
+    let sampled_at = Instant::now();
+    let deadline = sampled_at + REFRESH_BUDGET;
+    backend::with_command_deadline(deadline, || {
+        let machines = backend::machines(c, &previous).map_err(|error| format!("{error:#}"));
+        let list = machines.as_ref().ok().map(|list| list.machines.as_slice()).unwrap_or(&[]);
+        if !succeeded {
+            select_name = None;
+        } else if importing {
+            select_name = list
+                .iter()
+                .find(|m| !previous.iter().any(|cached| cached.id == m.id))
+                .map(|m| m.name.clone());
+        }
+        let details_for = select_name
+            .as_ref()
+            .and_then(|name| list.iter().find(|m| &m.name == name))
+            .or_else(|| selected.as_ref().and_then(|id| list.iter().find(|m| &m.id == id)))
+            .or_else(|| list.first())
+            .map(|machine| machine.id.clone());
+        let loaded = machines.is_ok();
+        if tx
+            .send(JobEvent::Library(Box::new(LibraryUpdate {
+                sampled_at,
+                machines,
+                select_name,
+                details_for: details_for.clone(),
+            })))
+            .is_err()
+        {
+            return;
+        }
+        if let Some(id) = details_for {
+            let details = operations::details(c, &id).map_err(|error| {
+                eprintln!("Could not load details for {id}: {error:#}");
+                format!("{error:#}")
+            });
+            if tx.send(JobEvent::Details(id, Box::new(details))).is_err() {
+                return;
+            }
+        }
+        let architectures =
+            (loaded && need_architectures).then(|| operations::available_architectures(c));
+        let _ = tx.send(JobEvent::RefreshFinished(architectures));
+    });
 }

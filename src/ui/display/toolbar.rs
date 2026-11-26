@@ -98,14 +98,12 @@ impl DisplayView {
             }
         };
         cx.spawn_in(window, async move |view, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move {
-                    rx.recv_timeout(Duration::from_secs(8))
-                        .map_err(|_| anyhow::anyhow!("The guest did not respond."))
-                        .and_then(|result| result)
-                })
-                .await;
+            let result = blocking::unblock(move || {
+                rx.recv_timeout(Duration::from_secs(8))
+                    .map_err(|_| anyhow::anyhow!("The guest did not respond."))
+                    .and_then(|result| result)
+            })
+            .await;
             let _ = view.update_in(cx, |view, window, cx| match result {
                 Ok(value) => done(view, value, window, cx),
                 Err(error) => window.push_notification(

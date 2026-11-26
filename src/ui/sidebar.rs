@@ -11,7 +11,8 @@ use gpui_kit::{prelude::*, *};
 
 impl Workspace {
     fn activity(&self, p: Palette, _cx: &mut Context<Self>) -> AnyElement {
-        let Some(pending) = self.pending.as_ref().filter(|pending| !pending.refresh) else {
+        let Some(pending) = self.pending.as_ref().filter(|pending| pending.refresh.is_none())
+        else {
             // Quiet while normal: only a preview library or the non-default system
             // connection is worth naming here.
             if self.library_error.is_some() && !self.machines.is_empty() {

@@ -116,7 +116,11 @@ impl Workspace {
                             .disabled(busy || (action.requires_power_off() && !editable))
                             .on_click(move |_, window, cx| {
                                 let _ = weak.update(cx, |this, cx| {
-                                    if let Some(form) = workflows::device_form(action, &m) {
+                                    if let Some(form) = workflows::device_form(
+                                        action,
+                                        &m,
+                                        this.preferences.connection,
+                                    ) {
                                         this.open_form(form, window, cx);
                                     }
                                 });

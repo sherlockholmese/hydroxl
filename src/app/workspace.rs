@@ -125,10 +125,12 @@ impl Workspace {
                     continue;
                 };
                 let sampled_at = Instant::now();
-                let Ok(statuses) = cx
-                    .background_executor()
-                    .spawn(async move { backend::MachineStatuses::read(connection) })
-                    .await
+                let Ok(statuses) = blocking::unblock(move || {
+                    backend::with_command_deadline(sampled_at + Duration::from_secs(8), || {
+                        backend::MachineStatuses::read(connection)
+                    })
+                })
+                .await
                 else {
                     continue;
                 };
@@ -247,7 +249,7 @@ impl Workspace {
     }
 
     pub(crate) fn busy(&self) -> bool {
-        self.pending.as_ref().is_some_and(|pending| !pending.refresh)
+        self.pending.as_ref().is_some_and(|pending| pending.refresh.is_none())
     }
 
     pub(crate) fn select(&mut self, id: String, cx: &mut Context<Self>) {

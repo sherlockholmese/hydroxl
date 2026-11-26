@@ -2,7 +2,6 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    process::Command,
     sync::{Mutex, OnceLock},
     time::SystemTime,
 };
@@ -58,15 +57,12 @@ fn probe(path: &Path, arch: &str) -> GpuFeatures {
     if let Some(features) = cache.lock().ok().and_then(|c| c.get(&key).copied()) {
         return features;
     }
-    let Some(features) = Command::new(path)
-        .args(["-device", &format!("{},help", device(arch))])
-        .output()
-        .ok()
-        .filter(|out| out.status.success())
-        .map(|out| parse(&String::from_utf8_lossy(&out.stdout)))
+    let Ok(help) = crate::files::path_text(path)
+        .and_then(|path| super::run(path, &["-device", &format!("{},help", device(arch))]))
     else {
         return GpuFeatures::default();
     };
+    let features = parse(&help);
     if let Ok(mut cache) = cache.lock() {
         cache.insert(key, features);
     }

@@ -79,7 +79,7 @@ in [the release workflow](.github/workflows/release.yml), Rust, and
 
 ```sh
 packaging/build-release.sh target/stage
-VERSION=0.4.0 STAGE="$PWD/target/stage" nfpm package --config packaging/nfpm.yaml --packager deb
+VERSION=0.4.1 STAGE="$PWD/target/stage" nfpm package --config packaging/nfpm.yaml --packager deb
 ```
 
 Use `--packager rpm` for Fedora. Pushing a `v*` tag that matches the version in
@@ -195,6 +195,13 @@ Hardware, device changes, exports, cloning, and snapshot restoration require a
 powered-off guest where indicated. In **Hardware → Storage**, open the drive's
 actions menu and choose **Edit drive…** to set its bus and target, such as
 `vda`, `vdb`, or `vdc`. Each target must be unique on the machine.
+
+For a user-session Linux guest, **Hardware → Shared folders → Edit** can map a
+virtio-fs share to the guest account. Select **Linux guest account** under
+**File ownership** and use the guest's `id -u` and `id -g` values. The defaults
+are 1000 and 1000. This requires Libvirt 10 or newer and subordinate UID/GID
+ranges for the host account. **Libvirt default** maps guest root to the host
+account. Files keep their host ownership and permissions.
 
 **Hardware → Advanced → Edit XML** edits the registered libvirt configuration
 and preserves the VM UUID. New machine folders use that configuration directly.

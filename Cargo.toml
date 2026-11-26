@@ -1,12 +1,13 @@
 [package]
 name = "hydroxl"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 description = "A quiet, native QEMU/KVM workspace for Linux"
 license = "MIT"
 
 [dependencies]
 anyhow = "1"
+blocking = "1"
 gpui-kit = "=0.9.0"
 libc = "0.2"
 libloading = "0.8"

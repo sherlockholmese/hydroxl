@@ -30,9 +30,11 @@ impl Workspace {
                     .icon(Icon::new(Glyph::Plus))
                     .disabled(!editable)
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        if let Some(form) =
-                            workflows::device_form(workflows::DeviceAction::Share, &m)
-                        {
+                        if let Some(form) = workflows::device_form(
+                            workflows::DeviceAction::Share,
+                            &m,
+                            this.preferences.connection,
+                        ) {
                             this.open_form(form, window, cx);
                         }
                     }))
@@ -97,7 +99,11 @@ impl Workspace {
                                             let _ = weak.update(cx, |this, cx| {
                                                 if let Some(m) = this.selected_machine().cloned() {
                                                     this.open_form(
-                                                        workflows::edit_share(&m, &device),
+                                                        workflows::edit_share(
+                                                            &m,
+                                                            &device,
+                                                            this.preferences.connection,
+                                                        ),
                                                         window,
                                                         cx,
                                                     );

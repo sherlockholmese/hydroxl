@@ -1,4 +1,4 @@
-use super::{Connection, NewMachine, run, virsh};
+use super::{Connection, NewMachine, progress::Reporter, run, virsh};
 use anyhow::{Context, Result, bail};
 use std::{
     fs,
@@ -80,7 +80,8 @@ pub(crate) fn record_owned_storage(folder: &Path, xml: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn create(connection: Connection, spec: &NewMachine) -> Result<()> {
+pub(crate) fn create(connection: Connection, spec: &NewMachine, progress: &Reporter) -> Result<()> {
+    progress.update("Checking machine requirements", None);
     spec.validate()?;
     if connection == Connection::System {
         bail!("Create machines in User session. System machines can be imported from XML.");
@@ -130,8 +131,10 @@ pub fn create(connection: Connection, spec: &NewMachine) -> Result<()> {
     let mut registration_attempted = false;
     let result = (|| -> Result<()> {
         let format = if spec.existing_disk.is_some() {
+            progress.update("Inspecting disk image", None);
             super::qemu::disk_info(crate::files::path_text(&disk)?)?.format
         } else {
+            progress.update("Creating disk image", None);
             run(
                 "qemu-img",
                 &[
@@ -208,9 +211,11 @@ pub fn create(connection: Connection, spec: &NewMachine) -> Result<()> {
             boot.push_str(",uefi");
         }
         args.extend(["--boot", &boot]);
+        progress.update("Preparing machine configuration", None);
         let xml = run("virt-install", &args)?;
         let xml = spec.qemu_build.configure_xml(&xml)?.unwrap_or(xml);
         record_owned_storage(&folder, &xml)?;
+        progress.update("Registering machine with Libvirt", None);
         registration_attempted = true;
         define_xml(connection, &xml)
     })();

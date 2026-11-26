@@ -22,7 +22,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let p = Palette::get(cx);
-        let editable = machine.can_edit() && !self.busy();
+        let editable = machine.can_edit() && !self.busy() && !self.awaiting_hardware_readback();
         let values = self.hardware_values();
         let mut page = v_flex().gap_6();
         if !machine.can_edit() {
@@ -530,9 +530,11 @@ impl Workspace {
                     .label("Discard…")
                     .disabled(self.busy())
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        if let Some(form) =
-                            workflows::action_form(workflows::MachineAction::DiscardState, &m)
-                        {
+                        if let Some(form) = workflows::action_form(
+                            workflows::MachineAction::DiscardState,
+                            &m,
+                            this.preferences.connection,
+                        ) {
                             this.open_form(form, window, cx);
                         }
                     }))

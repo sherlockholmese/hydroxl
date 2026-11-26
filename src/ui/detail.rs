@@ -259,6 +259,7 @@ impl Workspace {
                                         )
                                         .disabled(
                                             busy || leaving
+                                                || self.awaiting_hardware_readback()
                                                 || self.details_error.is_some()
                                                 || self.memory_error().is_some(),
                                         )

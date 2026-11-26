@@ -19,9 +19,9 @@ impl Workspace {
             return;
         }
         let connection = self.preferences.connection;
-        self.display_windows.retain(|(_, _, view)| view.upgrade().is_some());
-        if let Some((_, handle, view)) =
-            self.display_windows.iter().find(|(id, _, _)| *id == machine.id)
+        self.display_windows.retain(|(_, _, _, view)| view.upgrade().is_some());
+        if let Some((_, _, handle, view)) =
+            self.display_windows.iter().find(|(c, id, _, _)| *c == connection && *id == machine.id)
         {
             let _ = handle.update(cx, |_, window, cx| {
                 window.activate_window();
@@ -31,7 +31,8 @@ impl Workspace {
             });
             return;
         }
-        if !self.opening_displays.insert(machine.id.clone()) {
+        let key = (connection, machine.id.clone());
+        if !self.opening_displays.insert(key.clone()) {
             return;
         }
         let id = machine.id.clone();
@@ -67,10 +68,15 @@ impl Workspace {
                 })
             });
             let _ = workspace.update(cx, |this, cx| {
-                this.opening_displays.remove(&machine.id);
+                this.opening_displays.remove(&key);
                 match opened {
                     Ok((handle, view)) => {
-                        this.display_windows.push((machine.id, handle, view.downgrade()));
+                        this.display_windows.push((
+                            connection,
+                            machine.id,
+                            handle,
+                            view.downgrade(),
+                        ));
                     }
                     Err(error) => {
                         this.error = Some(format!("Could not open the display window: {error}"))

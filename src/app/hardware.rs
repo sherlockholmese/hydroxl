@@ -51,12 +51,16 @@ impl Workspace {
             || self.hardware_values().is_some_and(|(original, current)| original != current)
     }
 
+    pub(crate) fn awaiting_hardware_readback(&self) -> bool {
+        self.saved_hardware_for.is_some() && self.saved_hardware_for == self.selected
+    }
+
     pub(crate) fn edit_hardware(
         &mut self,
         edit: impl FnOnce(&mut HardwareDraft),
         cx: &mut Context<Self>,
     ) {
-        if self.busy() {
+        if self.busy() || self.awaiting_hardware_readback() {
             return;
         }
         if let Some((_, mut current)) = self.hardware_values() {
@@ -79,7 +83,10 @@ impl Workspace {
     }
 
     pub(crate) fn save_hardware(&mut self, cx: &mut Context<Self>) {
-        if self.details_error.is_some() || self.memory_error().is_some() {
+        if self.awaiting_hardware_readback()
+            || self.details_error.is_some()
+            || self.memory_error().is_some()
+        {
             return;
         }
         let Some((original, current)) = self.hardware_values() else {

@@ -632,6 +632,12 @@ pub fn keysym(key: &str) -> Option<u32> {
 pub const MODIFIERS: [u32; 4] = [0xffe1, 0xffe3, 0xffe9, 0xffeb];
 
 #[cfg(test)]
+pub(crate) fn test_session() -> (Arc<super::session::Session>, Arc<Mutex<Vec<u8>>>) {
+    let (session, _, packets) = tests::local_session(4, 3);
+    (Arc::new(super::session::Session::Vnc(Arc::new(session))), packets)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     #[derive(Clone)]

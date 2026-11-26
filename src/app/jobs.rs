@@ -5,7 +5,13 @@ use crate::{
     operations::{Details, Operation},
 };
 use gpui_kit::{AnyWindowHandle, WeakEntity};
-use std::{path::PathBuf, sync::mpsc::Receiver};
+use std::{
+    path::PathBuf,
+    sync::mpsc::Receiver,
+    time::{Duration, Instant},
+};
+
+pub(super) const REFRESH_BUDGET: Duration = Duration::from_secs(30);
 #[derive(Clone)]
 pub enum Job {
     Refresh,
@@ -104,21 +110,42 @@ impl Job {
         }
     }
 }
-pub(crate) struct Response {
-    pub(crate) machines: Option<(std::time::Instant, Result<backend::MachineList, String>)>,
-    pub(crate) details: Option<(String, Result<Details, String>)>,
-    pub(crate) outcome: Option<Result<(), String>>,
+pub(crate) struct LibraryUpdate {
+    pub(crate) sampled_at: Instant,
+    pub(crate) machines: Result<backend::MachineList, String>,
     pub(crate) select_name: Option<String>,
-    /// Read on the first refresh of a connection.
-    pub(crate) architectures: Option<Vec<String>>,
+    pub(crate) details_for: Option<String>,
 }
+
 pub(crate) enum JobEvent {
-    DisplayReady(Box<Machine>, ActionSource),
-    Complete(Box<Response>),
+    OperationFinished {
+        outcome: Result<(), String>,
+        display: Option<Box<(Machine, ActionSource, Instant)>>,
+    },
+    Library(Box<LibraryUpdate>),
+    Details(String, Box<Result<Details, String>>),
+    RefreshFinished(Option<Vec<String>>),
+}
+
+pub(crate) struct Refresh {
+    pub(crate) expires_at: Instant,
+    pub(crate) library_pending: bool,
+    pub(crate) details_pending: Option<String>,
+}
+
+impl Refresh {
+    pub(super) fn new() -> Self {
+        Self {
+            // Give the worker time to publish its error when the command budget expires.
+            expires_at: Instant::now() + REFRESH_BUDGET + Duration::from_secs(2),
+            library_pending: true,
+            details_pending: None,
+        }
+    }
 }
 
 pub(crate) struct Pending {
-    pub(crate) refresh: bool,
+    pub(crate) refresh: Option<Refresh>,
     pub(crate) hardware_save: Option<String>,
     pub(crate) disk_rename: Option<(String, String, String)>,
     pub(crate) receiver: Receiver<JobEvent>,

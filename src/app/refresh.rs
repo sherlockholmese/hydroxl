@@ -1,4 +1,5 @@
-use crate::app::{ActionSource, Job, JobEvent, Pending, Response, Workspace};
+use crate::app::jobs::{LibraryUpdate, Refresh};
+use crate::app::{ActionSource, Job, JobEvent, Pending, Workspace};
 use crate::backend;
 use crate::backend::{Action, State};
 use crate::forms::EditorForm;
@@ -78,21 +79,23 @@ impl Workspace {
         });
         if let Err(error) = worker {
             eprintln!("Could not start background work ({label}): {error}");
-            let message = if refresh {
-                "Could not refresh the library. Retry in a moment."
+            if refresh {
+                let _ = start_failure.send(JobEvent::Library(Box::new(LibraryUpdate {
+                    sampled_at: Instant::now(),
+                    machines: Err("Could not refresh the library. Retry in a moment.".into()),
+                    select_name: None,
+                    details_for: None,
+                })));
             } else {
-                "Could not start the operation. Retry in a moment."
-            };
-            let _ = start_failure.send(JobEvent::Complete(Box::new(Response {
-                machines: refresh.then(|| (Instant::now(), Err(message.into()))),
-                details: None,
-                outcome: (!refresh).then(|| Err(message.into())),
-                select_name: None,
-                architectures: None,
-            })));
+                let _ = start_failure.send(JobEvent::OperationFinished {
+                    outcome: Err("Could not start the operation. Retry in a moment.".into()),
+                    display: None,
+                });
+            }
+            let _ = start_failure.send(JobEvent::RefreshFinished(None));
         }
         self.pending = Some(Pending {
-            refresh,
+            refresh: refresh.then(Refresh::new),
             hardware_save,
             disk_rename,
             receiver: rx,
@@ -135,98 +138,160 @@ impl Workspace {
                 cx.notify();
             }
         }
-        let response = match self.pending.as_ref().map(|p| p.receiver.try_recv()) {
-            Some(Ok(JobEvent::Complete(response))) => response,
-            Some(Ok(JobEvent::DisplayReady(machine, source))) => {
-                self.last_library_sample = Some(Instant::now());
-                self.machine_statuses = None;
-                if let Some(current) = self.machines.iter_mut().find(|m| m.id == machine.id) {
-                    current.state = machine.state;
-                    current.saved_state = false;
-                    cx.notify();
-                }
-                match source {
-                    ActionSource::Library => self.open_machine_display(*machine, cx),
-                    ActionSource::Viewer(handle) => {
-                        if let Some((_, _, view)) =
-                            self.display_windows.iter().find(|(_, window, _)| *window == handle)
-                        {
-                            let _ = handle.update(cx, |_, window, cx| {
-                                let _ = view.update(cx, |view, cx| view.ensure_session(window, cx));
-                            });
+        loop {
+            match self.pending.as_ref().map(|pending| pending.receiver.try_recv()) {
+                Some(Ok(JobEvent::OperationFinished {
+                    outcome,
+                    display,
+                })) => {
+                    if let Some(mut pending) = self.pending.take() {
+                        self.finish_operation(&mut pending, outcome, window, cx);
+                        pending.form = None;
+                        pending.refresh = Some(Refresh::new());
+                        self.pending = Some(pending);
+                        if let Some(display) = display {
+                            let (machine, source, completed_at) = *display;
+                            self.machine_started(machine, source, completed_at, cx);
                         }
+                        cx.notify();
                     }
                 }
-                return;
-            }
-            Some(Err(mpsc::TryRecvError::Disconnected)) => {
-                if let Some(pending) = self.pending.take() {
-                    eprintln!(
-                        "{}: background worker stopped before reporting a result",
-                        pending.label
-                    );
-                    if pending.refresh {
-                        let error =
-                            "Library refresh stopped unexpectedly. Select Retry to reconnect."
-                                .to_owned();
-                        if !self.machines.is_empty() && self.library_error.as_ref() != Some(&error)
-                        {
-                            window.push_notification(Notification::error(error.clone()), cx);
-                        }
-                        self.library_error = Some(error);
-                        self.loaded = true;
-                    } else {
-                        let error = "The operation stopped before reporting a result. Check the machine and any output files before trying again.".to_owned();
-                        report_failure(&pending, error, window, cx);
+                Some(Ok(JobEvent::Library(update))) => self.apply_library(*update, window, cx),
+                Some(Ok(JobEvent::Details(id, details))) => {
+                    if let Some(refresh) = self.pending.as_mut().and_then(|p| p.refresh.as_mut()) {
+                        refresh.details_pending = None;
+                    }
+                    self.apply_details(id, *details);
+                    cx.notify();
+                }
+                Some(Ok(JobEvent::RefreshFinished(architectures))) => {
+                    self.pending = None;
+                    if let Some(architectures) = architectures.filter(|a| !a.is_empty()) {
+                        self.architectures = architectures;
+                    }
+                    if self.loaded
+                        && self.selected.is_some()
+                        && self.details_for != self.selected
+                        && self.library_error.is_none()
+                    {
                         self.begin(Job::Refresh, None, cx);
                     }
                     cx.notify();
+                    return;
                 }
-                return;
-            }
-            _ => return,
-        };
-        let response = *response;
-        let Some(pending) = self.pending.take() else {
-            return;
-        };
-        self.loaded = true;
-        if let Some(outcome) = response.outcome {
-            match outcome {
-                Ok(()) => {
-                    if pending.hardware_save.is_some() && pending.hardware_save == self.selected {
-                        self.saved_hardware_for = pending.hardware_save;
-                    }
-                    if let Some((id, old, new)) = pending.disk_rename
-                        && let Some(draft) =
-                            self.hardware_draft.as_mut().filter(|draft| draft.id == id)
+                Some(Err(mpsc::TryRecvError::Empty)) => {
+                    if self
+                        .pending
+                        .as_ref()
+                        .and_then(|p| p.refresh.as_ref())
+                        .is_some_and(|refresh| Instant::now() >= refresh.expires_at)
                     {
-                        draft.rename_boot_drive(&old, &new);
+                        self.refresh_interrupted("Timed out refreshing the library.", window, cx);
                     }
-                    self.notice = Some(pending.done.clone());
-                    if let Some(form) = pending.form {
-                        let open = form
-                            .update(cx, |form, cx| {
-                                form.pending = false;
-                                cx.notify();
-                                form.open
-                            })
-                            .unwrap_or(false);
-                        if open {
-                            window.close_dialog(cx);
-                        }
-                    }
+                    return;
                 }
-                Err(error) => report_failure(&pending, error, window, cx),
+                Some(Err(mpsc::TryRecvError::Disconnected)) => {
+                    if self.busy() {
+                        if let Some(pending) = self.pending.take() {
+                            eprintln!(
+                                "{}: background worker stopped before reporting a result",
+                                pending.label
+                            );
+                            report_failure(
+                                &pending,
+                                "The operation stopped before reporting a result. Check the machine and any output files before trying again.".into(),
+                                window,
+                                cx,
+                            );
+                            self.begin(Job::Refresh, None, cx);
+                            cx.notify();
+                        }
+                    } else {
+                        self.refresh_interrupted(
+                            "Library refresh stopped unexpectedly.",
+                            window,
+                            cx,
+                        );
+                    }
+                    return;
+                }
+                None => return,
             }
         }
-        if let Some(architectures) = response.architectures.filter(|a| !a.is_empty()) {
-            self.architectures = architectures;
+    }
+
+    fn machine_started(
+        &mut self,
+        mut machine: backend::Machine,
+        source: ActionSource,
+        completed_at: Instant,
+        cx: &mut Context<Self>,
+    ) {
+        self.last_library_sample =
+            Some(self.last_library_sample.map_or(completed_at, |sample| sample.max(completed_at)));
+        if let Some((sampled_at, statuses)) = &self.machine_statuses {
+            if *sampled_at > completed_at {
+                statuses.apply(&mut machine);
+            } else {
+                self.machine_statuses = None;
+            }
         }
-        let loaded_list = matches!(response.machines, Some((_, Ok(_))));
+        if let Some(current) = self.machines.iter_mut().find(|m| m.id == machine.id) {
+            current.state = machine.state;
+            current.saved_state = machine.saved_state;
+        }
+        if !matches!(machine.state, State::Running | State::Paused) {
+            return;
+        }
+        match source {
+            ActionSource::Library => self.open_machine_display(machine, cx),
+            ActionSource::Viewer(handle) => {
+                if let Some((_, _, _, view)) =
+                    self.display_windows.iter().find(|(_, _, window, _)| *window == handle)
+                {
+                    let _ = handle.update(cx, |_, window, cx| {
+                        let _ = view.update(cx, |view, cx| view.ensure_session(window, cx));
+                    });
+                }
+            }
+        }
+    }
+
+    fn refresh_interrupted(&mut self, message: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(refresh) = self.pending.take().and_then(|pending| pending.refresh) {
+            if refresh.library_pending {
+                self.report_library_error(message.into(), window, cx);
+                self.loaded = true;
+            } else if let Some(id) = refresh.details_pending {
+                self.apply_details(
+                    id,
+                    Err("Could not finish loading machine details. Try again.".into()),
+                );
+            }
+            cx.notify();
+        }
+    }
+
+    fn apply_library(
+        &mut self,
+        update: LibraryUpdate,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let LibraryUpdate {
+            sampled_at,
+            machines,
+            select_name,
+            details_for,
+        } = update;
+        self.loaded = true;
+        if let Some(refresh) = self.pending.as_mut().and_then(|p| p.refresh.as_mut()) {
+            refresh.library_pending = false;
+            refresh.details_pending = details_for;
+        }
         let previous_selection = self.selected.clone();
-        match response.machines {
-            Some((sampled_at, Ok(list))) => {
+        match machines {
+            Ok(list) => {
                 let mut machines = list.machines;
                 self.last_library_sample = Some(
                     self.last_library_sample
@@ -246,7 +311,7 @@ impl Workspace {
                 };
                 self.machines = machines;
                 self.apply_icons();
-                if let Some(name) = response.select_name
+                if let Some(name) = select_name
                     && let Some(m) = self.machines.iter().find(|m| m.name == name)
                 {
                     self.selected = Some(m.id.clone());
@@ -259,14 +324,7 @@ impl Workspace {
                     self.save_preferences();
                 }
             }
-            None => {}
-            Some((_, Err(error))) => {
-                if !self.machines.is_empty() && self.library_error.as_ref() != Some(&error) {
-                    window
-                        .push_notification(Notification::error(crate::ui::plain_error(&error)), cx);
-                }
-                self.library_error = Some(error);
-            }
+            Err(error) => self.report_library_error(error, window, cx),
         }
         if self.selected != previous_selection {
             self.details = Default::default();
@@ -276,29 +334,66 @@ impl Workspace {
             self.memory_invalid = false;
             self.saved_hardware_for = None;
         }
-        if let Some((id, details)) = response.details
-            && self.selected.as_ref() == Some(&id)
-        {
-            self.details_for = Some(id.clone());
-            match details {
-                Ok(details) => {
-                    self.details = details;
-                    self.details_error = None;
-                    if self.saved_hardware_for.as_ref() == Some(&id) {
-                        self.hardware_draft = None;
-                        self.memory_invalid = false;
-                        self.saved_hardware_for = None;
-                    }
-                }
-                Err(error) => {
-                    self.details_error = Some(error);
+        cx.notify();
+    }
+
+    fn report_library_error(&mut self, error: String, window: &mut Window, cx: &mut App) {
+        if !self.machines.is_empty() && self.library_error.as_ref() != Some(&error) {
+            window.push_notification(Notification::error(crate::ui::plain_error(&error)), cx);
+        }
+        self.library_error = Some(error);
+    }
+
+    fn apply_details(&mut self, id: String, details: Result<crate::operations::Details, String>) {
+        if self.selected.as_ref() != Some(&id) {
+            return;
+        }
+        self.details_for = Some(id.clone());
+        match details {
+            Ok(details) => {
+                self.details = details;
+                self.details_error = None;
+                if self.saved_hardware_for.as_ref() == Some(&id) {
+                    self.hardware_draft = None;
+                    self.memory_invalid = false;
+                    self.saved_hardware_for = None;
                 }
             }
+            Err(error) => self.details_error = Some(error),
         }
-        if loaded_list && self.selected.is_some() && self.details_for != self.selected {
-            self.begin(Job::Refresh, None, cx);
+    }
+
+    fn finish_operation(
+        &mut self,
+        pending: &mut Pending,
+        outcome: Result<(), String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Err(error) = outcome {
+            report_failure(pending, error, window, cx);
+            return;
         }
-        cx.notify();
+        if pending.hardware_save.is_some() && pending.hardware_save == self.selected {
+            self.saved_hardware_for = pending.hardware_save.take();
+        }
+        if let Some((id, old, new)) = pending.disk_rename.take()
+            && let Some(draft) = self.hardware_draft.as_mut().filter(|draft| draft.id == id)
+        {
+            draft.rename_boot_drive(&old, &new);
+        }
+        self.notice = Some(pending.done.clone());
+        let open = pending.form.take().is_some_and(|form| {
+            form.update(cx, |form, cx| {
+                form.pending = false;
+                cx.notify();
+                form.open
+            })
+            .unwrap_or(false)
+        });
+        if open {
+            window.close_dialog(cx);
+        }
     }
 }
 
@@ -327,4 +422,106 @@ fn show_job_error(error: String, source: Option<ActionSource>, window: &mut Wind
         return;
     }
     window.push_notification(Notification::error(crate::ui::plain_error(&error)), cx);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{JobEvent, LibraryUpdate, Pending, Workspace, mpsc};
+    use crate::app::Preferences;
+    use crate::backend::{MachineList, State};
+    use gpui_kit::{AppContext, WindowOptions};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn operations_finish_even_when_machine_details_stall() {
+        gpui_kit::platform::headless().with_assets(gpui_kit::assets::AllAssets).run(|cx| {
+            gpui_kit::init(cx);
+            let (handle, workspace) =
+                gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                    cx.new(|cx| {
+                        Workspace::new(true, None, Preferences::default(), None, window, cx)
+                    })
+                })
+                .unwrap();
+            handle
+                .update(cx, |_, window, cx| {
+                    workspace.update(cx, |workspace, cx| {
+                        for (label, done) in [
+                            ("Creating machine", "Machine created"),
+                            ("Starting machine", "Machine starting"),
+                            ("Requesting shutdown", "Shutdown requested"),
+                        ] {
+                            let (tx, receiver) = mpsc::channel();
+                            workspace.pending = Some(Pending {
+                                receiver,
+                                refresh: None,
+                                hardware_save: None,
+                                disk_rename: None,
+                                form: None,
+                                action_source: None,
+                                label,
+                                done: done.into(),
+                                reporter: Default::default(),
+                                progress: Default::default(),
+                            });
+                            assert!(workspace.busy());
+
+                            tx.send(JobEvent::OperationFinished {
+                                outcome: Ok(()),
+                                display: None,
+                            })
+                            .unwrap();
+                            workspace.poll(window, cx);
+                            assert!(!workspace.busy());
+                            assert_eq!(workspace.notice.take().as_deref(), Some(done));
+
+                            let id = workspace.selected.clone().unwrap();
+                            let mut machines = workspace.machines.clone();
+                            machines.iter_mut().find(|machine| machine.id == id).unwrap().state =
+                                if label == "Starting machine" {
+                                    State::Running
+                                } else {
+                                    State::Stopped
+                                };
+                            tx.send(JobEvent::Library(Box::new(LibraryUpdate {
+                                sampled_at: Instant::now(),
+                                machines: Ok(MachineList {
+                                    machines,
+                                    unavailable: 0,
+                                }),
+                                select_name: None,
+                                details_for: Some(id),
+                            })))
+                            .unwrap();
+                            workspace.poll(window, cx);
+                            assert_eq!(
+                                workspace.selected_machine().unwrap().status(),
+                                if label == "Starting machine" {
+                                    "Running"
+                                } else {
+                                    "Powered off"
+                                }
+                            );
+                            assert!(!workspace.busy());
+
+                            // A stalled read can be discarded while the command result is retained.
+                            let refresh =
+                                workspace.pending.as_mut().unwrap().refresh.as_mut().unwrap();
+                            refresh.expires_at = Instant::now();
+                            workspace.poll(window, cx);
+                            assert!(workspace.pending.is_none());
+                            assert!(workspace.details_error.is_some());
+                            assert!(workspace.library_error.is_none());
+                            assert!(workspace.notice.is_none());
+                        }
+                    });
+                })
+                .unwrap();
+            cx.spawn(async move |cx| {
+                cx.background_executor().timer(Duration::from_millis(1)).await;
+                cx.update(|cx| cx.quit());
+            })
+            .detach();
+        });
+    }
 }

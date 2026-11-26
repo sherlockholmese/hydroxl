@@ -126,7 +126,11 @@ pub fn direct_action(action: MachineAction, m: &Machine) -> Option<Op> {
         _ => return None,
     })
 }
-pub fn action_form(action: MachineAction, m: &Machine) -> Option<FormSpec> {
+pub fn action_form(
+    action: MachineAction,
+    m: &Machine,
+    connection: crate::backend::Connection,
+) -> Option<FormSpec> {
     let machine = m.clone();
     Some(match action {
         MachineAction::ForceStop => confirm(
@@ -292,7 +296,7 @@ pub fn action_form(action: MachineAction, m: &Machine) -> Option<FormSpec> {
         }
         MachineAction::OperatingSystem => super::operating_system(m),
         MachineAction::ShareFolder => {
-            return super::device_form(super::DeviceAction::Share, m);
+            return super::device_form(super::DeviceAction::Share, m, connection);
         }
         _ => return None,
     })

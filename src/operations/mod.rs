@@ -28,6 +28,7 @@ pub use architecture::available as available_architectures;
 pub use guest::{GuestOs, GuestSetup, ShareDriver, WINDOWS_COMMAND, linux_command};
 pub use inspect::{details, has_agent_channel};
 pub use platform::{NicChange, Platform, log_path, open_path, random_mac, read_log};
+pub use sharing::{ShareConfig, ShareOwnership};
 pub use types::{Details, Device, DisplaySettings, Operation, Snapshot};
 pub use usb::host_usb;
 pub(crate) use usb::toggle_live_usb;
@@ -148,12 +149,7 @@ pub fn execute(
             mode,
             source,
         } => networking::apply_network(c, machine, mode, source),
-        Operation::Share {
-            path,
-            tag,
-            readonly,
-            driver,
-        } => sharing::apply_share(c, machine, path, tag, readonly, driver),
+        Operation::Share(share) => sharing::apply_share(c, machine, share),
         Operation::Architecture(arch) => architecture::apply(c, machine, arch),
         Operation::OperatingSystem(uri) => metadata::apply_operating_system(c, machine, uri),
         Operation::Guest(setup) => guest::apply_setup(c, machine, setup),

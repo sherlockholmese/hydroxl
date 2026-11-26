@@ -17,13 +17,28 @@ use crate::display::{frame::Cursor, vnc::Endpoint};
 use gpui_kit::{prelude::*, *};
 use std::{
     cell::{Cell, RefCell},
+    future::{Future, poll_fn},
+    pin::Pin,
     rc::Rc,
     sync::{Arc, mpsc},
+    task::Poll,
     time::{Duration, Instant},
 };
 
 const RECONNECT_DELAYS: [u64; 4] = [1, 2, 4, 8];
 const STABLE_DISPLAY_AFTER: Duration = Duration::from_secs(30);
+const DISPLAY_CONNECT_TIMEOUT: Duration = Duration::from_secs(24);
+const DISPLAY_FRAME_TIMEOUT: Duration = Duration::from_secs(15);
+
+const CAPTURED_KEY_CONTEXT: &str = "GuestDisplayCaptured";
+
+pub(crate) fn bind_keys(cx: &mut App) {
+    // GPUI resolves focus navigation before dispatching raw key events.
+    cx.bind_keys([
+        KeyBinding::new("tab", NoAction, Some(CAPTURED_KEY_CONTEXT)),
+        KeyBinding::new("shift-tab", NoAction, Some(CAPTURED_KEY_CONTEXT)),
+    ]);
+}
 
 struct GuestResize {
     dimensions: (u16, u16),
@@ -103,6 +118,7 @@ pub(crate) struct DisplayView {
     power_status: &'static str,
     busy: bool,
     connecting: bool,
+    connection_attempt: u64,
     reconnect_attempts: usize,
     connected_at: Option<Instant>,
     frame_revision: u64,
@@ -156,6 +172,8 @@ impl DisplayView {
                     this.busy = busy;
                     if changed {
                         if powered_off && std::env::var_os("HYDROXL_VNC_SOCKET").is_none() {
+                            this.connection_attempt = this.connection_attempt.wrapping_add(1);
+                            this.connecting = false;
                             this.detach_session(window);
                             this.status = Some(power_status.into());
                         } else if this.machine_is_active() {
@@ -250,6 +268,7 @@ impl DisplayView {
             power_status,
             busy: false,
             connecting: false,
+            connection_attempt: 0,
             reconnect_attempts: 0,
             connected_at: None,
             frame_revision: 0,
@@ -278,24 +297,25 @@ impl DisplayView {
             self.reconnect_attempts = 0;
             self.status = Some("Connecting".into());
             self.connecting = true;
-            Self::connect_session(self.connection, self.machine.clone(), false, window, cx);
+            self.connect_session(false, window, cx);
             cx.notify();
         }
     }
 
-    fn connect_session(
-        connection: Connection,
-        id: String,
-        retry: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn connect_session(&mut self, retry: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.connection_attempt = self.connection_attempt.wrapping_add(1);
+        let attempt = self.connection_attempt;
+        let connection = self.connection;
+        let id = self.machine.clone();
         let gpu = window.supports_dma_buf();
         cx.spawn_in(window, async move |this, cx| {
             let mut retry = retry;
             loop {
                 if retry {
                     let delay = this.update(cx, |view, cx| {
+                        if view.connection_attempt != attempt {
+                            return None;
+                        }
                         if !view.machine_is_active() {
                             view.connecting = false;
                             view.status = Some(view.power_status.into());
@@ -316,6 +336,9 @@ impl DisplayView {
                     cx.background_executor().timer(delay).await;
                 }
                 let prefer_spice = this.update(cx, |view, cx| {
+                    if view.connection_attempt != attempt {
+                        return None;
+                    }
                     if retry && !view.machine_is_active() {
                         view.connecting = false;
                         view.status = Some(view.power_status.into());
@@ -328,42 +351,67 @@ impl DisplayView {
                     return;
                 };
                 let id = id.clone();
-                let result = cx
-                    .background_executor()
-                    .spawn(async move {
-                        match crate::backend::display_target(connection, &id, prefer_spice)? {
-                            DisplayTarget::Vnc {
-                                uri,
-                                clipboard,
-                            } => {
-                                let endpoint = Endpoint::parse(&uri).ok_or_else(|| {
-                                    anyhow::anyhow!("Invalid guest display address.")
-                                })?;
-                                let session = Session::vnc(&endpoint, clipboard)?;
-                                if std::env::var_os("HYDROXL_VNC_SOCKET").is_none()
-                                    && let Err(error) =
-                                        crate::backend::ensure_live_tablet(connection, &id)
-                                {
-                                    eprintln!(
-                                        "Could not add a tablet to the running guest: {error}"
-                                    );
-                                }
-                                Ok(session)
+                let mut connecting = blocking::unblock(move || {
+                    let target = crate::backend::with_command_deadline(
+                        Instant::now() + Duration::from_secs(8),
+                        || crate::backend::display_target(connection, &id, prefer_spice),
+                    )?;
+                    match target {
+                        DisplayTarget::Vnc {
+                            uri,
+                            clipboard,
+                        } => {
+                            let endpoint = Endpoint::parse(&uri)
+                                .ok_or_else(|| anyhow::anyhow!("Invalid guest display address."))?;
+                            let session = Session::vnc(&endpoint, clipboard)?;
+                            if std::env::var_os("HYDROXL_VNC_SOCKET").is_none()
+                                && let Err(error) = crate::backend::with_command_deadline(
+                                    Instant::now() + Duration::from_secs(4),
+                                    || crate::backend::ensure_live_tablet(connection, &id),
+                                )
+                            {
+                                eprintln!("Could not add a tablet to the running guest: {error}");
                             }
-                            DisplayTarget::Spice(options) => {
-                                Session::spice(connection, id, options, gpu)
-                            }
-                            DisplayTarget::Dbus {
-                                graphics,
-                                clipboard,
-                                usb,
-                            } => Session::dbus(connection, &id, graphics, gpu, clipboard, usb),
+                            Ok(session)
                         }
-                    })
-                    .await;
+                        DisplayTarget::Spice(options) => {
+                            Session::spice(connection, id, options, gpu)
+                        }
+                        DisplayTarget::Dbus {
+                            graphics,
+                            clipboard,
+                            usb,
+                        } => Session::dbus(connection, &id, graphics, gpu, clipboard, usb),
+                    }
+                });
+                let mut timeout = cx.background_executor().timer(DISPLAY_CONNECT_TIMEOUT);
+                let result = poll_fn(|cx| {
+                    if let Poll::Ready(result) = Pin::new(&mut connecting).poll(cx) {
+                        return Poll::Ready(Some(result));
+                    }
+                    Pin::new(&mut timeout).poll(cx).map(|()| None)
+                })
+                .await;
+                let Some(result) = result else {
+                    let _ = this.update(cx, |view, cx| {
+                        if view.connection_attempt == attempt {
+                            view.connecting = false;
+                            view.status = Some("Timed out connecting to the guest display.".into());
+                            cx.notify();
+                        }
+                    });
+                    // Native libvirt attachment can still return after the UI deadline.
+                    if let Ok(session) = connecting.await {
+                        session.close();
+                    }
+                    return;
+                };
                 let mut result = Some(result);
                 let keep_waiting = this
                     .update_in(cx, |this, window, cx| {
+                        if this.connection_attempt != attempt {
+                            return false;
+                        }
                         if !this.machine_is_active()
                             && std::env::var_os("HYDROXL_VNC_SOCKET").is_none()
                         {
@@ -442,6 +490,24 @@ impl DisplayView {
         // A reconnect keeps showing the last frame rather than a spinner.
         if self.image.is_none() {
             self.status = Some("Connecting".into());
+            let waiting = session.clone();
+            cx.spawn_in(window, async move |this, cx| {
+                cx.background_executor().timer(DISPLAY_FRAME_TIMEOUT).await;
+                let _ = this.update_in(cx, |view, window, cx| {
+                    if view.image.is_none()
+                        && view
+                            .session
+                            .as_ref()
+                            .is_some_and(|session| Arc::ptr_eq(session, &waiting))
+                    {
+                        view.detach_session(window);
+                        view.status =
+                            Some("The guest display did not send a frame in time.".into());
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
         }
         self.focus.focus(window, cx);
         if frame_clock {

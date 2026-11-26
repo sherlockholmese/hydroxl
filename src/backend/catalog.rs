@@ -1,5 +1,6 @@
 //! Operating systems known to libosinfo, the database virt-install uses for defaults.
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 pub struct OsEntry {
     /// libosinfo short id, as virt-install's `--os-variant` takes it ("win11").
@@ -19,12 +20,10 @@ pub fn os_catalog() -> &'static [OsEntry] {
             name: "Other".into(),
             uri: String::new(),
         }];
-        let output = std::process::Command::new("osinfo-query")
-            .args(["os", "--fields=short-id,name,release-date,id"])
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+        let output = super::with_command_deadline(Instant::now() + Duration::from_secs(2), || {
+            super::run("osinfo-query", &["os", "--fields=short-id,name,release-date,id"])
+        })
+        .ok();
         let mut rows: Vec<(String, String, String, String)> = output
             .as_deref()
             .unwrap_or("")

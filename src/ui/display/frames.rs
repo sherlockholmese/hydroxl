@@ -162,7 +162,7 @@ impl DisplayView {
             if self.machine_is_active() && self.reconnect_attempts < RECONNECT_DELAYS.len() {
                 self.status = Some(crate::ui::primitives::plain_error(&error));
                 self.connecting = true;
-                Self::connect_session(self.connection, self.machine.clone(), true, window, cx);
+                self.connect_session(true, window, cx);
             } else if self.machine_is_active() {
                 self.status = Some(crate::ui::primitives::plain_error(&error));
             } else {
@@ -360,7 +360,10 @@ impl DisplayView {
             return;
         };
         let state = workspace.read(cx);
-        if state.tab != 0 || state.selected.as_deref() != Some(&self.machine) {
+        if state.preferences.connection != self.connection
+            || state.tab != 0
+            || state.selected.as_deref() != Some(&self.machine)
+        {
             return;
         }
         let has_preview = state.live_preview.as_ref().is_some_and(|(id, _)| id == &self.machine);

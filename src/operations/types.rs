@@ -150,12 +150,7 @@ pub enum Operation {
         mode: String,
         source: String,
     },
-    Share {
-        path: PathBuf,
-        tag: String,
-        readonly: bool,
-        driver: super::ShareDriver,
-    },
+    Share(super::ShareConfig),
     /// Retargets a stopped machine at another CPU architecture.
     Architecture(String),
     /// libosinfo URI of the guest operating system; empty clears it.
@@ -397,10 +392,7 @@ impl Operation {
             Self::Network {
                 ..
             } => "Network saved".into(),
-            Self::Share {
-                tag,
-                ..
-            } => format!("Sharing {tag}"),
+            Self::Share(share) => format!("Sharing {}", share.tag),
             Self::Architecture(arch) => format!("Architecture set to {arch}"),
             Self::OperatingSystem(uri) => {
                 if uri.is_empty() {

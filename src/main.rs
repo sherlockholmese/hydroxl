@@ -35,6 +35,8 @@ fn main() -> ExitCode {
     }
     let demo = args.iter().any(|a| a == "--demo");
     let initial = args.iter().find(|a| !a.to_string_lossy().starts_with('-')).map(PathBuf::from);
+    // Prime the catalog used by the machine views before the UI starts drawing.
+    backend::os_catalog();
     let exit = std::rc::Rc::new(std::cell::Cell::new(ExitCode::SUCCESS));
     let startup_exit = exit.clone();
     gpui_kit::application().with_assets(gpui_kit::assets::AllAssets).run(move |cx| {
@@ -46,6 +48,7 @@ fn main() -> ExitCode {
             Err(error) => (Preferences::default(), Some(format!("{error:#}"))),
         };
         theme::apply(preferences.dark, cx);
+        ui::display::bind_keys(cx);
         cx.bind_keys([
             KeyBinding::new("ctrl-n", NewMachineAction, Some("Hydroxl")),
             KeyBinding::new("f5", RefreshAction, Some("Hydroxl")),

@@ -198,3 +198,119 @@ impl DisplayView {
         cx.notify();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{DisplayView, vnc};
+    use crate::backend::{Connection, demo_machines};
+    use crate::ui::display::bind_keys;
+    use gpui_kit::{
+        App, AppContext, KeyDownEvent, KeyUpEvent, Keystroke, Modifiers, ModifiersChangedEvent,
+        PlatformInput, Point, WeakEntity, Window, WindowOptions,
+    };
+    use std::time::Duration;
+
+    #[test]
+    fn tab_keys_stay_with_the_guest_until_capture_releases() {
+        gpui_kit::platform::headless().with_assets(gpui_kit::assets::AllAssets).run(|cx| {
+            gpui_kit::init(cx);
+            bind_keys(cx);
+            let (session, packets) = vnc::test_session();
+            let machine = &demo_machines()[0];
+            let (handle, view) =
+                gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+                    cx.new(|cx| {
+                        let mut view = DisplayView::connect(
+                            Connection::Session,
+                            machine.id.clone(),
+                            machine,
+                            WeakEntity::new_invalid(),
+                            window,
+                            cx,
+                        );
+                        view.session = Some(session);
+                        view
+                    })
+                })
+                .unwrap();
+            handle
+                .update(cx, |_, window, cx| {
+                    let focus = view.update(cx, |view, cx| {
+                        view.capture(Point::default(), Modifiers::default(), window, cx);
+                        view.focus.clone()
+                    });
+                    packets.lock().unwrap().clear();
+
+                    let press_key = |window: &mut Window, cx: &mut App, key| {
+                        let keystroke = Keystroke::parse(key).unwrap();
+                        window.dispatch_event(
+                            PlatformInput::KeyDown(KeyDownEvent {
+                                keystroke: keystroke.clone(),
+                                is_held: false,
+                                prefer_character_input: false,
+                            }),
+                            cx,
+                        );
+                        window.dispatch_event(
+                            PlatformInput::KeyUp(KeyUpEvent {
+                                keystroke,
+                            }),
+                            cx,
+                        );
+                    };
+                    let set_modifiers = |window: &mut Window, cx: &mut App, modifiers| {
+                        window.dispatch_event(
+                            PlatformInput::ModifiersChanged(ModifiersChangedEvent {
+                                modifiers,
+                                capslock: Default::default(),
+                            }),
+                            cx,
+                        );
+                    };
+                    let tab_packets = [4, 1, 0, 0, 0, 0, 0xff, 9, 4, 0, 0, 0, 0, 0, 0xff, 9];
+                    press_key(window, cx, "tab");
+                    assert!(focus.is_focused(window));
+                    assert_eq!(std::mem::take(&mut *packets.lock().unwrap()), tab_packets);
+
+                    set_modifiers(window, cx, Modifiers::shift());
+                    press_key(window, cx, "shift-tab");
+                    set_modifiers(window, cx, Modifiers::default());
+                    assert!(focus.is_focused(window));
+                    assert_eq!(
+                        std::mem::take(&mut *packets.lock().unwrap()),
+                        [
+                            [4, 1, 0, 0, 0, 0, 0xff, 0xe1].as_slice(),
+                            &tab_packets,
+                            &[4, 0, 0, 0, 0, 0, 0xff, 0xe1]
+                        ]
+                        .concat()
+                    );
+
+                    set_modifiers(
+                        window,
+                        cx,
+                        Modifiers {
+                            control: true,
+                            alt: true,
+                            ..Default::default()
+                        },
+                    );
+                    set_modifiers(window, cx, Modifiers::default());
+                    assert!(!view.read(cx).captured);
+                    packets.lock().unwrap().clear();
+                    press_key(window, cx, "tab");
+                    assert!(!focus.is_focused(window));
+                    let toolbar_focus = window.focused(cx);
+                    press_key(window, cx, "shift-tab");
+                    assert_ne!(window.focused(cx), toolbar_focus);
+                    assert!(packets.lock().unwrap().is_empty());
+                })
+                .unwrap();
+            cx.spawn(async move |cx| {
+                cx.background_executor().timer(Duration::from_millis(1)).await;
+                cx.update(|cx| cx.quit());
+            })
+            .detach();
+        });
+    }
+}

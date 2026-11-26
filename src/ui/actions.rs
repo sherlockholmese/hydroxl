@@ -127,7 +127,11 @@ impl Workspace {
                         let _ = weak.update(cx, |this, cx| {
                             if matches!(action, workflows::MachineAction::ViewLog) {
                                 this.show_log(&machine, window, cx);
-                            } else if let Some(form) = workflows::action_form(action, &machine) {
+                            } else if let Some(form) = workflows::action_form(
+                                action,
+                                &machine,
+                                this.preferences.connection,
+                            ) {
                                 this.open_form(form, window, cx);
                             } else if let Some(op) = workflows::direct_action(action, &machine) {
                                 this.begin(Job::Operation(machine.clone(), op), None, cx);
